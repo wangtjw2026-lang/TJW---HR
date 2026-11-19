@@ -1,0 +1,6 @@
+{
+  "name": "TalentFlow MY",
+  "description": "Enterprise 15-stage Recruitment Management System (ATS) for Malaysian HR teams with Gemini AI resume screening, automated Google Apps Script assessment links, SPM/UEC/Degree verification, atomic interview scheduling, and PDPA audit compliance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

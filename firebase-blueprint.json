@@ -1,0 +1,279 @@
+{
+  "entities": {
+    "StaffUser": {
+      "title": "StaffUser",
+      "description": "Authenticated HR staff member profile with RBAC role assignment.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "minLength": 3, "maxLength": 254 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["hr_admin", "recruiter", "hiring_manager"] },
+        "department": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "role", "department", "createdAt", "updatedAt"]
+    },
+    "AdminEntry": {
+      "title": "AdminEntry",
+      "description": "Trusted admin registry entry granting HR Admin RBAC privileges.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "minLength": 3, "maxLength": 254 },
+        "grantedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "grantedBy", "createdAt"]
+    },
+    "Candidate": {
+      "title": "Candidate",
+      "description": "Core operational candidate record across the 15-stage Malaysian recruitment workflow. Raw PII and salary packages are isolated in the private subcollection.",
+      "type": "object",
+      "properties": {
+        "candidateCode": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^[A-Z0-9\\-]+$" },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "maskedEmail": { "type": "string", "minLength": 3, "maxLength": 120 },
+        "maskedPhone": { "type": "string", "minLength": 3, "maxLength": 40 },
+        "emailHash": { "type": "string", "minLength": 8, "maxLength": 128 },
+        "phoneHash": { "type": "string", "minLength": 8, "maxLength": 128 },
+        "positionApplied": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "department": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "source": { "type": "string", "enum": ["JobStreet", "Email"] },
+        "applicationDate": { "type": "string", "minLength": 10, "maxLength": 30 },
+        "currentStage": { "type": "integer" },
+        "status": {
+          "type": "string",
+          "enum": [
+            "new",
+            "pending_screening",
+            "shortlisted_docs",
+            "rejected_screening",
+            "docs_under_review",
+            "qualified",
+            "not_qualified",
+            "interview_invited",
+            "interview_confirmed",
+            "interview_completed",
+            "offer_sent",
+            "offer_pending",
+            "offer_accepted",
+            "offer_rejected",
+            "offer_expired",
+            "rejected_post_interview"
+          ]
+        },
+        "aiMatchScore": { "type": "integer" },
+        "aiSummary": { "type": "string", "maxLength": 1200 },
+        "educationSummary": { "type": "string", "maxLength": 600 },
+        "experienceSummary": { "type": "string", "maxLength": 800 },
+        "yearsExperience": { "type": "number" },
+        "skills": { "type": "array", "description": "Bounded up to 20 extracted skills" },
+        "screeningDecision": { "type": "string", "enum": ["pending", "proceed", "reject"] },
+        "screeningRejectionReason": { "type": "string", "maxLength": 500 },
+        "employmentFormCompleted": { "type": "boolean" },
+        "discFormCompleted": { "type": "boolean" },
+        "discProfile": { "type": "string", "maxLength": 120 },
+        "docSpmStatus": { "type": "string", "enum": ["missing", "submitted", "verified"] },
+        "docUecStatus": { "type": "string", "enum": ["not_applicable", "missing", "submitted", "verified"] },
+        "docDegreeStatus": { "type": "string", "enum": ["missing", "submitted", "verified"] },
+        "docTranscriptStatus": { "type": "string", "enum": ["missing", "submitted", "verified"] },
+        "lastDocReminderAt": { "type": "string", "maxLength": 40 },
+        "qualificationDecision": { "type": "string", "enum": ["pending", "qualified", "not_qualified"] },
+        "qualificationRemarks": { "type": "string", "maxLength": 800 },
+        "interviewSlotId": { "type": "string", "maxLength": 128 },
+        "interviewDate": { "type": "string", "maxLength": 30 },
+        "interviewTime": { "type": "string", "maxLength": 40 },
+        "interviewMode": { "type": "string", "maxLength": 60 },
+        "interviewerName": { "type": "string", "maxLength": 120 },
+        "interviewFeedback": { "type": "string", "maxLength": 1500 },
+        "interviewRating": { "type": "integer" },
+        "postInterviewDecision": { "type": "string", "enum": ["pending", "offer", "reject"] },
+        "offerStatus": { "type": "string", "enum": ["none", "offer_sent", "pending_response", "accepted", "rejected", "expired"] },
+        "finalDecisionNotes": { "type": "string", "maxLength": 800 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assignedStaffIds": { "type": "array", "description": "Bounded up to 20 staff UIDs" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "candidateCode", "fullName", "maskedEmail", "maskedPhone", "emailHash", "phoneHash",
+        "positionApplied", "department", "source", "applicationDate", "currentStage", "status",
+        "aiMatchScore", "aiSummary", "educationSummary", "experienceSummary", "yearsExperience",
+        "skills", "screeningDecision", "screeningRejectionReason", "employmentFormCompleted",
+        "discFormCompleted", "discProfile", "docSpmStatus", "docUecStatus", "docDegreeStatus",
+        "docTranscriptStatus", "lastDocReminderAt", "qualificationDecision", "qualificationRemarks",
+        "interviewSlotId", "interviewDate", "interviewTime", "interviewMode", "interviewerName",
+        "interviewFeedback", "interviewRating", "postInterviewDecision", "offerStatus",
+        "finalDecisionNotes", "ownerId", "assignedStaffIds", "createdAt", "updatedAt"
+      ]
+    },
+    "CandidatePrivatePii": {
+      "title": "CandidatePrivatePii",
+      "description": "PDPA-isolated sensitive candidate contact details and academic certificate file references. Masked from Hiring Managers.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "minLength": 3, "maxLength": 254 },
+        "phone": { "type": "string", "minLength": 5, "maxLength": 40 },
+        "location": { "type": "string", "maxLength": 120 },
+        "resumeFileName": { "type": "string", "maxLength": 180 },
+        "resumeExcerpt": { "type": "string", "maxLength": 4000 },
+        "spmFileName": { "type": "string", "maxLength": 180 },
+        "uecFileName": { "type": "string", "maxLength": 180 },
+        "degreeFileName": { "type": "string", "maxLength": 180 },
+        "transcriptFileName": { "type": "string", "maxLength": 180 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "email", "phone", "location", "resumeFileName", "resumeExcerpt",
+        "spmFileName", "uecFileName", "degreeFileName", "transcriptFileName",
+        "ownerId", "createdAt", "updatedAt"
+      ]
+    },
+    "CandidatePrivateCompensation": {
+      "title": "CandidatePrivateCompensation",
+      "description": "PDPA-isolated MYR compensation package and employment offer details. Strictly restricted to HR Admin.",
+      "type": "object",
+      "properties": {
+        "positionOffered": { "type": "string", "maxLength": 120 },
+        "departmentOffered": { "type": "string", "maxLength": 80 },
+        "monthlySalaryMYR": { "type": "number" },
+        "allowanceMYR": { "type": "number" },
+        "probationMonths": { "type": "integer" },
+        "startDate": { "type": "string", "maxLength": 30 },
+        "offerDeadline": { "type": "string", "maxLength": 30 },
+        "offerLetterRef": { "type": "string", "maxLength": 120 },
+        "offerTermsSummary": { "type": "string", "maxLength": 1500 },
+        "candidateResponseNote": { "type": "string", "maxLength": 600 },
+        "respondedAt": { "type": "string", "maxLength": 40 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "positionOffered", "departmentOffered", "monthlySalaryMYR", "allowanceMYR",
+        "probationMonths", "startDate", "offerDeadline", "offerLetterRef",
+        "offerTermsSummary", "candidateResponseNote", "respondedAt",
+        "ownerId", "createdAt", "updatedAt"
+      ]
+    },
+    "InterviewSlot": {
+      "title": "InterviewSlot",
+      "description": "Interview slot managed with atomic Firestore transactions to prevent double-booking.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "minLength": 10, "maxLength": 20 },
+        "startTime": { "type": "string", "minLength": 4, "maxLength": 20 },
+        "endTime": { "type": "string", "minLength": 4, "maxLength": 20 },
+        "interviewerName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "department": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "mode": { "type": "string", "enum": ["Google Meet", "Microsoft Teams", "On-site (KL HQ)", "On-site (Penang)"] },
+        "meetingLinkOrRoom": { "type": "string", "maxLength": 250 },
+        "status": { "type": "string", "enum": ["available", "booked", "completed", "cancelled"] },
+        "bookedCandidateId": { "type": "string", "maxLength": 128 },
+        "bookedCandidateName": { "type": "string", "maxLength": 140 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assignedStaffIds": { "type": "array", "description": "Bounded up to 20 staff UIDs" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "date", "startTime", "endTime", "interviewerName", "department", "mode",
+        "meetingLinkOrRoom", "status", "bookedCandidateId", "bookedCandidateName",
+        "ownerId", "assignedStaffIds", "createdAt", "updatedAt"
+      ]
+    },
+    "EmailLog": {
+      "title": "EmailLog",
+      "description": "Automated candidate email dispatch and reminder log.",
+      "type": "object",
+      "properties": {
+        "candidateId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "candidateName": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "maskedRecipient": { "type": "string", "minLength": 3, "maxLength": 120 },
+        "templateType": {
+          "type": "string",
+          "enum": [
+            "shortlist_forms_disc",
+            "docs_reminder_48h",
+            "interview_invite",
+            "interview_confirmation",
+            "employment_offer",
+            "rejection_notice"
+          ]
+        },
+        "subject": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "bodyPreview": { "type": "string", "minLength": 5, "maxLength": 2000 },
+        "stageTriggered": { "type": "integer" },
+        "deliveryStatus": { "type": "string", "enum": ["dispatched", "queued"] },
+        "triggeredByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assignedStaffIds": { "type": "array", "description": "Bounded up to 20 staff UIDs" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "candidateId", "candidateName", "maskedRecipient", "templateType", "subject",
+        "bodyPreview", "stageTriggered", "deliveryStatus", "triggeredByUid",
+        "ownerId", "assignedStaffIds", "createdAt"
+      ]
+    },
+    "PdpaAuditLog": {
+      "title": "PdpaAuditLog",
+      "description": "Immutable Malaysian PDPA 2010 security audit trail logging access and mutations to sensitive candidate records.",
+      "type": "object",
+      "properties": {
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorEmail": { "type": "string", "minLength": 3, "maxLength": 254 },
+        "actorRole": { "type": "string", "enum": ["hr_admin", "recruiter", "hiring_manager"] },
+        "action": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "targetType": { "type": "string", "enum": ["candidate", "pii", "compensation", "interview_slot", "export", "rbac"] },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "details": { "type": "string", "minLength": 2, "maxLength": 500 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assignedStaffIds": { "type": "array", "description": "Bounded up to 20 staff UIDs" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "actorUid", "actorEmail", "actorRole", "action", "targetType",
+        "targetId", "details", "ownerId", "assignedStaffIds", "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/StaffUser" },
+      "description": "Staff user accounts and RBAC roles."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminEntry" },
+      "description": "Trusted HR Admin registry."
+    },
+    "/candidates/{candidateId}": {
+      "schema": { "$ref": "#/entities/Candidate" },
+      "description": "Core 15-stage operational candidate profiles."
+    },
+    "/candidates/{candidateId}/private/pii": {
+      "schema": { "$ref": "#/entities/CandidatePrivatePii" },
+      "description": "PDPA-isolated contact details and academic certificate references."
+    },
+    "/candidates/{candidateId}/private/compensation": {
+      "schema": { "$ref": "#/entities/CandidatePrivateCompensation" },
+      "description": "PDPA-isolated MYR compensation and employment offer terms."
+    },
+    "/interviewSlots/{slotId}": {
+      "schema": { "$ref": "#/entities/InterviewSlot" },
+      "description": "Interview booking calendar slots locked via atomic transactions."
+    },
+    "/emailLogs/{logId}": {
+      "schema": { "$ref": "#/entities/EmailLog" },
+      "description": "Automated transactional and 48h reminder email dispatch logs."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/PdpaAuditLog" },
+      "description": "Immutable PDPA Security Audit Logs."
+    }
+  }
+}
