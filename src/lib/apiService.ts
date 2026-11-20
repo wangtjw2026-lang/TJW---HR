@@ -5,6 +5,7 @@ import {
   BookingStatus,
   CandidateRecord,
   DocType,
+  EmailDeliveryResult,
   EmailLogRecord,
   InterviewMode,
   InterviewSlot,
@@ -13,11 +14,24 @@ import {
   PostInterviewDecision,
   QualificationStatus,
   ScreeningDecision,
+  SmtpConfigStatus,
   StaffRole,
   StaffUser,
 } from '../types/ats';
 
 const TOKEN_STORAGE_KEY = 'talentflow_my_jwt';
+
+type SessionExpiredListener = (info: { code?: string; message: string }) => void;
+let sessionExpiredListener: SessionExpiredListener | null = null;
+let currentAuditPageHeader = 'Pipeline Dashboard';
+
+export function registerSessionExpiredHandler(listener: SessionExpiredListener | null): void {
+  sessionExpiredListener = listener;
+}
+
+export function setCurrentAuditPage(pageName: string): void {
+  currentAuditPageHeader = pageName || 'Pipeline Dashboard';
+}
 
 export function getStoredToken(): string | null {
   try {
@@ -51,6 +65,9 @@ async function apiFetch<T>(
     if (token) {
       headers.set('Authorization', `Bearer ${token}`);
     }
+    if (currentAuditPageHeader && !headers.has('X-Page-Visited')) {
+      headers.set('X-Page-Visited', currentAuditPageHeader);
+    }
   }
   if (!(options.body instanceof FormData) && !headers.has('Content-Type') && options.body !== undefined) {
     headers.set('Content-Type', 'application/json');
@@ -78,12 +95,14 @@ async function apiFetch<T>(
     }
 
     if (!res.ok) {
+      const dataObj = typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
       const errMsg =
-        typeof data === 'object' && data !== null && 'error' in data
-          ? String((data as { error: unknown }).error)
-          : `Request failed with status ${res.status}`;
+        'error' in dataObj ? String(dataObj.error) : `Request failed with status ${res.status}`;
+      const errCode = typeof dataObj.code === 'string' ? dataObj.code : undefined;
+
       if (res.status === 401 && auth) {
         setStoredToken(null);
+        sessionExpiredListener?.({ code: errCode, message: errMsg });
       }
       throw new Error(errMsg);
     }
@@ -133,6 +152,23 @@ export async function setupInitialHrAdmin(params: {
   return data;
 }
 
+export async function requestStaffAccess(params: {
+  name: string;
+  email: string;
+  password: string;
+  role: StaffRole;
+  department: string;
+}): Promise<{ message: string; user: StaffUser }> {
+  return apiFetch<{ message: string; user: StaffUser }>(
+    '/api/auth/register-request',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    },
+    false
+  );
+}
+
 export async function loginStaff(email: string, password: string): Promise<{ token: string; user: StaffUser }> {
   const data = await apiFetch<{ token: string; user: StaffUser }>(
     '/api/auth/login',
@@ -149,6 +185,34 @@ export async function loginStaff(email: string, password: string): Promise<{ tok
 export async function fetchCurrentUser(): Promise<StaffUser> {
   const data = await apiFetch<{ user: StaffUser }>('/api/auth/me');
   return data.user;
+}
+
+export async function keepSessionAlive(): Promise<void> {
+  await apiFetch('/api/auth/keep-alive', { method: 'POST' });
+}
+
+export async function logoutStaffSession(params?: {
+  reason?: 'manual' | 'idle_timeout';
+  page_visited?: string;
+}): Promise<void> {
+  const token = getStoredToken();
+  setStoredToken(null);
+  if (!token) return;
+  try {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        reason: params?.reason || 'manual',
+        page_visited: params?.page_visited || currentAuditPageHeader,
+      }),
+    });
+  } catch {
+    // Best-effort server logout notification; local token is already cleared
+  }
 }
 
 export function logoutStaff(): void {
@@ -170,6 +234,26 @@ export async function createStaffUser(params: {
   const data = await apiFetch<{ user: StaffUser }>('/api/users', {
     method: 'POST',
     body: JSON.stringify(params),
+  });
+  return data.user;
+}
+
+export async function approveStaffUser(
+  id: number,
+  role: StaffRole,
+  department?: string
+): Promise<StaffUser> {
+  const data = await apiFetch<{ user: StaffUser }>(`/api/users/${id}/approve`, {
+    method: 'PATCH',
+    body: JSON.stringify({ role, ...(department ? { department } : {}) }),
+  });
+  return data.user;
+}
+
+export async function rejectStaffUser(id: number, reason?: string): Promise<StaffUser> {
+  const data = await apiFetch<{ user: StaffUser }>(`/api/users/${id}/reject`, {
+    method: 'PATCH',
+    body: JSON.stringify({ reason: reason || '' }),
   });
   return data.user;
 }
@@ -418,12 +502,16 @@ export async function sendDocReminder(candidateId: number): Promise<CandidateRec
   return data.candidate;
 }
 
-export async function sendBatchDocReminders(candidateIds: number[]): Promise<number> {
-  const data = await apiFetch<{ sentCount: number }>('/api/candidates/remind-docs-batch', {
-    method: 'POST',
-    body: JSON.stringify({ candidateIds }),
-  });
-  return data.sentCount;
+export async function sendBatchDocReminders(
+  candidateIds: number[]
+): Promise<{ sentCount: number; deliveredCount: number; failedCount: number; lastError: string }> {
+  return apiFetch<{ sentCount: number; deliveredCount: number; failedCount: number; lastError: string }>(
+    '/api/candidates/remind-docs-batch',
+    {
+      method: 'POST',
+      body: JSON.stringify({ candidateIds }),
+    }
+  );
 }
 
 export async function submitQualificationDecision(
@@ -657,11 +745,42 @@ export async function portalRespondToOffer(
 }
 
 // =============================================================================
-// EMAIL LOGS & TAMPER-EVIDENT AUDIT LOGS
+// EMAIL LOGS, LIVE GMAIL SMTP & TAMPER-EVIDENT AUDIT LOGS
 // =============================================================================
+export async function fetchEmailLogsWithStatus(): Promise<{
+  emailLogs: EmailLogRecord[];
+  smtpStatus: SmtpConfigStatus;
+}> {
+  return apiFetch<{ emailLogs: EmailLogRecord[]; smtpStatus: SmtpConfigStatus }>('/api/email-logs');
+}
+
 export async function fetchEmailLogs(): Promise<EmailLogRecord[]> {
-  const data = await apiFetch<{ emailLogs: EmailLogRecord[] }>('/api/email-logs');
+  const data = await fetchEmailLogsWithStatus();
   return data.emailLogs;
+}
+
+export async function resendEmailLog(
+  emailLogId: number,
+  pageVisited = 'Email Automation & Audit Trail'
+): Promise<{
+  emailDelivery: EmailDeliveryResult;
+  emailLog: EmailLogRecord;
+  candidate: CandidateRecord | null;
+}> {
+  return apiFetch(`/api/email-logs/${emailLogId}/resend`, {
+    method: 'POST',
+    body: JSON.stringify({ page_visited: pageVisited }),
+  });
+}
+
+export async function verifySmtpConnection(): Promise<{
+  ok: boolean;
+  error: string;
+  smtpStatus: SmtpConfigStatus;
+}> {
+  return apiFetch('/api/smtp/verify', {
+    method: 'POST',
+  });
 }
 
 function buildAuditQueryString(filters?: Partial<AuditLogFilters>, limit?: number): string {
@@ -740,12 +859,18 @@ export async function downloadAuditLogCsv(filters?: Partial<AuditLogFilters>): P
 
   if (!res.ok) {
     let errMsg = `Export failed with status ${res.status}`;
+    let errCode: string | undefined;
     try {
       const text = await res.text();
-      const parsed = JSON.parse(text) as { error?: string };
+      const parsed = JSON.parse(text) as { error?: string; code?: string };
       if (parsed?.error) errMsg = parsed.error;
+      if (parsed?.code) errCode = parsed.code;
     } catch {
       // use fallback status message
+    }
+    if (res.status === 401) {
+      setStoredToken(null);
+      sessionExpiredListener?.({ code: errCode, message: errMsg });
     }
     throw new Error(errMsg);
   }

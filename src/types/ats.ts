@@ -41,12 +41,17 @@ export type InterviewMode =
   | 'On-site (KL HQ)'
   | 'On-site (Penang)';
 
+export type UserApprovalStatus = 'pending' | 'approved' | 'rejected';
+
 export interface StaffUser {
   id: number;
   name: string;
   email: string;
   role: StaffRole;
   department: string;
+  status: UserApprovalStatus;
+  approved_by: string;
+  approved_at: string;
   created_at?: string;
 }
 
@@ -180,6 +185,7 @@ export interface CandidateRecord {
   documents: CandidateDocument[];
   active_booking: InterviewBooking | null;
   offer: OfferRecord | null;
+  recent_emails?: EmailLogRecord[];
 }
 
 export interface InterviewSlot {
@@ -208,8 +214,30 @@ export interface EmailLogRecord {
   body_preview: string;
   stage_triggered: number;
   delivery_status: string;
+  smtp_error: string;
+  message_id: string;
   triggered_by: string;
   created_at: string;
+}
+
+export interface SmtpConfigStatus {
+  configured: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  from: string;
+  userMasked: string;
+  reason?: string;
+}
+
+export interface EmailDeliveryResult {
+  id: number;
+  delivery_status: 'SENT_SMTP' | 'SMTP_FAILED' | 'LOGGED_LOCAL';
+  smtp_error: string;
+  message_id: string;
+  recipient_email: string;
+  subject: string;
+  template_type: string;
 }
 
 export type AuditActorRole = 'administrator' | 'manager' | 'candidate_portal' | 'system';
@@ -366,8 +394,12 @@ export const ROLE_META: Record<
   StaffRole,
   {
     label: string;
+    title: string;
     badgeLabel: string;
+    accessLimits: string;
     summary: string;
+    allowed: string[];
+    restricted: string[];
     canWrite: boolean;
     canViewSalary: boolean;
     canExportCsv: boolean;
@@ -375,23 +407,50 @@ export const ROLE_META: Record<
   }
 > = {
   administrator: {
-    label: 'Administrator',
-    badgeLabel: 'Administrator',
+    label: 'System Administrator',
+    title: 'System Administrator — Full Access',
+    badgeLabel: 'System Administrator',
+    accessLimits: 'Full read/write, AI screening, emails, exports & user admin',
     summary:
-      'Full access — view all records, add/edit/delete candidates, run AI resume screening, make hiring decisions, manage interview slots, issue offers, send emails, export reports, and manage user accounts.',
+      'Full administrative control across all recruitment pipelines, candidate records, AI screening, interview scheduling, offers, email automation, CSV/audit exports, and staff access approvals.',
+    allowed: [
+      'View all candidates, resumes, academic transcripts, interview schedules, offers, email logs, and audit trails.',
+      'Create, edit, screen, qualify, advance, reject, or delete candidates and run Gemini AI document extraction.',
+      'Create and manage interview slots, issue or update MYR offers, and send or resend SMTP emails.',
+      'Export Excel candidate reports and download tamper-proof Audit Trail CSV logs.',
+      'Create, approve, reject, change roles, or delete staff user accounts.',
+    ],
+    restricted: [
+      'Cannot edit or delete tamper-evident audit trail records.',
+      'Cannot delete or demote the last remaining active System Administrator account.',
+    ],
     canWrite: true,
     canViewSalary: true,
     canExportCsv: true,
     canManageUsers: true,
   },
   manager: {
-    label: 'Manager',
-    badgeLabel: 'Manager (View Only)',
+    label: 'Hiring Manager',
+    title: 'Hiring Manager — View & Review Only',
+    badgeLabel: 'Hiring Manager (View Only)',
+    accessLimits: 'Read-only pipeline, profiles, docs, calendar & offers',
     summary:
-      'Read-only access — view the dashboard, recruitment pipeline, candidate profiles, uploaded resumes/academic documents, interview calendar, offer statuses, and export reports. Cannot modify records or manage users.',
+      'Strict read-only review access to the Pipeline Dashboard, Candidate Database, Candidate Profiles & Uploaded Documents, Interview Calendar, Offer Statuses, and Logs.',
+    allowed: [
+      'View Pipeline Dashboard metrics and recruitment stage summaries.',
+      'Browse Candidate Database, Candidate Profiles, resumes, and uploaded academic transcripts.',
+      'View Interview Calendar schedules, panel bookings, and Employment Offer statuses.',
+      'Inspect Email Automation logs and User Activity Audit Trail records (read-only).',
+    ],
+    restricted: [
+      'Blocked (HTTP 403) from adding, editing, or deleting candidates or triggering Gemini AI scans.',
+      'Blocked (HTTP 403) from changing screening, qualification, or post-interview decisions.',
+      'Blocked (HTTP 403) from managing interview slots, issuing/updating offers, or sending/resending emails.',
+      'Blocked (HTTP 403) from exporting Excel candidate reports, downloading Audit Trail CSVs, or managing users.',
+    ],
     canWrite: false,
     canViewSalary: true,
-    canExportCsv: true,
+    canExportCsv: false,
     canManageUsers: false,
   },
 };

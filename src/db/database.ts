@@ -239,6 +239,10 @@ export function initializeDatabase() {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('administrator', 'manager')),
       department TEXT NOT NULL DEFAULT 'Human Resources',
+      status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('pending', 'approved', 'rejected')),
+      approved_by TEXT NOT NULL DEFAULT '',
+      approved_at TEXT NOT NULL DEFAULT '',
+      last_active_at TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -346,15 +350,65 @@ export function initializeDatabase() {
       subject TEXT NOT NULL,
       body_preview TEXT NOT NULL,
       stage_triggered INTEGER NOT NULL DEFAULT 1,
-      delivery_status TEXT NOT NULL DEFAULT 'LOGGED',
+      delivery_status TEXT NOT NULL DEFAULT 'LOGGED_LOCAL',
+      smtp_error TEXT NOT NULL DEFAULT '',
+      message_id TEXT NOT NULL DEFAULT '',
       triggered_by TEXT NOT NULL DEFAULT 'system',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE SET NULL
     );
   `);
 
+  ensureUsersSecurityColumns();
   ensureCandidateDocumentsAiColumns();
+  ensureEmailLogsDeliveryColumns();
   ensureImmutableAuditLogsTable();
+}
+
+function ensureUsersSecurityColumns() {
+  const columns = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
+  const hasStatus = columns.some((c) => c.name === 'status');
+  const hasApprovedBy = columns.some((c) => c.name === 'approved_by');
+  const hasApprovedAt = columns.some((c) => c.name === 'approved_at');
+  const hasLastActiveAt = columns.some((c) => c.name === 'last_active_at');
+
+  if (!hasStatus) {
+    db.exec(`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'`);
+  }
+  if (!hasApprovedBy) {
+    db.exec(`ALTER TABLE users ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!hasApprovedAt) {
+    db.exec(`ALTER TABLE users ADD COLUMN approved_at TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!hasLastActiveAt) {
+    db.exec(`ALTER TABLE users ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''`);
+  }
+
+  // Backfill approval metadata for pre-existing initial admin/approved accounts only (zero dummy data)
+  const legacyApproved = db
+    .prepare(`SELECT id, created_at FROM users WHERE status = 'approved' AND (approved_by IS NULL OR approved_by = '')`)
+    .all() as Array<{ id: number; created_at: string }>;
+
+  if (legacyApproved.length > 0) {
+    const updateStmt = db.prepare(`
+      UPDATE users
+      SET approved_by = 'Initial System Setup',
+          approved_at = CASE WHEN approved_at = '' THEN ? ELSE approved_at END
+      WHERE id = ?
+    `);
+    for (const row of legacyApproved) {
+      let parsedDate = new Date();
+      if (row.created_at) {
+        const isoCandidate = row.created_at.includes('T')
+          ? row.created_at
+          : `${row.created_at.replace(' ', 'T')}Z`;
+        const d = new Date(isoCandidate);
+        if (!Number.isNaN(d.getTime())) parsedDate = d;
+      }
+      updateStmt.run(formatAuditTimestamp(parsedDate), row.id);
+    }
+  }
 }
 
 function ensureCandidateDocumentsAiColumns() {
@@ -367,6 +421,19 @@ function ensureCandidateDocumentsAiColumns() {
   }
   if (!hasStatus) {
     db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_verified_status TEXT NOT NULL DEFAULT ''`);
+  }
+}
+
+function ensureEmailLogsDeliveryColumns() {
+  const columns = db.prepare(`PRAGMA table_info(email_logs)`).all() as Array<{ name: string }>;
+  const hasSmtpError = columns.some((c) => c.name === 'smtp_error');
+  const hasMessageId = columns.some((c) => c.name === 'message_id');
+
+  if (!hasSmtpError) {
+    db.exec(`ALTER TABLE email_logs ADD COLUMN smtp_error TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!hasMessageId) {
+    db.exec(`ALTER TABLE email_logs ADD COLUMN message_id TEXT NOT NULL DEFAULT ''`);
   }
 }
 

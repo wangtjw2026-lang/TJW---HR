@@ -1,26 +1,39 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   BellRing,
+  Check,
   CheckCircle2,
+  Clock,
   Download,
+  Eye,
   Loader2,
   Lock,
   Mail,
+  RefreshCw,
   RotateCcw,
   Search,
+  Server,
   Shield,
   Trash2,
+  UserCheck,
   UserPlus,
   Users,
+  XCircle,
 } from 'lucide-react';
 import {
+  approveStaffUser,
   createStaffUser,
   deleteStaffUser,
   downloadAuditLogCsv,
   fetchAuditLogsWithMeta,
+  fetchEmailLogsWithStatus,
+  rejectStaffUser,
+  resendEmailLog,
   sendBatchDocReminders,
   updateStaffUser,
+  verifySmtpConnection,
 } from '../lib/apiService';
 import { formatTimestamp, hasPendingDocs } from '../lib/atsHelpers';
 import {
@@ -31,6 +44,7 @@ import {
   DEPARTMENTS,
   EmailLogRecord,
   ROLE_META,
+  SmtpConfigStatus,
   StaffRole,
   StaffUser,
 } from '../types/ats';
@@ -80,12 +94,16 @@ function getActionToneClass(action: string): string {
   if (
     upper.includes('FAILED') ||
     upper.includes('DELETE') ||
-    upper.includes('CANCEL')
+    upper.includes('CANCEL') ||
+    upper.includes('REJECT') ||
+    upper.includes('AUTO_LOGOUT_IDLE')
   ) {
     return 'text-[#B91C1C]';
   }
   if (
     upper.includes('CREATE') ||
+    upper.includes('APPROVE') ||
+    upper.includes('REGISTER_ACCESS') ||
     upper.includes('ISSUE_OFFER') ||
     upper.includes('AI_RESUME') ||
     upper.includes('EXPORT')
@@ -96,6 +114,20 @@ function getActionToneClass(action: string): string {
     return 'text-[#1D4ED8]';
   }
   return 'text-[#334155]';
+}
+
+function getEmailDeliveryMeta(status: string): {
+  label: string;
+  tone: 'green' | 'red' | 'amber';
+} {
+  const upper = String(status || '').toUpperCase();
+  if (upper === 'SENT_SMTP') {
+    return { label: 'Sent via SMTP', tone: 'green' };
+  }
+  if (upper === 'SMTP_FAILED' || upper === 'SMTP_FAILED_LOGGED') {
+    return { label: 'SMTP Failed', tone: 'red' };
+  }
+  return { label: 'Logged Local', tone: 'amber' };
 }
 
 interface CommunicationsAndAuditViewProps {
@@ -124,6 +156,13 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const [selectedEmailId, setSelectedEmailId] = useState<number | null>(emailLogs[0]?.id ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [smtpStatus, setSmtpStatus] = useState<SmtpConfigStatus | null>(null);
+  const [verifyingSmtp, setVerifyingSmtp] = useState(false);
+  const [smtpCheckBanner, setSmtpCheckBanner] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+  const [resendingEmailId, setResendingEmailId] = useState<number | null>(null);
 
   // Create new staff user form (administrator only)
   const [newName, setNewName] = useState('');
@@ -132,6 +171,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const [newRole, setNewRole] = useState<StaffRole>('manager');
   const [newDept, setNewDept] = useState<string>('Human Resources');
   const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<number | null>(null);
+  const [pendingRoleDrafts, setPendingRoleDrafts] = useState<Record<number, StaffRole>>({});
 
   // Tamper-evident Audit Trail filter & query state
   const [auditFilters, setAuditFilters] = useState<AuditLogFilters>(EMPTY_AUDIT_FILTERS);
@@ -197,14 +237,97 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const selectedEmail =
     emailLogs.find((e) => e.id === selectedEmailId) || emailLogs[0] || null;
 
+  useEffect(() => {
+    if (mode !== 'emails') return;
+    let active = true;
+    void fetchEmailLogsWithStatus()
+      .then((res) => {
+        if (active) setSmtpStatus(res.smtpStatus);
+      })
+      .catch(() => {
+        // Ignore non-critical status load error
+      });
+    return () => {
+      active = false;
+    };
+  }, [mode, emailLogs]);
+
+  const handleVerifySmtp = async () => {
+    if (!isAdmin) return;
+    setVerifyingSmtp(true);
+    setSmtpCheckBanner(null);
+    setError('');
+    try {
+      const res = await verifySmtpConnection();
+      setSmtpStatus(res.smtpStatus);
+      if (res.ok) {
+        const msg = `Live SMTP verified: ${res.smtpStatus.host}:${res.smtpStatus.port} (${res.smtpStatus.from})`;
+        setSmtpCheckBanner({ ok: true, message: msg });
+        onNotify(msg);
+      } else {
+        setSmtpCheckBanner({ ok: false, message: res.error || 'SMTP verification failed.' });
+      }
+    } catch (err) {
+      setSmtpCheckBanner({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Failed to test SMTP connection.',
+      });
+    } finally {
+      setVerifyingSmtp(false);
+    }
+  };
+
+  const handleResendEmail = async (log: EmailLogRecord) => {
+    if (!isAdmin) return;
+    setResendingEmailId(log.id);
+    setSmtpCheckBanner(null);
+    setError('');
+    try {
+      const res = await resendEmailLog(log.id, 'Email Automation & Audit Trail');
+      await onRefresh();
+      setSelectedEmailId(res.emailDelivery.id);
+      if (res.emailDelivery.delivery_status === 'SENT_SMTP') {
+        const msg = `Resent email via SMTP to ${res.emailDelivery.recipient_email}${
+          res.emailDelivery.message_id ? ` (Message-ID: ${res.emailDelivery.message_id})` : ''
+        }.`;
+        setSmtpCheckBanner({ ok: true, message: msg });
+        onNotify(msg);
+      } else {
+        const errText = res.emailDelivery.smtp_error || 'SMTP delivery failed.';
+        setSmtpCheckBanner({
+          ok: false,
+          message: `Resend to ${res.emailDelivery.recipient_email} failed: ${errText}`,
+        });
+        onNotify(`SMTP resend failed for ${res.emailDelivery.recipient_email}.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resend email.');
+    } finally {
+      setResendingEmailId(null);
+    }
+  };
+
   const handleBatchReminder = async () => {
     if (!isAdmin || pendingDocCandidates.length === 0) return;
     setBusy(true);
     setError('');
+    setSmtpCheckBanner(null);
     try {
-      const count = await sendBatchDocReminders(pendingDocCandidates.map((c) => c.id));
+      const result = await sendBatchDocReminders(pendingDocCandidates.map((c) => c.id));
       await onRefresh();
-      onNotify(`Sent ${count} document submission reminder email(s).`);
+      if (result.failedCount === 0 && result.deliveredCount > 0) {
+        const msg = `Sent ${result.deliveredCount} document reminder email(s) via live SMTP.`;
+        setSmtpCheckBanner({ ok: true, message: msg });
+        onNotify(msg);
+      } else if (result.failedCount > 0) {
+        const msg = `Batch reminders processed: ${result.deliveredCount} sent via SMTP, ${result.failedCount} failed.${
+          result.lastError ? ` Error: ${result.lastError}` : ''
+        }`;
+        setSmtpCheckBanner({ ok: false, message: msg });
+        onNotify(msg);
+      } else {
+        onNotify('No pending-document candidates required a reminder.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send batch reminders.');
     } finally {
@@ -240,6 +363,10 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
 
   const handleRoleChange = async (user: StaffUser, role: StaffRole) => {
     if (!isAdmin) return;
+    if (user.status === 'pending') {
+      setPendingRoleDrafts((prev) => ({ ...prev, [user.id]: role }));
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -248,6 +375,48 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
       onNotify(`Updated ${user.email} role to ${ROLE_META[role].badgeLabel}.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update role.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleApproveUser = async (user: StaffUser) => {
+    if (!isAdmin) return;
+    const assignedRole = pendingRoleDrafts[user.id] || user.role;
+    setBusy(true);
+    setError('');
+    try {
+      await approveStaffUser(user.id, assignedRole, user.department);
+      setPendingRoleDrafts((prev) => {
+        const next = { ...prev };
+        delete next[user.id];
+        return next;
+      });
+      await onRefresh();
+      onNotify(
+        `Approved ${user.name} (${user.email}) as ${ROLE_META[assignedRole].label}. Approved by ${currentUser.name}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to approve user account.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRejectUser = async (user: StaffUser) => {
+    if (!isAdmin) return;
+    setBusy(true);
+    setError('');
+    try {
+      await rejectStaffUser(user.id);
+      await onRefresh();
+      onNotify(
+        user.status === 'pending'
+          ? `Rejected staff access request for ${user.email}.`
+          : `Suspended workspace access for ${user.email}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reject user account.');
     } finally {
       setBusy(false);
     }
@@ -271,27 +440,99 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
 
   // EMAIL AUTOMATION LOG VIEW
   if (mode === 'emails') {
+    const selectedDeliveryMeta = selectedEmail
+      ? getEmailDeliveryMeta(selectedEmail.delivery_status)
+      : null;
+
     return (
-      <div className="space-y-6">
+      <div className="space-y-5">
         <div className="flex flex-wrap items-end justify-between gap-4 border-b border-[#E2E8F0] pb-4">
           <div>
             <h1 className="text-xl font-bold text-[#0F172A]">Email Automation Log</h1>
             <p className="text-xs text-[#64748B] mt-0.5">
-              Every Nodemailer dispatch (Shortlist Forms, Reminders, Interview Invites, Confirmations &amp; Offers) is logged in SQLite.
+              Live Gmail / SMTP dispatches (Shortlist Forms, Reminders, Interview Invites, Confirmations &amp; Offers) with real delivery status and error diagnostics.
             </p>
           </div>
           {isAdmin && (
-            <button
-              type="button"
-              disabled={busy || pendingDocCandidates.length === 0}
-              onClick={handleBatchReminder}
-              className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-            >
-              <BellRing className="h-3.5 w-3.5" />
-              Send Batch Doc Reminders ({pendingDocCandidates.length})
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={verifyingSmtp}
+                onClick={() => void handleVerifySmtp()}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50"
+              >
+                {verifyingSmtp ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />
+                ) : (
+                  <Server className="h-3.5 w-3.5 text-[#0F766E]" />
+                )}
+                {verifyingSmtp ? 'Testing SMTP...' : 'Test SMTP Connection'}
+              </button>
+              <button
+                type="button"
+                disabled={busy || pendingDocCandidates.length === 0}
+                onClick={handleBatchReminder}
+                className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+              >
+                <BellRing className="h-3.5 w-3.5" />
+                Send Batch Doc Reminders ({pendingDocCandidates.length})
+              </button>
+            </div>
           )}
         </div>
+
+        {/* Live Gmail SMTP Runtime Transport Status */}
+        {smtpStatus && (
+          <div
+            className={`flex flex-wrap items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-xs ${
+              smtpStatus.configured
+                ? 'border-[#BBF7D0] bg-[#F0FDF4] text-[#166534]'
+                : 'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]'
+            }`}
+          >
+            <div className="flex items-start gap-2 min-w-0">
+              {smtpStatus.configured ? (
+                <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-[#15803D]" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-[#D97706]" />
+              )}
+              <div className="min-w-0">
+                {smtpStatus.configured ? (
+                  <span>
+                    <strong>Live SMTP Active:</strong>{' '}
+                    <span className="font-mono">
+                      {smtpStatus.host}:{smtpStatus.port}
+                    </span>{' '}
+                    ({smtpStatus.secure ? 'SSL/TLS' : 'STARTTLS'}) · Sender:{' '}
+                    <span className="font-mono">{smtpStatus.from}</span>
+                    {smtpStatus.userMasked ? ` · Auth: ${smtpStatus.userMasked}` : ''}
+                  </span>
+                ) : (
+                  <span>
+                    <strong>SMTP Not Configured:</strong> {smtpStatus.reason}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {smtpCheckBanner && (
+          <div
+            className={`flex items-start gap-2 rounded-md border px-4 py-2.5 text-xs ${
+              smtpCheckBanner.ok
+                ? 'border-[#BBF7D0] bg-[#F0FDF4] text-[#15803D]'
+                : 'border-[#FECACA] bg-[#FEF2F2] text-[#B91C1C]'
+            }`}
+          >
+            {smtpCheckBanner.ok ? (
+              <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5" />
+            ) : (
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            )}
+            <span className="break-words">{smtpCheckBanner.message}</span>
+          </div>
+        )}
 
         {error && (
           <div className="flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#B91C1C]">
@@ -314,6 +555,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
               ) : (
                 emailLogs.map((log) => {
                   const active = selectedEmail?.id === log.id;
+                  const meta = getEmailDeliveryMeta(log.delivery_status);
                   return (
                     <button
                       key={log.id}
@@ -336,10 +578,28 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                         <span className="truncate">
                           To: {log.candidate_name} ({log.recipient_email})
                         </span>
-                        <span className="font-mono text-[10px] text-[#15803D] shrink-0 ml-2">
-                          {log.delivery_status}
+                        <span
+                          className={`inline-flex items-center gap-1 font-mono text-[10px] font-semibold shrink-0 ml-2 ${
+                            meta.tone === 'green'
+                              ? 'text-[#15803D]'
+                              : meta.tone === 'red'
+                                ? 'text-[#DC2626]'
+                                : 'text-[#B45309]'
+                          }`}
+                        >
+                          {meta.tone === 'green' ? (
+                            <CheckCircle2 className="h-3 w-3" />
+                          ) : (
+                            <AlertTriangle className="h-3 w-3" />
+                          )}
+                          {meta.label}
                         </span>
                       </div>
+                      {log.smtp_error && (
+                        <div className="mt-1 text-[10px] text-[#B91C1C] truncate">
+                          {log.smtp_error}
+                        </div>
+                      )}
                     </button>
                   );
                 })
@@ -349,18 +609,47 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
 
           {/* Email preview */}
           <div className="lg:col-span-7 border border-[#E2E8F0] rounded-lg bg-white p-5">
-            {selectedEmail ? (
+            {selectedEmail && selectedDeliveryMeta ? (
               <div className="space-y-4">
-                <div className="border-b border-[#E2E8F0] pb-3 space-y-1">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="border-b border-[#E2E8F0] pb-3 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#0F766E]">
                       <Mail className="h-4 w-4" />
                       {selectedEmail.template_type}
                     </span>
-                    <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[#15803D]">
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                      {selectedEmail.delivery_status}
-                    </span>
+                    <div className="flex items-center gap-2.5">
+                      <span
+                        className={`inline-flex items-center gap-1 text-[11px] font-mono font-semibold ${
+                          selectedDeliveryMeta.tone === 'green'
+                            ? 'text-[#15803D]'
+                            : selectedDeliveryMeta.tone === 'red'
+                              ? 'text-[#DC2626]'
+                              : 'text-[#B45309]'
+                        }`}
+                      >
+                        {selectedDeliveryMeta.tone === 'green' ? (
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                        ) : (
+                          <AlertTriangle className="h-3.5 w-3.5" />
+                        )}
+                        {selectedDeliveryMeta.label} ({selectedEmail.delivery_status})
+                      </span>
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          disabled={resendingEmailId === selectedEmail.id}
+                          onClick={() => void handleResendEmail(selectedEmail)}
+                          className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50"
+                        >
+                          {resendingEmailId === selectedEmail.id ? (
+                            <Loader2 className="h-3 w-3 animate-spin text-[#0F766E]" />
+                          ) : (
+                            <RefreshCw className="h-3 w-3 text-[#0F766E]" />
+                          )}
+                          {resendingEmailId === selectedEmail.id ? 'Resending...' : 'Resend via SMTP'}
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <h2 className="text-base font-bold text-[#0F172A]">{selectedEmail.subject}</h2>
                   <div className="text-xs text-[#475569]">
@@ -368,15 +657,33 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                   </div>
                   <div className="text-[11px] text-[#64748B]">
                     Triggered by {selectedEmail.triggered_by} · {formatTimestamp(selectedEmail.created_at)}
+                    {selectedEmail.message_id && (
+                      <span className="font-mono ml-2 text-[#0F766E]">
+                        · Message-ID: {selectedEmail.message_id}
+                      </span>
+                    )}
                   </div>
                 </div>
+
+                {selectedEmail.smtp_error && (
+                  <div className="flex items-start gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C]">
+                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="font-semibold">SMTP Delivery Error</div>
+                      <div className="mt-0.5 font-mono text-[11px] break-words">
+                        {selectedEmail.smtp_error}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 <pre className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-[#334155] bg-[#F8FAFC] border border-[#E2E8F0] rounded-md p-4">
                   {selectedEmail.body_preview}
                 </pre>
               </div>
             ) : (
               <div className="py-16 text-center text-xs text-[#64748B]">
-                Select an email log entry to inspect its full dispatch body and Google Apps Script links.
+                Select an email log entry to inspect its real SMTP delivery status, error diagnostics, and full dispatch body.
               </div>
             )}
           </div>
@@ -390,18 +697,29 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
     if (!isAdmin) {
       return (
         <div className="rounded-lg border border-[#E2E8F0] bg-white p-8 text-center text-xs text-[#64748B]">
-          Team &amp; Access management is restricted to Administrator accounts.
+          Team &amp; Access management is restricted to System Administrator accounts.
         </div>
       );
     }
 
+    const pendingUsersCount = staffUsers.filter((u) => u.status === 'pending').length;
+
     return (
       <div className="space-y-6">
-        <div className="border-b border-[#E2E8F0] pb-4">
-          <h1 className="text-xl font-bold text-[#0F172A]">Team &amp; Access</h1>
-          <p className="text-xs text-[#64748B] mt-0.5">
-            Create and manage <strong>Administrator</strong> (full access) and <strong>Manager (View Only)</strong> logins directly in SQLite.
-          </p>
+        <div className="flex flex-wrap items-end justify-between gap-4 border-b border-[#E2E8F0] pb-4">
+          <div>
+            <h1 className="text-xl font-bold text-[#0F172A]">Team &amp; Access Management</h1>
+            <p className="text-xs text-[#64748B] mt-0.5">
+              Review pending staff access requests, record approval provenance, enforce strict RBAC boundaries, and manage workspace accounts in SQLite.
+            </p>
+          </div>
+          {pendingUsersCount > 0 && (
+            <div className="inline-flex items-center gap-2 rounded-md border border-[#FDE68A] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#92400E]">
+              <Clock className="h-3.5 w-3.5 text-[#D97706]" />
+              <span className="font-mono tabular-nums">{pendingUsersCount}</span>
+              <span>Pending Access Request{pendingUsersCount > 1 ? 's' : ''}</span>
+            </div>
+          )}
         </div>
 
         {error && (
@@ -411,30 +729,85 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
           </div>
         )}
 
-        {/* Role Policy Overview */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {(['administrator', 'manager'] as StaffRole[]).map((roleKey) => (
-            <div key={roleKey} className="rounded-lg border border-[#E2E8F0] bg-white p-4 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
-                  <Shield className="h-4 w-4 text-[#0F766E]" />
-                  {ROLE_META[roleKey].badgeLabel}
-                </span>
-                <span className="font-mono text-[11px] font-semibold text-[#64748B]">{roleKey}</span>
-              </div>
-              <p className="text-xs text-[#475569] leading-relaxed">{ROLE_META[roleKey].summary}</p>
+        {/* Role Definition & Access Permissions Reference Card */}
+        <section className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
+          <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-5 py-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="inline-flex items-center gap-2 text-xs font-bold text-[#0F172A]">
+              <Shield className="h-4 w-4 text-[#0F766E]" />
+              <span>Role Definition &amp; Access Permissions</span>
             </div>
-          ))}
-        </div>
+            <span className="text-[11px] text-[#64748B]">
+              Enforced across every API route (HTTP 403 Forbidden) and UI control
+            </span>
+          </div>
 
-        {/* Create User Form */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-[#E2E8F0]">
+            {(['administrator', 'manager'] as StaffRole[]).map((roleKey) => {
+              const meta = ROLE_META[roleKey];
+              return (
+                <div key={roleKey} className="p-5 space-y-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="inline-flex items-center gap-2 text-sm font-bold text-[#0F172A]">
+                      {roleKey === 'administrator' ? (
+                        <Shield className="h-4 w-4 text-[#0F766E] shrink-0" />
+                      ) : (
+                        <Eye className="h-4 w-4 text-[#475569] shrink-0" />
+                      )}
+                      <span>{meta.title}</span>
+                    </div>
+                    <span className="font-mono text-[11px] font-semibold text-[#64748B]">
+                      {roleKey}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-[#475569] leading-relaxed">{meta.summary}</p>
+
+                  <div className="space-y-1.5 pt-1">
+                    <div className="text-[11px] font-semibold text-[#0F766E]">
+                      Allowed Permissions
+                    </div>
+                    <ul className="space-y-1.5 text-xs text-[#334155]">
+                      {meta.allowed.map((item) => (
+                        <li key={item} className="flex items-start gap-2">
+                          <Check className="h-3.5 w-3.5 text-[#15803D] shrink-0 mt-0.5" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="space-y-1.5 pt-2 border-t border-[#F1F5F9]">
+                    <div className="text-[11px] font-semibold text-[#B91C1C]">
+                      Access Limits &amp; Restrictions
+                    </div>
+                    <ul className="space-y-1.5 text-xs text-[#475569]">
+                      {meta.restricted.map((item) => (
+                        <li key={item} className="flex items-start gap-2">
+                          <Lock className="h-3.5 w-3.5 text-[#B91C1C] shrink-0 mt-0.5" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* Create User Form (Directly Approved by Current Administrator) */}
         <form
           onSubmit={handleCreateUser}
           className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4"
         >
-          <div className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
-            <UserPlus className="h-4 w-4 text-[#0F766E]" />
-            Create New User Login
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
+              <UserPlus className="h-4 w-4 text-[#0F766E]" />
+              <span>Create Directly Approved Staff Account</span>
+            </div>
+            <span className="text-[11px] text-[#64748B]">
+              Automatically records <span className="font-mono text-[#334155]">Approved By: {currentUser.name} ({currentUser.email})</span>
+            </span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <div>
@@ -492,8 +865,8 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                 onChange={(e) => setNewRole(e.target.value as StaffRole)}
                 className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-semibold text-[#0F172A]"
               >
-                <option value="manager">Manager (View Only)</option>
-                <option value="administrator">Administrator (Full Access)</option>
+                <option value="manager">Hiring Manager (View Only)</option>
+                <option value="administrator">System Administrator (Full Access)</option>
               </select>
             </div>
           </div>
@@ -501,20 +874,25 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
             <button
               type="submit"
               disabled={busy}
-              className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50 cursor-pointer"
             >
               <UserPlus className="h-3.5 w-3.5" />
-              Create User Account
+              Create &amp; Approve Account
             </button>
           </div>
         </form>
 
-        {/* Staff Accounts Table */}
+        {/* Staff Accounts & Approval Table */}
         <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
-          <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 flex items-center justify-between">
+          <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 flex flex-wrap items-center justify-between gap-2">
             <div className="inline-flex items-center gap-2 text-xs font-bold text-[#0F172A]">
               <Users className="h-4 w-4 text-[#0F766E]" />
-              Registered Workspace Users ({staffUsers.length})
+              <span>Registered Workspace Users ({staffUsers.length})</span>
+            </div>
+            <div className="text-[11px] text-[#64748B] font-mono tabular-nums">
+              {staffUsers.filter((u) => u.status === 'approved').length} Approved ·{' '}
+              {pendingUsersCount} Pending ·{' '}
+              {staffUsers.filter((u) => u.status === 'rejected').length} Rejected
             </div>
           </div>
 
@@ -522,36 +900,97 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
             <table className="w-full text-left text-xs">
               <thead className="border-b border-[#E2E8F0] bg-[#FAFBFC] text-[11px] uppercase tracking-wider text-[#64748B]">
                 <tr>
-                  <th className="px-4 py-2.5 font-semibold">Name</th>
-                  <th className="px-4 py-2.5 font-semibold">Work Email</th>
-                  <th className="px-4 py-2.5 font-semibold">Department</th>
-                  <th className="px-4 py-2.5 font-semibold">Role</th>
-                  <th className="px-4 py-2.5 font-semibold text-right">Actions</th>
+                  <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Name &amp; Email</th>
+                  <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Role</th>
+                  <th className="px-4 py-2.5 font-semibold">Access Limits</th>
+                  <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Status</th>
+                  <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Approved By</th>
+                  <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Approved Date</th>
+                  <th className="px-4 py-2.5 font-semibold text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E2E8F0]">
                 {staffUsers.map((u) => {
                   const isSelf = u.id === currentUser.id;
+                  const effectiveRole: StaffRole =
+                    u.status === 'pending' ? pendingRoleDrafts[u.id] || u.role : u.role;
+                  const approvedDateDisplay = u.approved_at
+                    ? formatAuditMytDisplay(u.approved_at).display
+                    : '—';
+
                   return (
-                    <tr key={u.id} className="hover:bg-[#FAFBFC]">
-                      <td className="px-4 py-3 font-semibold text-[#0F172A]">
-                        {u.name}{' '}
-                        {isSelf && <span className="text-[11px] font-mono text-[#0F766E]">(You)</span>}
+                    <tr
+                      key={u.id}
+                      className={
+                        u.status === 'pending'
+                          ? 'bg-[#FFFBEB]/50 hover:bg-[#FFFBEB]'
+                          : 'hover:bg-[#FAFBFC]'
+                      }
+                    >
+                      <td className="px-4 py-3 align-top">
+                        <div className="font-semibold text-[#0F172A]">
+                          {u.name}{' '}
+                          {isSelf && (
+                            <span className="text-[11px] font-mono text-[#0F766E]">(You)</span>
+                          )}
+                        </div>
+                        <div className="font-mono text-[11px] text-[#334155] mt-0.5">{u.email}</div>
+                        <div className="text-[11px] text-[#64748B] mt-0.5">{u.department}</div>
                       </td>
-                      <td className="px-4 py-3 font-mono text-[#334155]">{u.email}</td>
-                      <td className="px-4 py-3 text-[#475569]">{u.department}</td>
-                      <td className="px-4 py-3">
+
+                      <td className="px-4 py-3 align-top whitespace-nowrap">
                         <select
-                          value={u.role}
-                          disabled={busy}
+                          value={effectiveRole}
+                          disabled={busy || u.status === 'rejected'}
                           onChange={(e) => handleRoleChange(u, e.target.value as StaffRole)}
-                          className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-semibold text-[#0F172A]"
+                          className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-semibold text-[#0F172A] disabled:opacity-60"
                         >
-                          <option value="administrator">Administrator</option>
-                          <option value="manager">Manager (View Only)</option>
+                          <option value="administrator">System Administrator</option>
+                          <option value="manager">Hiring Manager (View Only)</option>
                         </select>
+                        {u.status === 'pending' && (
+                          <div className="text-[10px] text-[#92400E] mt-1">
+                            Confirm role before approving
+                          </div>
+                        )}
                       </td>
-                      <td className="px-4 py-3 text-right whitespace-nowrap">
+
+                      <td className="px-4 py-3 align-top text-[11px] text-[#475569] max-w-[230px] leading-snug">
+                        {ROLE_META[effectiveRole].accessLimits}
+                      </td>
+
+                      <td className="px-4 py-3 align-top whitespace-nowrap">
+                        {u.status === 'approved' ? (
+                          <span className="inline-flex items-center gap-1 font-semibold text-[#15803D]">
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                            <span>Approved</span>
+                          </span>
+                        ) : u.status === 'pending' ? (
+                          <span className="inline-flex items-center gap-1 font-semibold text-[#B45309]">
+                            <Clock className="h-3.5 w-3.5 shrink-0" />
+                            <span>Pending</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 font-semibold text-[#DC2626]">
+                            <XCircle className="h-3.5 w-3.5 shrink-0" />
+                            <span>Rejected</span>
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="px-4 py-3 align-top text-[11px] text-[#334155]">
+                        {u.status === 'pending' ? (
+                          <span className="text-[#94A3B8]">Awaiting Admin</span>
+                        ) : (
+                          <span className="font-medium">{u.approved_by || 'Initial System Setup'}</span>
+                        )}
+                      </td>
+
+                      <td className="px-4 py-3 align-top font-mono text-[11px] text-[#475569] whitespace-nowrap tabular-nums">
+                        {u.status === 'pending' ? '—' : approvedDateDisplay}
+                      </td>
+
+                      <td className="px-4 py-3 align-top text-right whitespace-nowrap">
                         {isSelf ? (
                           <span className="text-[11px] text-[#94A3B8]">Current Session</span>
                         ) : confirmDeleteUserId === u.id ? (
@@ -560,28 +999,80 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                               type="button"
                               disabled={busy}
                               onClick={() => handleDeleteUser(u)}
-                              className="rounded bg-[#DC2626] px-2 py-1 text-[11px] font-semibold text-white hover:bg-[#B91C1C]"
+                              className="rounded bg-[#DC2626] px-2 py-1 text-[11px] font-semibold text-white hover:bg-[#B91C1C] cursor-pointer"
                             >
                               Confirm Delete
                             </button>
                             <button
                               type="button"
                               onClick={() => setConfirmDeleteUserId(null)}
-                              className="rounded border border-[#CBD5E1] px-2 py-1 text-[11px] text-[#475569]"
+                              className="rounded border border-[#CBD5E1] px-2 py-1 text-[11px] text-[#475569] cursor-pointer"
                             >
                               Cancel
                             </button>
                           </div>
+                        ) : u.status === 'pending' ? (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleApproveUser(u)}
+                              className="inline-flex items-center gap-1 rounded bg-[#0F766E] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#115E59] disabled:opacity-50 cursor-pointer"
+                            >
+                              <UserCheck className="h-3 w-3" />
+                              <span>Approve</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleRejectUser(u)}
+                              className="inline-flex items-center gap-1 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50 cursor-pointer"
+                            >
+                              <XCircle className="h-3 w-3" />
+                              <span>Reject</span>
+                            </button>
+                          </div>
+                        ) : u.status === 'rejected' ? (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleApproveUser(u)}
+                              className="inline-flex items-center gap-1 rounded border border-[#0F766E]/40 bg-white px-2.5 py-1 text-[11px] font-semibold text-[#0F766E] hover:bg-[#F0FDFA] disabled:opacity-50 cursor-pointer"
+                            >
+                              <UserCheck className="h-3 w-3" />
+                              <span>Approve</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setConfirmDeleteUserId(u.id)}
+                              className="inline-flex items-center gap-1 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#DC2626] hover:bg-[#FEF2F2] cursor-pointer"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              <span>Delete</span>
+                            </button>
+                          </div>
                         ) : (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => setConfirmDeleteUserId(u.id)}
-                            className="inline-flex items-center gap-1 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#DC2626] hover:bg-[#FEF2F2]"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                            Delete
-                          </button>
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleRejectUser(u)}
+                              className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] font-medium text-[#475569] hover:bg-[#F8FAFC] disabled:opacity-50 cursor-pointer"
+                            >
+                              Suspend
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setConfirmDeleteUserId(u.id)}
+                              className="inline-flex items-center gap-1 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#DC2626] hover:bg-[#FEF2F2] cursor-pointer"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              <span>Delete</span>
+                            </button>
+                          </div>
                         )}
                       </td>
                     </tr>

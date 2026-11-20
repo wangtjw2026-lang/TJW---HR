@@ -34,6 +34,7 @@ import {
   deleteCandidate,
   getProtectedFileUrl,
   reanalyzeDocumentWithAi,
+  resendEmailLog,
   sendDocReminder,
   sendEmploymentOffer,
   submitPostInterviewDecision,
@@ -49,6 +50,7 @@ import {
   CandidateDocument,
   CandidateRecord,
   DocType,
+  EmailLogRecord,
   GOOGLE_APPS_SCRIPT_URLS,
   InterviewSlot,
   OfferStatus,
@@ -140,6 +142,14 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   const [busy, setBusy] = useState(false);
   const [uploadingDoc, setUploadingDoc] = useState<DocType | null>(null);
   const [analyzingDocId, setAnalyzingDocId] = useState<number | null>(null);
+  const [resendingEmailId, setResendingEmailId] = useState<number | null>(null);
+  const [emailBanner, setEmailBanner] = useState<{
+    status: 'SENT_SMTP' | 'SMTP_FAILED';
+    subject: string;
+    recipient: string;
+    error?: string;
+    messageId?: string;
+  } | null>(null);
   const [error, setError] = useState('');
   const [copiedPortal, setCopiedPortal] = useState(false);
 
@@ -221,6 +231,62 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     }
   };
 
+  const reportLatestEmailOutcome = (updated: CandidateRecord, actionLabel: string) => {
+    const latest = updated.recent_emails?.[0];
+    if (!latest) {
+      onNotify(actionLabel);
+      return;
+    }
+    const isSent = latest.delivery_status === 'SENT_SMTP';
+    setEmailBanner({
+      status: isSent ? 'SENT_SMTP' : 'SMTP_FAILED',
+      subject: latest.subject,
+      recipient: latest.recipient_email,
+      error: latest.smtp_error || undefined,
+      messageId: latest.message_id || undefined,
+    });
+    if (isSent) {
+      onNotify(`${actionLabel} — Sent via SMTP to ${latest.recipient_email}.`);
+    } else {
+      onNotify(
+        `${actionLabel} — SMTP Failed (${latest.recipient_email}): ${
+          latest.smtp_error || 'Check Gmail SMTP settings.'
+        }`
+      );
+    }
+  };
+
+  const handleResendCandidateEmail = async (log: EmailLogRecord) => {
+    if (!isAdmin) return;
+    setResendingEmailId(log.id);
+    setError('');
+    try {
+      const res = await resendEmailLog(log.id, 'Candidate Detail Drawer');
+      await onUpdated(res.candidate ?? undefined);
+      const isSent = res.emailDelivery.delivery_status === 'SENT_SMTP';
+      setEmailBanner({
+        status: isSent ? 'SENT_SMTP' : 'SMTP_FAILED',
+        subject: res.emailDelivery.subject,
+        recipient: res.emailDelivery.recipient_email,
+        error: res.emailDelivery.smtp_error || undefined,
+        messageId: res.emailDelivery.message_id || undefined,
+      });
+      if (isSent) {
+        onNotify(`Resent email via SMTP to ${res.emailDelivery.recipient_email}.`);
+      } else {
+        onNotify(
+          `SMTP resend failed (${res.emailDelivery.recipient_email}): ${
+            res.emailDelivery.smtp_error || 'Check Gmail SMTP settings.'
+          }`
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resend email.');
+    } finally {
+      setResendingEmailId(null);
+    }
+  };
+
   const handleScreening = async (decision: ScreeningDecision) => {
     if (!isAdmin) return;
     setBusy(true);
@@ -228,10 +294,11 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     try {
       const updated = await submitScreeningDecision(candidate.id, decision, screeningRemarks);
       await onUpdated(updated);
-      onNotify(
+      reportLatestEmailOutcome(
+        updated,
         decision === 'proceed'
-          ? `Shortlisted ${candidate.full_name} — Forms & Academic Docs email dispatched.`
-          : `Recorded screening rejection for ${candidate.full_name}.`
+          ? `Shortlisted ${candidate.full_name}`
+          : `Recorded screening rejection for ${candidate.full_name}`
       );
       if (decision === 'proceed') setActiveTab('documents');
     } catch (err) {
@@ -313,7 +380,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     try {
       const updated = await sendDocReminder(candidate.id);
       await onUpdated(updated);
-      onNotify(`Dispatched document submission reminder email to ${candidate.email}.`);
+      reportLatestEmailOutcome(updated, `Document reminder for ${candidate.full_name}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send reminder email.');
     } finally {
@@ -328,10 +395,11 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     try {
       const updated = await submitQualificationDecision(candidate.id, status, qualRemarks);
       await onUpdated(updated);
-      onNotify(
+      reportLatestEmailOutcome(
+        updated,
         status === 'qualified'
-          ? `${candidate.full_name} marked Qualified — Interview invitation sent with portal link.`
-          : `${candidate.full_name} marked Not Qualified.`
+          ? `${candidate.full_name} marked Qualified`
+          : `${candidate.full_name} marked Not Qualified`
       );
       if (status === 'qualified') setActiveTab('interview');
     } catch (err) {
@@ -349,7 +417,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
       const res = await bookInterviewSlotAtomically(Number(selectedSlotId), candidate.id);
       await onUpdated(res.candidate);
       setSelectedSlotId('');
-      onNotify(`Atomically booked interview slot for ${candidate.full_name} — confirmation emailed.`);
+      reportLatestEmailOutcome(res.candidate, `Booked interview slot for ${candidate.full_name}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Slot could not be booked.');
     } finally {
@@ -385,12 +453,12 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
         finalNotes
       );
       await onUpdated(updated);
-      onNotify(
-        decision === 'offer'
-          ? `Approved ${candidate.full_name} for employment offer.`
-          : `Recorded post-interview rejection for ${candidate.full_name}.`
-      );
-      if (decision === 'offer') setActiveTab('offer');
+      if (decision === 'reject') {
+        reportLatestEmailOutcome(updated, `Recorded post-interview rejection for ${candidate.full_name}`);
+      } else {
+        onNotify(`Approved ${candidate.full_name} for employment offer.`);
+        setActiveTab('offer');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit interview evaluation.');
     } finally {
@@ -417,7 +485,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
       });
       setOfferLetterFile(null);
       await onUpdated(updated);
-      onNotify(`Employment Offer (${formatMYR(offerSalary)}/mo) dispatched to ${candidate.email}.`);
+      reportLatestEmailOutcome(updated, `Employment Offer (${formatMYR(offerSalary)}/mo)`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to dispatch offer.');
     } finally {
@@ -590,6 +658,49 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
           <div className="mx-6 mt-4 flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C]">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <span>{error}</span>
+          </div>
+        )}
+
+        {/* Real SMTP Email Delivery Status Banner */}
+        {emailBanner && (
+          <div
+            className={`mx-6 mt-3 flex items-start justify-between gap-2 rounded-md border px-3.5 py-2.5 text-xs ${
+              emailBanner.status === 'SENT_SMTP'
+                ? 'border-[#BBF7D0] bg-[#F0FDF4] text-[#15803D]'
+                : 'border-[#FECACA] bg-[#FEF2F2] text-[#B91C1C]'
+            }`}
+          >
+            <div className="flex items-start gap-2 min-w-0">
+              {emailBanner.status === 'SENT_SMTP' ? (
+                <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              )}
+              <div className="min-w-0">
+                <div className="font-semibold">
+                  {emailBanner.status === 'SENT_SMTP'
+                    ? `Email Sent via SMTP to ${emailBanner.recipient}`
+                    : `SMTP Email Failed to ${emailBanner.recipient}`}
+                </div>
+                <div className="text-[11px] opacity-90 truncate">{emailBanner.subject}</div>
+                {emailBanner.error && (
+                  <div className="mt-1 font-mono text-[11px] break-words">{emailBanner.error}</div>
+                )}
+                {emailBanner.messageId && (
+                  <div className="mt-0.5 font-mono text-[10px] opacity-80">
+                    Message-ID: {emailBanner.messageId}
+                  </div>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setEmailBanner(null)}
+              className="rounded p-0.5 opacity-70 hover:opacity-100 shrink-0"
+              aria-label="Dismiss email delivery notice"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         )}
 
@@ -793,6 +904,76 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   </p>
                 )}
               </div>
+
+              {/* Candidate Email Dispatch & Real SMTP Delivery Status */}
+              {candidate.recent_emails && candidate.recent_emails.length > 0 && (
+                <div className="border border-[#E2E8F0] rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2.5">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#0F172A]">
+                      <Mail className="h-3.5 w-3.5 text-[#0F766E]" />
+                      Email Delivery History ({candidate.recent_emails.length})
+                    </span>
+                    <span className="text-[11px] text-[#64748B]">Live SMTP status per dispatch</span>
+                  </div>
+                  <div className="divide-y divide-[#E2E8F0] bg-white max-h-64 overflow-y-auto">
+                    {candidate.recent_emails.map((log) => {
+                      const isSent = log.delivery_status === 'SENT_SMTP';
+                      const isFailed =
+                        log.delivery_status === 'SMTP_FAILED' || log.delivery_status === 'SMTP_FAILED_LOGGED';
+                      return (
+                        <div key={log.id} className="px-4 py-2.5 space-y-1 text-xs">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="font-semibold text-[#0F172A]">{log.subject}</span>
+                              <span className="ml-2 font-mono text-[10px] text-[#64748B]">
+                                {formatTimestamp(log.created_at)}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span
+                                className={`inline-flex items-center gap-1 font-mono text-[10px] font-semibold ${
+                                  isSent
+                                    ? 'text-[#15803D]'
+                                    : isFailed
+                                      ? 'text-[#DC2626]'
+                                      : 'text-[#B45309]'
+                                }`}
+                              >
+                                {isSent ? (
+                                  <CheckCircle2 className="h-3 w-3" />
+                                ) : (
+                                  <AlertTriangle className="h-3 w-3" />
+                                )}
+                                {isSent ? 'Sent via SMTP' : isFailed ? 'SMTP Failed' : log.delivery_status}
+                              </span>
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  disabled={resendingEmailId === log.id}
+                                  onClick={() => void handleResendCandidateEmail(log)}
+                                  className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-0.5 text-[10px] font-semibold text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50"
+                                >
+                                  {resendingEmailId === log.id ? (
+                                    <Loader2 className="h-3 w-3 animate-spin text-[#0F766E]" />
+                                  ) : (
+                                    <RefreshCw className="h-3 w-3 text-[#0F766E]" />
+                                  )}
+                                  {resendingEmailId === log.id ? 'Resending...' : 'Resend'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          {log.smtp_error && (
+                            <div className="rounded border border-[#FECACA] bg-[#FEF2F2] px-2.5 py-1 font-mono text-[10px] text-[#B91C1C] break-words">
+                              {log.smtp_error}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div className="border-t border-[#E2E8F0] pt-4 flex items-center justify-between">
                 <span className="text-xs text-[#64748B]">

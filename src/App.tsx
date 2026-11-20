@@ -1,18 +1,24 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Calendar,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  Clock,
   Database,
   Eye,
   Globe,
   LayoutDashboard,
   Loader2,
+  Lock,
   LogOut,
   Mail,
   Plus,
   RefreshCw,
   Shield,
   Users,
+  X,
 } from 'lucide-react';
 import { AuthGate } from './components/AuthGate';
 import { CandidateDetailDrawer } from './components/CandidateDetailDrawer';
@@ -31,10 +37,13 @@ import {
   fetchInterviewSlots,
   fetchStaffUsers,
   getStoredToken,
+  keepSessionAlive,
   logCsvExport,
   logPageVisit,
-  logoutStaff,
+  logoutStaffSession,
+  registerSessionExpiredHandler,
   sendBatchDocReminders,
+  setCurrentAuditPage,
 } from './lib/apiService';
 import { exportCandidatesToExcelCsv } from './lib/atsHelpers';
 import {
@@ -60,6 +69,10 @@ const TAB_PAGE_NAMES: Record<NavTab, string> = {
   audit: 'Email Automation & Audit Trail',
 };
 
+const IDLE_WARNING_MS = 9 * 60 * 1000; // 9 minutes -> show 60s countdown warning
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes -> automatic PDPA logout
+const ACTIVITY_SYNC_INTERVAL_MS = 4 * 60 * 1000; // Sync server last_active_at every 4 min while user is actively interacting
+
 const EMPTY_FILTERS: CandidateFilters = {
   search: '',
   dateFrom: '',
@@ -79,11 +92,19 @@ function getPublicPortalTokenFromUrl(): string | null {
   return token && token.trim().length > 0 ? token.trim() : null;
 }
 
+function formatApprovalDateShort(ts?: string): string {
+  const raw = String(ts || '').trim();
+  if (!raw) return '—';
+  const parenIdx = raw.indexOf(' (');
+  return parenIdx > 0 ? raw.slice(0, parenIdx) : raw;
+}
+
 export default function App() {
   const publicPortalToken = useMemo(() => getPublicPortalTokenFromUrl(), []);
 
   const [staffUser, setStaffUser] = useState<StaffUser | null>(null);
   const [authChecking, setAuthChecking] = useState(!publicPortalToken);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [candidates, setCandidates] = useState<CandidateRecord[]>([]);
@@ -100,13 +121,28 @@ export default function App() {
   const [showIntakeModal, setShowIntakeModal] = useState(false);
   const [selectedCandidateId, setSelectedCandidateId] = useState<number | null>(null);
   const [portalPreviewCandidateId, setPortalPreviewCandidateId] = useState<number | null>(null);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+
+  // 10-minute PDPA inactivity auto-logout state
+  const [idleWarningSecondsLeft, setIdleWarningSecondsLeft] = useState<number | null>(null);
+  const [keepingAlive, setKeepingAlive] = useState(false);
 
   const lastTabVisitKeyRef = useRef<string>('');
   const lastModalVisitKeyRef = useRef<string>('');
   const lastDrawerVisitKeyRef = useRef<string>('');
+  const lastActivityAtRef = useRef<number>(Date.now());
+  const lastServerKeepAliveRef = useRef<number>(Date.now());
+  const idleWarningOpenRef = useRef<boolean>(false);
+  const idleLogoutInFlightRef = useRef<boolean>(false);
+  const activeTabRef = useRef<NavTab>('dashboard');
+  const profileMenuRef = useRef<HTMLDivElement | null>(null);
 
   const isAdmin = staffUser?.role === 'administrator';
+  const pendingApprovalCount = useMemo(
+    () => (isAdmin ? staffUsers.filter((u) => u.status === 'pending').length : 0),
+    [isAdmin, staffUsers]
+  );
 
   const notify = useCallback((message: string) => {
     setToast(message);
@@ -114,6 +150,172 @@ export default function App() {
       setToast((prev) => (prev === message ? null : prev));
     }, 4500);
   }, []);
+
+  const clearWorkspaceState = useCallback(() => {
+    setStaffUser(null);
+    setCandidates([]);
+    setSlots([]);
+    setEmailLogs([]);
+    setAuditLogs([]);
+    setStaffUsers([]);
+    setSelectedCandidateId(null);
+    setShowIntakeModal(false);
+    setProfileMenuOpen(false);
+    setIdleWarningSecondsLeft(null);
+    idleWarningOpenRef.current = false;
+    setActiveTab('dashboard');
+  }, []);
+
+  const performLogout = useCallback(
+    async (reason: 'manual' | 'idle_timeout', notice?: string) => {
+      const pageVisited = TAB_PAGE_NAMES[activeTabRef.current] || 'Pipeline Dashboard';
+      await logoutStaffSession({ reason, page_visited: pageVisited });
+      clearWorkspaceState();
+      if (notice) {
+        setSessionNotice(notice);
+      }
+    },
+    [clearWorkspaceState]
+  );
+
+  // Sync active page name for backend audit headers
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+    setCurrentAuditPage(TAB_PAGE_NAMES[activeTab]);
+  }, [activeTab]);
+
+  // Global listener for backend 401 / IDLE_TIMEOUT enforcement
+  useEffect(() => {
+    if (publicPortalToken) return;
+    registerSessionExpiredHandler(({ code, message }) => {
+      if (idleLogoutInFlightRef.current) return;
+      const isIdle = code === 'IDLE_TIMEOUT' || /10 minutes of inactivity/i.test(message);
+      clearWorkspaceState();
+      if (isIdle) {
+        setSessionNotice('Session expired after 10 minutes of inactivity.');
+      } else if (message) {
+        setSessionNotice(message);
+      }
+    });
+    return () => {
+      registerSessionExpiredHandler(null);
+    };
+  }, [publicPortalToken, clearWorkspaceState]);
+
+  // Close user profile popover on outside click or Escape
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(e.target as Node)) {
+        setProfileMenuOpen(false);
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setProfileMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [profileMenuOpen]);
+
+  // Frontend 10-minute inactivity tracker (9-min warning + 10-min auto-logout + active keep-alive sync)
+  useEffect(() => {
+    if (!staffUser || publicPortalToken) {
+      idleWarningOpenRef.current = false;
+      idleLogoutInFlightRef.current = false;
+      setIdleWarningSecondsLeft(null);
+      return;
+    }
+
+    const now = Date.now();
+    lastActivityAtRef.current = now;
+    lastServerKeepAliveRef.current = now;
+    idleWarningOpenRef.current = false;
+    idleLogoutInFlightRef.current = false;
+    setIdleWarningSecondsLeft(null);
+
+    const recordLocalActivity = () => {
+      // Once the 9-minute PDPA warning is visible, user must click "Stay Signed In" explicitly
+      if (idleWarningOpenRef.current) return;
+      lastActivityAtRef.current = Date.now();
+    };
+
+    const activityEvents: Array<keyof WindowEventMap> = [
+      'mousemove',
+      'mousedown',
+      'keydown',
+      'scroll',
+      'touchstart',
+      'click',
+    ];
+
+    for (const evt of activityEvents) {
+      window.addEventListener(evt, recordLocalActivity, { passive: true });
+    }
+
+    const intervalId = window.setInterval(() => {
+      const currentNow = Date.now();
+      const idleMs = currentNow - lastActivityAtRef.current;
+
+      if (idleMs >= IDLE_TIMEOUT_MS) {
+        if (!idleLogoutInFlightRef.current) {
+          idleLogoutInFlightRef.current = true;
+          void performLogout(
+            'idle_timeout',
+            'Session expired after 10 minutes of inactivity.'
+          ).finally(() => {
+            idleLogoutInFlightRef.current = false;
+          });
+        }
+        return;
+      }
+
+      if (idleMs >= IDLE_WARNING_MS) {
+        idleWarningOpenRef.current = true;
+        const remainingSec = Math.max(1, Math.ceil((IDLE_TIMEOUT_MS - idleMs) / 1000));
+        setIdleWarningSecondsLeft(remainingSec);
+        return;
+      }
+
+      // While genuinely active (not idle), periodically refresh server-side last_active_at
+      if (
+        currentNow - lastServerKeepAliveRef.current >= ACTIVITY_SYNC_INTERVAL_MS &&
+        lastActivityAtRef.current > lastServerKeepAliveRef.current
+      ) {
+        lastServerKeepAliveRef.current = currentNow;
+        void keepSessionAlive().catch(() => {
+          // 401 handled globally by registerSessionExpiredHandler
+        });
+      }
+    }, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+      for (const evt of activityEvents) {
+        window.removeEventListener(evt, recordLocalActivity);
+      }
+    };
+  }, [staffUser, publicPortalToken, performLogout]);
+
+  const handleStaySignedIn = async () => {
+    setKeepingAlive(true);
+    try {
+      await keepSessionAlive();
+      const now = Date.now();
+      lastActivityAtRef.current = now;
+      lastServerKeepAliveRef.current = now;
+      idleWarningOpenRef.current = false;
+      setIdleWarningSecondsLeft(null);
+      notify('Session extended. Inactivity timer reset to 10 minutes.');
+    } catch {
+      // If server already expired the session, global 401 handler will redirect to Login Gate
+    } finally {
+      setKeepingAlive(false);
+    }
+  };
 
   const refreshWorkspace = useCallback(async () => {
     if (!staffUser) return;
@@ -133,15 +335,18 @@ export default function App() {
       setStaffUsers(users);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load workspace data.';
-      if (msg.toLowerCase().includes('expired') || msg.toLowerCase().includes('unauthorized')) {
-        setStaffUser(null);
+      if (msg.toLowerCase().includes('inactivity')) {
+        clearWorkspaceState();
+        setSessionNotice('Session expired after 10 minutes of inactivity.');
+      } else if (msg.toLowerCase().includes('expired') || msg.toLowerCase().includes('unauthorized')) {
+        clearWorkspaceState();
       } else {
         notify(msg);
       }
     } finally {
       setLoadingWorkspace(false);
     }
-  }, [staffUser, notify]);
+  }, [staffUser, notify, clearWorkspaceState]);
 
   useEffect(() => {
     if (publicPortalToken) return;
@@ -260,7 +465,14 @@ export default function App() {
   if (!staffUser) {
     return (
       <ErrorBoundary>
-        <AuthGate onAuthenticated={(user) => setStaffUser(user)} />
+        <AuthGate
+          sessionNotice={sessionNotice}
+          onDismissNotice={() => setSessionNotice(null)}
+          onAuthenticated={(user) => {
+            setSessionNotice(null);
+            setStaffUser(user);
+          }}
+        />
       </ErrorBoundary>
     );
   }
@@ -271,24 +483,24 @@ export default function App() {
       : null;
 
   const handleLogout = () => {
-    logoutStaff();
-    setStaffUser(null);
-    setCandidates([]);
-    setSlots([]);
-    setEmailLogs([]);
-    setAuditLogs([]);
-    setStaffUsers([]);
-    setSelectedCandidateId(null);
-    setActiveTab('dashboard');
+    void performLogout('manual');
   };
 
   const handleBatchDocReminders = async (targets: CandidateRecord[]) => {
     if (!isAdmin || targets.length === 0) return;
     setSendingBatchReminders(true);
     try {
-      const count = await sendBatchDocReminders(targets.map((c) => c.id));
+      const result = await sendBatchDocReminders(targets.map((c) => c.id));
       await refreshWorkspace();
-      notify(`Dispatched ${count} document submission reminder email(s).`);
+      if (result.failedCount > 0) {
+        notify(
+          `Batch reminders: ${result.deliveredCount} sent via SMTP, ${result.failedCount} failed.${
+            result.lastError ? ` ${result.lastError}` : ''
+          }`
+        );
+      } else {
+        notify(`Dispatched ${result.deliveredCount} document reminder email(s) via SMTP.`);
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to send batch reminders.');
     } finally {
@@ -297,6 +509,10 @@ export default function App() {
   };
 
   const handleExportCsv = async (filtered: CandidateRecord[]) => {
+    if (!isAdmin) {
+      notify('Excel report exports require System Administrator privileges.');
+      return;
+    }
     setExportingCsv(true);
     try {
       exportCandidatesToExcelCsv(filtered, staffUser.role);
@@ -398,6 +614,14 @@ export default function App() {
                       {candidates.length}
                     </span>
                   )}
+                  {item.id === 'team' && pendingApprovalCount > 0 && (
+                    <span
+                      title={`${pendingApprovalCount} pending staff access request(s)`}
+                      className="ml-auto font-mono text-[11px] font-bold text-[#B45309] tabular-nums"
+                    >
+                      {pendingApprovalCount} pending
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -406,14 +630,21 @@ export default function App() {
           {/* Staff Profile Footer */}
           <div className="border-t border-[#E2E8F0] p-4 space-y-2.5 bg-[#FAFBFC]">
             <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-xs font-bold text-[#0F172A] truncate">{staffUser.name}</div>
+              <button
+                type="button"
+                onClick={() => setProfileMenuOpen(true)}
+                className="min-w-0 text-left group cursor-pointer"
+                title="View Role Definition & Access Permissions"
+              >
+                <div className="text-xs font-bold text-[#0F172A] truncate group-hover:text-[#0F766E] transition-colors">
+                  {staffUser.name}
+                </div>
                 <div className="text-[11px] text-[#64748B] truncate font-mono">{staffUser.email}</div>
                 <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-mono font-semibold text-[#0F766E]">
                   {isAdmin ? <Shield className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                  {roleMeta.badgeLabel}
+                  <span>{roleMeta.badgeLabel}</span>
                 </div>
-              </div>
+              </button>
               <button
                 type="button"
                 onClick={handleLogout}
@@ -428,8 +659,8 @@ export default function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 min-w-0 flex flex-col">
-          {/* Top Utility Bar with Explicit Role Badge */}
-          <header className="h-14 border-b border-[#E2E8F0] bg-white px-6 flex items-center justify-between gap-4">
+          {/* Top Utility Bar with Interactive Role Permissions Profile Menu */}
+          <header className="h-14 border-b border-[#E2E8F0] bg-white px-6 flex items-center justify-between gap-4 relative">
             <div className="text-xs text-[#64748B] truncate">
               <span className="font-semibold text-[#0F172A]">
                 {navItems.find((n) => n.id === activeTab)?.label}
@@ -439,22 +670,142 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3 shrink-0">
-              <span
-                className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-[11px] font-mono font-semibold whitespace-nowrap ${
-                  isAdmin
-                    ? 'border-[#0F766E]/30 bg-[#F0FDFA] text-[#0F766E]'
-                    : 'border-[#CBD5E1] bg-[#F8FAFC] text-[#334155]'
-                }`}
-              >
-                {isAdmin ? <Shield className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                {roleMeta.badgeLabel}
-              </span>
+              {/* Interactive User Profile & Role Permissions Menu */}
+              <div className="relative" ref={profileMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setProfileMenuOpen((prev) => !prev)}
+                  aria-expanded={profileMenuOpen}
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                    isAdmin
+                      ? 'border-[#0F766E]/30 bg-[#F0FDFA] text-[#0F766E] hover:bg-[#CCFBF1]/60'
+                      : 'border-[#CBD5E1] bg-[#F8FAFC] text-[#334155] hover:bg-[#F1F5F9]'
+                  }`}
+                >
+                  {isAdmin ? <Shield className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  <span>{roleMeta.badgeLabel}</span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform ${profileMenuOpen ? 'rotate-180' : ''}`}
+                  />
+                </button>
+
+                {profileMenuOpen && (
+                  <div className="absolute right-0 mt-2 w-[360px] max-w-[calc(100vw-2rem)] rounded-lg border border-[#E2E8F0] bg-white shadow-lg z-40 overflow-hidden">
+                    <div className="px-4 py-3 border-b border-[#E2E8F0] bg-[#F8FAFC] flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-[#0F172A] truncate">{staffUser.name}</div>
+                        <div className="text-[11px] font-mono text-[#475569] truncate">
+                          {staffUser.email}
+                        </div>
+                        <div className="text-[11px] text-[#64748B] mt-0.5">
+                          {staffUser.department}
+                          {staffUser.approved_by && (
+                            <>
+                              {' '}
+                              · Approved by{' '}
+                              <span className="text-[#334155] font-medium">
+                                {staffUser.approved_by}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                        {staffUser.approved_at && (
+                          <div className="text-[10px] font-mono text-[#64748B] mt-0.5 tabular-nums">
+                            Approved: {formatApprovalDateShort(staffUser.approved_at)}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setProfileMenuOpen(false)}
+                        className="rounded p-1 text-[#64748B] hover:bg-[#E2E8F0]/60 cursor-pointer"
+                        aria-label="Close profile menu"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+
+                    {/* Role Definition & Access Permissions Reference Card */}
+                    <div className="p-4 space-y-3 max-h-[65vh] overflow-y-auto">
+                      <div>
+                        <div className="text-[11px] font-bold text-[#0F172A]">
+                          Role Definition &amp; Access Permissions
+                        </div>
+                        <div className="mt-1 inline-flex items-center gap-1.5 text-xs font-semibold text-[#0F766E]">
+                          {isAdmin ? <Shield className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                          <span>{roleMeta.title}</span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="text-[11px] font-semibold text-[#15803D]">
+                          Permitted Actions
+                        </div>
+                        <ul className="space-y-1 text-[11px] text-[#334155] leading-snug">
+                          {roleMeta.allowed.map((item) => (
+                            <li key={item} className="flex items-start gap-1.5">
+                              <Check className="h-3 w-3 text-[#15803D] shrink-0 mt-0.5" />
+                              <span>{item}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div className="space-y-1 pt-2 border-t border-[#F1F5F9]">
+                        <div className="text-[11px] font-semibold text-[#B91C1C]">
+                          Access Restrictions
+                        </div>
+                        <ul className="space-y-1 text-[11px] text-[#475569] leading-snug">
+                          {roleMeta.restricted.map((item) => (
+                            <li key={item} className="flex items-start gap-1.5">
+                              <Lock className="h-3 w-3 text-[#B91C1C] shrink-0 mt-0.5" />
+                              <span>{item}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div className="pt-2 border-t border-[#F1F5F9] flex items-center gap-1.5 text-[11px] text-[#64748B]">
+                        <Clock className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
+                        <span>PDPA session lock: auto-logout after 10 minutes of inactivity.</span>
+                      </div>
+                    </div>
+
+                    <div className="px-4 py-2.5 border-t border-[#E2E8F0] bg-[#FAFBFC] flex items-center justify-between gap-2">
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProfileMenuOpen(false);
+                            setActiveTab('team');
+                          }}
+                          className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#0F766E] hover:underline cursor-pointer"
+                        >
+                          <Users className="h-3.5 w-3.5" />
+                          <span>Manage Team &amp; Approvals</span>
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-[#64748B]">View &amp; Review Only</span>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={handleLogout}
+                        className="inline-flex items-center gap-1.5 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] cursor-pointer"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        <span>Sign Out</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               <button
                 type="button"
                 onClick={() => void refreshWorkspace()}
                 disabled={loadingWorkspace}
-                className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50 cursor-pointer"
+                className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50 cursor-pointer whitespace-nowrap"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${loadingWorkspace ? 'animate-spin' : ''}`} />
                 Refresh
@@ -582,6 +933,64 @@ export default function App() {
               setActiveTab('portal');
             }}
           />
+        )}
+
+        {/* 9-Minute PDPA Inactivity Auto-Logout Countdown Warning Modal */}
+        {idleWarningSecondsLeft !== null && (
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="idle-warning-title"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#0F172A]/60 p-4"
+          >
+            <div className="w-full max-w-md rounded-lg border border-[#FDE68A] bg-white shadow-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-[#FEF3C7] bg-[#FFFBEB] flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <AlertTriangle className="h-5 w-5 text-[#D97706] shrink-0" />
+                  <h2 id="idle-warning-title" className="text-sm font-bold text-[#92400E]">
+                    Inactivity Timeout Warning
+                  </h2>
+                </div>
+                <span className="font-mono text-sm font-bold text-[#B91C1C] tabular-nums">
+                  {idleWarningSecondsLeft}s
+                </span>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <p className="text-xs leading-relaxed text-[#334155]">
+                  You have been idle for 9 minutes. You will be automatically logged out in{' '}
+                  <strong className="font-mono text-[#B91C1C] tabular-nums">
+                    {idleWarningSecondsLeft} second{idleWarningSecondsLeft === 1 ? '' : 's'}
+                  </strong>{' '}
+                  for PDPA data security unless you click <strong>Stay Signed In</strong>.
+                </p>
+
+                <div className="flex items-center justify-end gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3.5 py-2 text-xs font-semibold text-[#475569] hover:bg-[#F8FAFC] cursor-pointer"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span>Sign Out Now</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={keepingAlive}
+                    onClick={() => void handleStaySignedIn()}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-60 cursor-pointer"
+                  >
+                    {keepingAlive ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Shield className="h-3.5 w-3.5" />
+                    )}
+                    <span>{keepingAlive ? 'Extending Session...' : 'Stay Signed In'}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Toast Notification */}

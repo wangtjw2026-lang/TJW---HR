@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -23,6 +24,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'talentflow-my-dev-jwt-secret-change-in-prod';
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes of inactivity
 
 const EMPLOYMENT_FORM_URL =
   'https://script.google.com/macros/s/AKfycbzmwDILioaOGbozPl9t13wCJLpdF_T99WHAglBDJJXvEZTmWIt2oilSNYLyyatK6cG0/exec';
@@ -30,6 +32,7 @@ const DISC_FORM_URL =
   'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec';
 
 type StaffRole = 'administrator' | 'manager';
+type UserApprovalStatus = 'pending' | 'approved' | 'rejected';
 type AuditActorRole = 'administrator' | 'manager' | 'candidate_portal' | 'system';
 
 interface AuthPayload {
@@ -38,10 +41,17 @@ interface AuthPayload {
   name: string;
   role: StaffRole;
   department: string;
+  status?: UserApprovalStatus;
+  approved_by?: string;
+  approved_at?: string;
+  created_at?: string;
+  sid?: string;
+  iat?: number;
 }
 
 interface AuthedRequest extends Request {
   user?: AuthPayload;
+  sessionId?: string;
 }
 
 // =============================================================================
@@ -73,42 +83,176 @@ const memoryUpload = multer({
 });
 
 // =============================================================================
-// EMAIL AUTOMATION (Nodemailer with SQLite email_logs + console fallback)
+// LIVE GMAIL / SMTP EMAIL AUTOMATION (Nodemailer + SQLite email_logs)
 // =============================================================================
-function createMailTransporter() {
-  const rawHost = String(process.env.SMTP_HOST || '')
-    .replace(/^["']|["']$/g, '')
-    .trim();
-  const nonRoutableHosts = new Set(['', 'localhost', '127.0.0.1', '::1', '0.0.0.0', 'smtp.example.com']);
-  if (!rawHost || nonRoutableHosts.has(rawHost.toLowerCase())) {
-    return null;
-  }
-
-  const smtpUser = String(process.env.SMTP_USER || '')
-    .replace(/^["']|["']$/g, '')
-    .trim();
-  const smtpPass = String(process.env.SMTP_PASS || '')
-    .replace(/^["']|["']$/g, '')
-    .trim();
-  const smtpPort = Number(String(process.env.SMTP_PORT || '587').replace(/^["']|["']$/g, '').trim()) || 587;
-  const smtpSecure =
-    String(process.env.SMTP_SECURE || '')
-      .replace(/^["']|["']$/g, '')
-      .trim()
-      .toLowerCase() === 'true';
-
-  return nodemailer.createTransport({
-    host: rawHost,
-    port: smtpPort,
-    secure: smtpSecure,
-    connectionTimeout: 5_000,
-    greetingTimeout: 5_000,
-    socketTimeout: 10_000,
-    auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
-  });
+interface SmtpRuntimeConfig {
+  configured: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  pass: string;
+  from: string;
+  reason: string;
 }
 
-const mailTransporter = createMailTransporter();
+interface EmailDeliveryResult {
+  id: number;
+  delivery_status: 'SENT_SMTP' | 'SMTP_FAILED' | 'LOGGED_LOCAL';
+  smtp_error: string;
+  message_id: string;
+  recipient_email: string;
+  subject: string;
+  template_type: string;
+}
+
+function cleanEnvValue(val: unknown): string {
+  return String(val ?? '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
+
+function maskEmailUser(email: string): string {
+  const clean = email.trim();
+  if (!clean) return '';
+  const atIdx = clean.indexOf('@');
+  if (atIdx <= 2) return clean;
+  return `${clean.slice(0, 2)}***${clean.slice(atIdx)}`;
+}
+
+function getSmtpRuntimeConfig(): SmtpRuntimeConfig {
+  const rawHost = cleanEnvValue(process.env.SMTP_HOST);
+  const smtpUser = cleanEnvValue(process.env.SMTP_USER);
+  const rawPass = cleanEnvValue(process.env.SMTP_PASS);
+  const rawPort = cleanEnvValue(process.env.SMTP_PORT);
+  const rawSecure = cleanEnvValue(process.env.SMTP_SECURE).toLowerCase();
+  const rawFrom = cleanEnvValue(process.env.SMTP_FROM);
+
+  const nonRoutableHosts = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', 'smtp.example.com']);
+  const isGmailUser = /@(gmail|googlemail)\.com$/i.test(smtpUser);
+
+  // If SMTP_HOST is omitted but a Gmail user+pass is set, default cleanly to smtp.gmail.com
+  const host =
+    rawHost && !nonRoutableHosts.has(rawHost.toLowerCase())
+      ? rawHost
+      : isGmailUser && rawPass
+        ? 'smtp.gmail.com'
+        : '';
+
+  const isGmailHost = /gmail\.com$/i.test(host);
+  const port = Number(rawPort) || (rawSecure === 'true' ? 465 : 587);
+  const secure = rawSecure === 'true' || port === 465;
+
+  // Google displays 16-char App Passwords with spaces ("xxxx xxxx xxxx xxxx"); strip spaces for Gmail SMTP
+  const pass = isGmailHost ? rawPass.replace(/\s+/g, '') : rawPass;
+  const from =
+    rawFrom && !/your-email@gmail\.com|hr@company\.com/i.test(rawFrom)
+      ? rawFrom
+      : smtpUser
+        ? `TalentFlow MY HR <${smtpUser}>`
+        : 'TalentFlow MY HR <hr@company.com>';
+
+  if (!host) {
+    return {
+      configured: false,
+      host: rawHost || '',
+      port,
+      secure,
+      user: smtpUser,
+      pass: '',
+      from,
+      reason: rawHost && nonRoutableHosts.has(rawHost.toLowerCase())
+        ? `SMTP_HOST is set to "${rawHost}" which is not reachable. Set SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_USER, SMTP_PASS (16-char Gmail App Password), and SMTP_FROM in Settings > Secrets.`
+        : 'Gmail SMTP is not configured. Set SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_USER, SMTP_PASS (16-char Gmail App Password), and SMTP_FROM in Settings > Secrets.',
+    };
+  }
+
+  if (isGmailHost && (!smtpUser || !pass)) {
+    return {
+      configured: false,
+      host,
+      port,
+      secure,
+      user: smtpUser,
+      pass: '',
+      from,
+      reason:
+        'Gmail SMTP requires both SMTP_USER (your Gmail address) and SMTP_PASS (16-character Google App Password) in Settings > Secrets.',
+    };
+  }
+
+  return {
+    configured: true,
+    host,
+    port,
+    secure,
+    user: smtpUser,
+    pass,
+    from,
+    reason: '',
+  };
+}
+
+function getPublicSmtpStatus() {
+  const cfg = getSmtpRuntimeConfig();
+  return {
+    configured: cfg.configured,
+    host: cfg.host,
+    port: cfg.port,
+    secure: cfg.secure,
+    from: cfg.from,
+    userMasked: maskEmailUser(cfg.user),
+    ...(cfg.reason ? { reason: cfg.reason } : {}),
+  };
+}
+
+function createLiveMailTransporter() {
+  const cfg = getSmtpRuntimeConfig();
+  if (!cfg.configured) {
+    return { transporter: null, config: cfg };
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure: cfg.secure,
+    requireTLS: !cfg.secure && cfg.port === 587,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
+    tls: {
+      minVersion: 'TLSv1.2',
+    },
+    auth: cfg.user && cfg.pass ? { user: cfg.user, pass: cfg.pass } : undefined,
+  });
+
+  return { transporter, config: cfg };
+}
+
+function formatSmtpError(err: unknown): string {
+  if (!err || typeof err !== 'object') {
+    return String(err || 'Unknown SMTP delivery error.');
+  }
+  const e = err as {
+    code?: string;
+    responseCode?: number;
+    response?: string;
+    command?: string;
+    message?: string;
+  };
+  const raw = String(e.response || e.message || 'SMTP delivery failed.').trim();
+  if (e.responseCode === 535 || /535|Username and Password not accepted|BadCredentials/i.test(raw)) {
+    return `Gmail SMTP authentication failed (535): ${raw}. Ensure 2-Step Verification is enabled and SMTP_PASS is a 16-character Google App Password (not your regular Gmail password).`;
+  }
+  if (e.code === 'ECONNREFUSED') {
+    return `SMTP connection refused (${raw}). Verify SMTP_HOST (smtp.gmail.com) and SMTP_PORT (587 or 465).`;
+  }
+  if (e.code === 'ETIMEDOUT' || /timeout/i.test(raw)) {
+    return `SMTP connection timed out (${raw}). Check SMTP_HOST, SMTP_PORT (587 or 465), and firewall rules.`;
+  }
+  const prefix = e.code ? `[${e.code}] ` : e.responseCode ? `[SMTP ${e.responseCode}] ` : '';
+  return `${prefix}${raw}`.slice(0, 600);
+}
 
 function extractClientContext(req?: Request): { ipAddress: string; userAgent: string } {
   if (!req) {
@@ -247,33 +391,45 @@ async function dispatchEmail(params: {
   actorRole?: AuditActorRole;
   pageVisited?: string;
   skipAuditLog?: boolean;
-}) {
-  let deliveryStatus = 'LOGGED_LOCAL';
-  if (mailTransporter) {
+}): Promise<EmailDeliveryResult> {
+  const { transporter, config } = createLiveMailTransporter();
+  let deliveryStatus: 'SENT_SMTP' | 'SMTP_FAILED' | 'LOGGED_LOCAL' = 'SMTP_FAILED';
+  let smtpError = '';
+  let messageId = '';
+
+  if (transporter) {
     try {
-      await mailTransporter.sendMail({
-        from: process.env.SMTP_FROM || 'TalentFlow MY HR <hr@company.com>',
+      const info = await transporter.sendMail({
+        from: config.from,
         to: params.recipientEmail,
         subject: params.subject,
         text: params.bodyText,
       });
       deliveryStatus = 'SENT_SMTP';
+      messageId = String(info?.messageId || '').trim().slice(0, 200);
+      console.log(
+        `[Email Automation] SENT_SMTP via ${config.host}:${config.port} -> ${params.recipientEmail} (messageId=${messageId || 'n/a'})`
+      );
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.log(`[Email Automation] SMTP unavailable (${reason}); recorded email in SQLite email_logs.`);
-      deliveryStatus = 'LOGGED_LOCAL';
+      deliveryStatus = 'SMTP_FAILED';
+      smtpError = formatSmtpError(err);
+      console.log(
+        `[Email Automation] SMTP_FAILED via ${config.host}:${config.port} -> ${params.recipientEmail}: ${smtpError}`
+      );
     }
   } else {
+    deliveryStatus = 'SMTP_FAILED';
+    smtpError = config.reason;
     console.log(
-      `\n[TalentFlow MY Email] (${params.templateType}) -> ${params.recipientEmail}\nSubject: ${params.subject}\n${params.bodyText}\n`
+      `[Email Automation] SMTP_FAILED (not configured) -> ${params.recipientEmail}: ${smtpError}`
     );
   }
 
-  db.prepare(`
+  const insertInfo = db.prepare(`
     INSERT INTO email_logs (
       candidate_id, candidate_name, recipient_email, template_type,
-      subject, body_preview, stage_triggered, delivery_status, triggered_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      subject, body_preview, stage_triggered, delivery_status, smtp_error, message_id, triggered_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     params.candidateId,
     params.candidateName,
@@ -283,8 +439,12 @@ async function dispatchEmail(params: {
     params.bodyText,
     params.stageTriggered,
     deliveryStatus,
+    smtpError,
+    messageId,
     params.triggeredBy
   );
+
+  const logId = Number(insertInfo.lastInsertRowid);
 
   if (!params.skipAuditLog) {
     logAudit({
@@ -297,9 +457,22 @@ async function dispatchEmail(params: {
       targetEntity: params.candidateName
         ? `${params.candidateName} <${params.recipientEmail}>`
         : params.recipientEmail,
-      details: `Dispatched "${params.templateType}" email (${deliveryStatus}) — Subject: ${params.subject}`,
+      details:
+        deliveryStatus === 'SENT_SMTP'
+          ? `Sent "${params.templateType}" email via SMTP (${config.host}) — Subject: ${params.subject}${messageId ? ` (Message-ID: ${messageId})` : ''}`
+          : `Failed to send "${params.templateType}" email via SMTP — Subject: ${params.subject}. Error: ${smtpError}`,
     });
   }
+
+  return {
+    id: logId,
+    delivery_status: deliveryStatus,
+    smtp_error: smtpError,
+    message_id: messageId,
+    recipient_email: params.recipientEmail,
+    subject: params.subject,
+    template_type: params.templateType,
+  };
 }
 
 function getAppBaseUrl(req: Request): string {
@@ -1241,14 +1414,185 @@ async function runAndPersistDocumentExtraction(params: {
 }
 
 // =============================================================================
-// AUTH & RBAC MIDDLEWARE
+// AUTH, SESSION IDLE ENFORCEMENT (10 MIN) & RBAC MIDDLEWARE
 // =============================================================================
+interface ActiveSessionRecord {
+  userId: number;
+  lastActiveMs: number;
+  revoked: boolean;
+  idleAuditLogged: boolean;
+}
+
+const sessionActivityMap = new Map<string, ActiveSessionRecord>();
+const recentIdleAuditByUser = new Map<number, number>();
+
+function registerActiveSession(userId: number): string {
+  const sid = crypto.randomBytes(16).toString('hex');
+  const now = Date.now();
+  sessionActivityMap.set(sid, {
+    userId,
+    lastActiveMs: now,
+    revoked: false,
+    idleAuditLogged: false,
+  });
+  db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), userId);
+  return sid;
+}
+
+function recordIdleAutoLogoutOnce(params: {
+  req: Request;
+  user: AuthPayload;
+  sid?: string;
+  pageVisited: string;
+  details: string;
+}) {
+  const now = Date.now();
+  if (params.sid) {
+    const existing = sessionActivityMap.get(params.sid);
+    if (existing?.idleAuditLogged) return;
+    sessionActivityMap.set(params.sid, {
+      userId: params.user.id,
+      lastActiveMs: existing?.lastActiveMs ?? now,
+      revoked: true,
+      idleAuditLogged: true,
+    });
+  } else {
+    const prev = recentIdleAuditByUser.get(params.user.id) || 0;
+    if (now - prev < 10_000) return;
+  }
+  recentIdleAuditByUser.set(params.user.id, now);
+
+  logAudit({
+    req: params.req,
+    actor: params.user,
+    pageVisited: params.pageVisited,
+    actionTaken: 'AUTO_LOGOUT_IDLE',
+    targetEntity: `${params.user.name} (${params.user.email})`,
+    details: params.details,
+  });
+}
+
 function verifyJwtToken(token: string): AuthPayload | null {
   try {
     return jwt.verify(token, JWT_SECRET) as AuthPayload;
   } catch {
     return null;
   }
+}
+
+function validateSessionAndIdle(
+  decoded: AuthPayload,
+  req: Request,
+  touchActivity: boolean
+):
+  | {
+      ok: true;
+      user: AuthPayload;
+    }
+  | {
+      ok: false;
+      statusCode: number;
+      error: string;
+      code?: string;
+    } {
+  const dbUser = db
+    .prepare(
+      'SELECT id, name, email, role, department, status, approved_by, approved_at, last_active_at, created_at FROM users WHERE id = ?'
+    )
+    .get(decoded.id) as (AuthPayload & { last_active_at?: string }) | undefined;
+
+  if (!dbUser) {
+    return { ok: false, statusCode: 401, error: 'Account no longer exists.' };
+  }
+
+  if (dbUser.status === 'pending') {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Your account is pending approval by a System Administrator.',
+      code: 'PENDING_APPROVAL',
+    };
+  }
+
+  if (dbUser.status !== 'approved') {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Your account access has been revoked or rejected. Contact a System Administrator.',
+      code: 'ACCOUNT_REJECTED',
+    };
+  }
+
+  const now = Date.now();
+  const sid = typeof decoded.sid === 'string' ? decoded.sid : '';
+  const memSession = sid ? sessionActivityMap.get(sid) : undefined;
+
+  if (memSession?.revoked) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: 'Session has been signed out. Please sign in again.',
+      code: 'SESSION_REVOKED',
+    };
+  }
+
+  let lastActiveMs: number | null = null;
+  if (memSession) {
+    lastActiveMs = memSession.lastActiveMs;
+  } else if (dbUser.last_active_at) {
+    const parsedDb = Date.parse(dbUser.last_active_at);
+    if (!Number.isNaN(parsedDb)) {
+      lastActiveMs = parsedDb;
+    }
+  } else if (decoded.iat) {
+    lastActiveMs = decoded.iat * 1000;
+  }
+
+  if (lastActiveMs !== null && now - lastActiveMs > IDLE_TIMEOUT_MS) {
+    const idleMinutes = Math.floor((now - lastActiveMs) / 60000);
+    const pageHeader = String(req.headers['x-page-visited'] || 'Workspace Session').trim();
+    recordIdleAutoLogoutOnce({
+      req,
+      user: dbUser,
+      sid: sid || undefined,
+      pageVisited: pageHeader || 'Workspace Session',
+      details: `Session automatically terminated after exceeding 10 minutes of inactivity (${idleMinutes} min idle).`,
+    });
+    return {
+      ok: false,
+      statusCode: 401,
+      error: 'Session expired due to 10 minutes of inactivity',
+      code: 'IDLE_TIMEOUT',
+    };
+  }
+
+  if (touchActivity) {
+    if (sid) {
+      sessionActivityMap.set(sid, {
+        userId: dbUser.id,
+        lastActiveMs: now,
+        revoked: false,
+        idleAuditLogged: false,
+      });
+    }
+    db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), dbUser.id);
+  }
+
+  return {
+    ok: true,
+    user: {
+      id: dbUser.id,
+      name: dbUser.name,
+      email: dbUser.email,
+      role: dbUser.role,
+      department: dbUser.department,
+      status: dbUser.status,
+      approved_by: dbUser.approved_by,
+      approved_at: dbUser.approved_at,
+      created_at: dbUser.created_at,
+      sid,
+    },
+  };
 }
 
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -1263,14 +1607,18 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     res.status(401).json({ error: 'Session expired or invalid token. Please sign in again.' });
     return;
   }
-  const dbUser = db
-    .prepare('SELECT id, name, email, role, department FROM users WHERE id = ?')
-    .get(decoded.id) as AuthPayload | undefined;
-  if (!dbUser) {
-    res.status(401).json({ error: 'Account no longer exists.' });
+
+  const sessionCheck = validateSessionAndIdle(decoded, req, true);
+  if (!sessionCheck.ok) {
+    res.status(sessionCheck.statusCode).json({
+      error: sessionCheck.error,
+      ...(sessionCheck.code ? { code: sessionCheck.code } : {}),
+    });
     return;
   }
-  req.user = dbUser;
+
+  req.user = sessionCheck.user;
+  req.sessionId = sessionCheck.user.sid;
   next();
 }
 
@@ -1278,7 +1626,8 @@ function requireRole(...allowedRoles: StaffRole[]) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
     if (!req.user || !allowedRoles.includes(req.user.role)) {
       res.status(403).json({
-        error: 'Forbidden: Administrator role is required to perform this action.',
+        error:
+          'Forbidden: System Administrator privileges are required for this action. Hiring Manager accounts are restricted to View & Review Only.',
       });
       return;
     }
@@ -1404,6 +1753,11 @@ function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CAND
           created_at: String(offerRow.created_at),
         }
       : null,
+    recent_emails: isCandidatePortal
+      ? undefined
+      : (db
+          .prepare('SELECT * FROM email_logs WHERE candidate_id = ? ORDER BY id DESC LIMIT 15')
+          .all(candidateId) as Array<Record<string, unknown>>),
   };
 }
 
@@ -1525,7 +1879,7 @@ async function startServer() {
   });
 
   // ===========================================================================
-  // 1. AUTHENTICATION, FIRST-RUN ADMIN SETUP & STAFF RBAC ROUTES
+  // 1. AUTHENTICATION, FIRST-RUN ADMIN SETUP, APPROVAL WORKFLOW & RBAC ROUTES
   // ===========================================================================
   app.get('/api/auth/setup-status', (_req: Request, res: Response) => {
     const row = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
@@ -1540,7 +1894,7 @@ async function startServer() {
 
     const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
     if (existingCount > 0) {
-      res.status(403).json({ error: 'Initial HR Admin account already exists. Please sign in.' });
+      res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
       return;
     }
 
@@ -1552,22 +1906,32 @@ async function startServer() {
     }
 
     const hash = bcrypt.hashSync(password, 10);
+    const approvedAt = formatAuditTimestamp(new Date());
+    const nowIso = new Date().toISOString();
     const createInitialAdmin = db.transaction(() => {
       const countInsideTx = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
       if (countInsideTx > 0) {
         return null;
       }
       const info = db
-        .prepare('INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, ?, ?)')
-        .run(name, email, hash, 'administrator', department);
+        .prepare(
+          `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+           VALUES (?, ?, ?, 'administrator', ?, 'approved', 'Initial System Setup', ?, ?)`
+        )
+        .run(name, email, hash, department, approvedAt, nowIso);
       return db
-        .prepare('SELECT id, name, email, role, department, created_at FROM users WHERE id = ?')
+        .prepare(
+          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+        )
         .get(info.lastInsertRowid) as {
         id: number;
         name: string;
         email: string;
         role: StaffRole;
         department: string;
+        status: UserApprovalStatus;
+        approved_by: string;
+        approved_at: string;
         created_at: string;
       };
     });
@@ -1578,12 +1942,14 @@ async function startServer() {
       return;
     }
 
+    const sid = registerActiveSession(createdUser.id);
     const payload: AuthPayload = {
       id: createdUser.id,
       email: createdUser.email,
       name: createdUser.name,
       role: createdUser.role,
       department: createdUser.department,
+      sid,
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
@@ -1594,10 +1960,78 @@ async function startServer() {
       pageVisited: 'Login Gate',
       actionTaken: 'CREATE_USER',
       targetEntity: `${createdUser.name} (${createdUser.email})`,
-      details: `Registered initial Administrator account (${createdUser.email}, ${createdUser.department}).`,
+      details: `Registered initial System Administrator account (${createdUser.email}, ${createdUser.department}). Approved by: Initial System Setup.`,
     });
 
     res.status(201).json({ token, user: createdUser });
+  });
+
+  // Public staff self-registration request (creates account with status = 'pending' until approved by Administrator)
+  app.post('/api/auth/register-request', (req: Request, res: Response) => {
+    const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+    if (existingCount === 0) {
+      res.status(400).json({
+        error: 'No System Administrator exists yet. Please complete Initial System Setup first.',
+      });
+      return;
+    }
+
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const requestedRole: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+
+    if (!name || !email || !email.includes('@') || password.length < 8) {
+      res.status(400).json({
+        error: 'Full name, valid work email, and a password of at least 8 characters are required.',
+      });
+      return;
+    }
+
+    const existing = db.prepare('SELECT id, status FROM users WHERE lower(email) = ?').get(email) as
+      | { id: number; status: UserApprovalStatus }
+      | undefined;
+    if (existing) {
+      const msg =
+        existing.status === 'pending'
+          ? 'An access request for this email is already pending approval by a System Administrator.'
+          : 'A staff account with this email already exists.';
+      res.status(409).json({ error: msg });
+      return;
+    }
+
+    const hash = bcrypt.hashSync(password, 10);
+    const info = db
+      .prepare(
+        `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', '', '', '')`
+      )
+      .run(name, email, hash, requestedRole, department);
+
+    const newUserId = Number(info.lastInsertRowid);
+    logAudit({
+      req,
+      actorId: newUserId,
+      actorName: `${name} (${email})`,
+      actorRole: requestedRole,
+      pageVisited: 'Login Gate',
+      actionTaken: 'REGISTER_ACCESS_REQUEST',
+      targetEntity: `${name} (${email})`,
+      details: `Submitted new staff access request for ${name} (${email}, ${department}) requesting role "${requestedRole}". Status: pending System Administrator approval.`,
+    });
+
+    const created = db
+      .prepare(
+        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+      )
+      .get(newUserId);
+
+    res.status(201).json({
+      message:
+        'Your staff access request has been submitted and is pending approval by a System Administrator.',
+      user: created,
+    });
   });
 
   app.post('/api/auth/login', (req: Request, res: Response) => {
@@ -1610,9 +2044,17 @@ async function startServer() {
     }
 
     const user = db
-      .prepare('SELECT id, name, email, password_hash, role, department, created_at FROM users WHERE lower(email) = ?')
+      .prepare(
+        'SELECT id, name, email, password_hash, role, department, status, approved_by, approved_at, created_at FROM users WHERE lower(email) = ?'
+      )
       .get(email) as
-      | (AuthPayload & { password_hash: string; created_at: string })
+      | (AuthPayload & {
+          password_hash: string;
+          status: UserApprovalStatus;
+          approved_by: string;
+          approved_at: string;
+          created_at: string;
+        })
       | undefined;
 
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -1632,12 +2074,46 @@ async function startServer() {
       return;
     }
 
+    if (user.status === 'pending') {
+      logAudit({
+        req,
+        actorId: user.id,
+        actorName: `${user.name} (${user.email})`,
+        actorRole: user.role,
+        pageVisited: 'Login Gate',
+        actionTaken: 'LOGIN_FAILED',
+        targetEntity: `${user.name} (${user.email})`,
+        details: `Blocked login attempt for ${user.email}: account is pending approval by a System Administrator.`,
+      });
+      res.status(403).json({ error: 'Your account is pending approval by a System Administrator.' });
+      return;
+    }
+
+    if (user.status !== 'approved') {
+      logAudit({
+        req,
+        actorId: user.id,
+        actorName: `${user.name} (${user.email})`,
+        actorRole: user.role,
+        pageVisited: 'Login Gate',
+        actionTaken: 'LOGIN_FAILED',
+        targetEntity: `${user.name} (${user.email})`,
+        details: `Blocked login attempt for ${user.email}: account status is "${user.status}".`,
+      });
+      res.status(403).json({
+        error: 'Your access request was not approved. Please contact a System Administrator.',
+      });
+      return;
+    }
+
+    const sid = registerActiveSession(user.id);
     const payload: AuthPayload = {
       id: user.id,
       email: user.email,
       name: user.name,
       role: user.role,
       department: user.department,
+      sid,
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
@@ -1659,9 +2135,67 @@ async function startServer() {
         email: user.email,
         role: user.role,
         department: user.department,
+        status: user.status,
+        approved_by: user.approved_by,
+        approved_at: user.approved_at,
         created_at: user.created_at,
       },
     });
+  });
+
+  // Explicit logout & 10-minute idle auto-logout endpoint (revokes session and logs immutable audit event)
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    const reason = String(req.body?.reason || 'manual').trim().toLowerCase();
+    const pageVisited = String(req.body?.page_visited || 'Pipeline Dashboard').trim() || 'Pipeline Dashboard';
+
+    if (token) {
+      const decoded = verifyJwtToken(token);
+      if (decoded) {
+        const dbUser = db
+          .prepare('SELECT id, name, email, role, department, status, approved_by, approved_at FROM users WHERE id = ?')
+          .get(decoded.id) as AuthPayload | undefined;
+
+        const actor = dbUser || decoded;
+        const sid = typeof decoded.sid === 'string' ? decoded.sid : '';
+
+        if (reason === 'idle_timeout') {
+          recordIdleAutoLogoutOnce({
+            req,
+            user: actor,
+            sid: sid || undefined,
+            pageVisited,
+            details: `Automatically logged out ${actor.name} (${actor.email}) after 10 minutes of inactivity on ${pageVisited}.`,
+          });
+        } else {
+          if (sid) {
+            const existing = sessionActivityMap.get(sid);
+            sessionActivityMap.set(sid, {
+              userId: actor.id,
+              lastActiveMs: existing?.lastActiveMs ?? Date.now(),
+              revoked: true,
+              idleAuditLogged: existing?.idleAuditLogged ?? false,
+            });
+          }
+          logAudit({
+            req,
+            actor,
+            pageVisited,
+            actionTaken: 'LOGOUT',
+            targetEntity: `${actor.name} (${actor.email})`,
+            details: `${actor.name} (${actor.email}) signed out manually from ${pageVisited}.`,
+          });
+        }
+      }
+    }
+
+    res.json({ loggedOut: true });
+  });
+
+  // Keep-alive heartbeat triggered only when user clicks "Stay Signed In" or has verified local activity
+  app.post('/api/auth/keep-alive', requireAuth, (_req: AuthedRequest, res: Response) => {
+    res.json({ ok: true, last_active_at: new Date().toISOString() });
   });
 
   app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
@@ -1670,7 +2204,11 @@ async function startServer() {
 
   app.get('/api/users', requireAuth, requireRole('administrator'), (_req: AuthedRequest, res: Response) => {
     const users = db
-      .prepare('SELECT id, name, email, role, department, created_at FROM users ORDER BY id ASC')
+      .prepare(
+        `SELECT id, name, email, role, department, status, approved_by, approved_at, created_at
+         FROM users
+         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, id ASC`
+      )
       .all();
     res.json({ users });
   });
@@ -1694,9 +2232,15 @@ async function startServer() {
     }
 
     const hash = bcrypt.hashSync(password, 10);
+    const approvedBy = `${req.user!.name} (${req.user!.email})`;
+    const approvedAt = formatAuditTimestamp(new Date());
+
     const info = db
-      .prepare('INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, ?, ?)')
-      .run(name, email, hash, role, department);
+      .prepare(
+        `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, 'approved', ?, ?, '')`
+      )
+      .run(name, email, hash, role, department, approvedBy, approvedAt);
 
     logAudit({
       req,
@@ -1704,34 +2248,174 @@ async function startServer() {
       pageVisited: 'Team & Access Management',
       actionTaken: 'CREATE_USER',
       targetEntity: `${name} (${email})`,
-      details: `Created ${role} account for ${name} (${email}, ${department}).`,
+      details: `Created & approved ${role} account for ${name} (${email}, ${department}). Approved by ${approvedBy}.`,
     });
 
     const created = db
-      .prepare('SELECT id, name, email, role, department, created_at FROM users WHERE id = ?')
+      .prepare(
+        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+      )
       .get(info.lastInsertRowid);
     res.status(201).json({ user: created });
   });
+
+  app.patch(
+    '/api/users/:id/approve',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const targetId = Number(req.params.id);
+      const target = db
+        .prepare('SELECT id, name, email, role, department, status FROM users WHERE id = ?')
+        .get(targetId) as
+        | {
+            id: number;
+            name: string;
+            email: string;
+            role: StaffRole;
+            department: string;
+            status: UserApprovalStatus;
+          }
+        | undefined;
+
+      if (!target) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
+      }
+
+      const assignedRole: StaffRole =
+        req.body?.role === 'administrator'
+          ? 'administrator'
+          : req.body?.role === 'manager'
+            ? 'manager'
+            : target.role;
+      const assignedDepartment =
+        String(req.body?.department || target.department || 'Human Resources').trim() || 'Human Resources';
+
+      const approvedBy = `${req.user!.name} (${req.user!.email})`;
+      const approvedAt = formatAuditTimestamp(new Date());
+
+      db.prepare(
+        `UPDATE users
+         SET status = 'approved', role = ?, department = ?, approved_by = ?, approved_at = ?
+         WHERE id = ?`
+      ).run(assignedRole, assignedDepartment, approvedBy, approvedAt, targetId);
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'APPROVE_USER',
+        targetEntity: `${target.name} (${target.email})`,
+        details: `Approved staff account for ${target.name} (${target.email}) from status "${target.status}" to "approved" with assigned role "${assignedRole}" (${assignedDepartment}). Approved by ${approvedBy}.`,
+      });
+
+      const updated = db
+        .prepare(
+          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+        )
+        .get(targetId);
+      res.json({ user: updated });
+    }
+  );
+
+  app.patch(
+    '/api/users/:id/reject',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const targetId = Number(req.params.id);
+      if (req.user && targetId === req.user.id) {
+        res.status(400).json({ error: 'You cannot reject or suspend your own currently signed-in account.' });
+        return;
+      }
+
+      const target = db
+        .prepare('SELECT id, name, email, role, department, status FROM users WHERE id = ?')
+        .get(targetId) as
+        | {
+            id: number;
+            name: string;
+            email: string;
+            role: StaffRole;
+            department: string;
+            status: UserApprovalStatus;
+          }
+        | undefined;
+
+      if (!target) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
+      }
+
+      if (target.role === 'administrator' && target.status === 'approved') {
+        const adminCount = (
+          db
+            .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+            .get() as { count: number }
+        ).count;
+        if (adminCount <= 1) {
+          res.status(400).json({ error: 'Cannot reject or suspend the last remaining active Administrator account.' });
+          return;
+        }
+      }
+
+      const reason = String(req.body?.reason || '').trim();
+      const reviewedBy = `${req.user!.name} (${req.user!.email})`;
+      const reviewedAt = formatAuditTimestamp(new Date());
+
+      db.prepare(
+        `UPDATE users
+         SET status = 'rejected', approved_by = ?, approved_at = ?, last_active_at = ''
+         WHERE id = ?`
+      ).run(`Rejected by ${reviewedBy}`, reviewedAt, targetId);
+
+      // Immediately revoke any active in-memory sessions for this user
+      for (const [sid, session] of sessionActivityMap.entries()) {
+        if (session.userId === targetId) {
+          sessionActivityMap.set(sid, { ...session, revoked: true });
+        }
+      }
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'REJECT_USER',
+        targetEntity: `${target.name} (${target.email})`,
+        details: `Rejected/suspended ${target.role} account ${target.name} (${target.email}) (previous status: "${target.status}")${reason ? `. Reason: ${reason}` : ''}.`,
+      });
+
+      const updated = db
+        .prepare(
+          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+        )
+        .get(targetId);
+      res.json({ user: updated });
+    }
+  );
 
   app.patch('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const targetId = Number(req.params.id);
     const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
     const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
 
-    const target = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(targetId) as
-      | { id: number; name: string; email: string; role: StaffRole }
+    const target = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(targetId) as
+      | { id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }
       | undefined;
     if (!target) {
       res.status(404).json({ error: 'User account not found.' });
       return;
     }
 
-    if (target.role === 'administrator' && role !== 'administrator') {
+    if (target.role === 'administrator' && target.status === 'approved' && role !== 'administrator') {
       const adminCount = (
-        db.prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator'`).get() as { count: number }
+        db
+          .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+          .get() as { count: number }
       ).count;
       if (adminCount <= 1) {
-        res.status(400).json({ error: 'Cannot demote the last remaining Administrator account.' });
+        res.status(400).json({ error: 'Cannot demote the last remaining active Administrator account.' });
         return;
       }
     }
@@ -1747,7 +2431,9 @@ async function startServer() {
     });
 
     const updated = db
-      .prepare('SELECT id, name, email, role, department, created_at FROM users WHERE id = ?')
+      .prepare(
+        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
+      )
       .get(targetId);
     res.json({ user: updated });
   });
@@ -1759,32 +2445,40 @@ async function startServer() {
       return;
     }
 
-    const target = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(targetId) as
-      | { id: number; name: string; email: string; role: StaffRole }
+    const target = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(targetId) as
+      | { id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }
       | undefined;
     if (!target) {
       res.status(404).json({ error: 'User account not found.' });
       return;
     }
 
-    if (target.role === 'administrator') {
+    if (target.role === 'administrator' && target.status === 'approved') {
       const adminCount = (
-        db.prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator'`).get() as { count: number }
+        db
+          .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+          .get() as { count: number }
       ).count;
       if (adminCount <= 1) {
-        res.status(400).json({ error: 'Cannot delete the last remaining Administrator account.' });
+        res.status(400).json({ error: 'Cannot delete the last remaining active Administrator account.' });
         return;
       }
     }
 
     db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+    for (const [sid, session] of sessionActivityMap.entries()) {
+      if (session.userId === targetId) {
+        sessionActivityMap.set(sid, { ...session, revoked: true });
+      }
+    }
+
     logAudit({
       req,
       actor: req.user,
       pageVisited: 'Team & Access Management',
       actionTaken: 'DELETE_USER',
       targetEntity: `${target.name} (${target.email})`,
-      details: `Removed ${target.role} account (${target.email}).`,
+      details: `Removed ${target.role} account (${target.email}, status: ${target.status}).`,
     });
 
     res.json({ deleted: true });
@@ -2512,7 +3206,7 @@ async function startServer() {
       WHERE id = ?
     `).run(nowIso, id);
 
-    await dispatchEmail({
+    const emailDelivery = await dispatchEmail({
       candidateId: id,
       candidateName: String(candidate.full_name),
       recipientEmail: String(candidate.email),
@@ -2542,17 +3236,23 @@ async function startServer() {
       pageVisited: 'Candidate Detail Drawer',
       actionTaken: 'SEND_EMAIL',
       targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
-      details: `Sent document reminder email to ${candidate.email} (${missing.length} outstanding item(s)).`,
+      details:
+        emailDelivery.delivery_status === 'SENT_SMTP'
+          ? `Sent document reminder email via SMTP to ${candidate.email} (${missing.length} outstanding item(s)).`
+          : `Attempted document reminder email to ${candidate.email} — SMTP_FAILED: ${emailDelivery.smtp_error}`,
     });
 
     const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
-    res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
+    res.json({ candidate: hydrateCandidate(updated, req.user!.role), emailDelivery });
   });
 
   // Batch 48h Missing-Docs Reminder
   app.post('/api/candidates/remind-docs-batch', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     const ids = Array.isArray(req.body?.candidateIds) ? req.body.candidateIds.map(Number) : [];
     let sentCount = 0;
+    let deliveredCount = 0;
+    let failedCount = 0;
+    let lastError = '';
 
     for (const id of ids) {
       const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
@@ -2569,7 +3269,7 @@ async function startServer() {
         WHERE id = ?
       `).run(new Date().toISOString().slice(0, 19), id);
 
-      await dispatchEmail({
+      const delivery = await dispatchEmail({
         candidateId: id,
         candidateName: String(candidate.full_name),
         recipientEmail: String(candidate.email),
@@ -2592,6 +3292,12 @@ async function startServer() {
         skipAuditLog: true,
       });
       sentCount++;
+      if (delivery.delivery_status === 'SENT_SMTP') {
+        deliveredCount++;
+      } else {
+        failedCount++;
+        if (delivery.smtp_error) lastError = delivery.smtp_error;
+      }
     }
 
     logAudit({
@@ -2600,10 +3306,10 @@ async function startServer() {
       pageVisited: 'Email Automation & Audit Trail',
       actionTaken: 'SEND_EMAIL',
       targetEntity: `Batch Document Reminders (${sentCount} candidates)`,
-      details: `Dispatched batch document submission reminder emails to ${sentCount} candidate(s).`,
+      details: `Processed batch document reminders: ${deliveredCount} sent via SMTP, ${failedCount} failed${lastError ? ` (Last error: ${lastError})` : ''}.`,
     });
 
-    res.json({ sentCount });
+    res.json({ sentCount, deliveredCount, failedCount, lastError });
   });
 
   // Stage 13: Create/Send Employment Offer (HR Admin only, optional offer letter PDF)
@@ -3363,8 +4069,20 @@ async function startServer() {
 
     let authorized = false;
 
-    if (jwtRaw && verifyJwtToken(jwtRaw)) {
-      authorized = true;
+    if (jwtRaw) {
+      const decoded = verifyJwtToken(jwtRaw);
+      if (decoded) {
+        const sessionCheck = validateSessionAndIdle(decoded, req, true);
+        if (sessionCheck.ok) {
+          authorized = true;
+        } else {
+          res.status(sessionCheck.statusCode).json({
+            error: sessionCheck.error,
+            ...(sessionCheck.code ? { code: sessionCheck.code } : {}),
+          });
+          return;
+        }
+      }
     } else if (portalToken) {
       const cand = db.prepare('SELECT id FROM candidates WHERE portal_token = ?').get(portalToken) as
         | { id: number }
@@ -3401,7 +4119,97 @@ async function startServer() {
   // ===========================================================================
   app.get('/api/email-logs', requireAuth, (_req: AuthedRequest, res: Response) => {
     const emailLogs = db.prepare('SELECT * FROM email_logs ORDER BY id DESC LIMIT 200').all();
-    res.json({ emailLogs });
+    res.json({ emailLogs, smtpStatus: getPublicSmtpStatus() });
+  });
+
+  // Resend any previously logged email via live Gmail SMTP (Administrator only)
+  app.post(
+    '/api/email-logs/:id/resend',
+    requireAuth,
+    requireRole('administrator'),
+    async (req: AuthedRequest, res: Response) => {
+      const logId = Number(req.params.id);
+      if (!Number.isInteger(logId) || logId <= 0) {
+        res.status(400).json({ error: 'Invalid email log ID.' });
+        return;
+      }
+
+      const original = db.prepare('SELECT * FROM email_logs WHERE id = ?').get(logId) as
+        | {
+            id: number;
+            candidate_id: number | null;
+            candidate_name: string;
+            recipient_email: string;
+            template_type: string;
+            subject: string;
+            body_preview: string;
+            stage_triggered: number;
+          }
+        | undefined;
+
+      if (!original) {
+        res.status(404).json({ error: 'Email log entry not found.' });
+        return;
+      }
+
+      const pageVisited = String(req.body?.page_visited || 'Email Automation & Audit Trail').trim();
+
+      const emailDelivery = await dispatchEmail({
+        candidateId: original.candidate_id,
+        candidateName: original.candidate_name,
+        recipientEmail: original.recipient_email,
+        templateType: original.template_type,
+        subject: original.subject,
+        bodyText: original.body_preview,
+        stageTriggered: original.stage_triggered,
+        triggeredBy: req.user!.email,
+        req,
+        actor: req.user,
+        pageVisited,
+      });
+
+      const emailLog = db.prepare('SELECT * FROM email_logs WHERE id = ?').get(emailDelivery.id);
+      const candidateRow = original.candidate_id
+        ? (db.prepare('SELECT * FROM candidates WHERE id = ?').get(original.candidate_id) as
+            | Record<string, unknown>
+            | undefined)
+        : undefined;
+
+      res.json({
+        emailDelivery,
+        emailLog,
+        candidate: candidateRow ? hydrateCandidate(candidateRow, req.user!.role) : null,
+      });
+    }
+  );
+
+  // Live Gmail SMTP connection verification check (Administrator only)
+  app.post('/api/smtp/verify', requireAuth, requireRole('administrator'), async (_req: AuthedRequest, res: Response) => {
+    const smtpStatus = getPublicSmtpStatus();
+    const { transporter, config } = createLiveMailTransporter();
+    if (!transporter) {
+      res.json({
+        ok: false,
+        error: config.reason,
+        smtpStatus,
+      });
+      return;
+    }
+
+    try {
+      await transporter.verify();
+      res.json({
+        ok: true,
+        error: '',
+        smtpStatus,
+      });
+    } catch (err) {
+      res.json({
+        ok: false,
+        error: formatSmtpError(err),
+        smtpStatus,
+      });
+    }
   });
 
   // Strict immutability enforcement: explicitly reject ANY DELETE, PUT, or PATCH on audit_logs
@@ -3486,8 +4294,8 @@ async function startServer() {
     res.status(201).json({ logged: true });
   });
 
-  // Record candidate report CSV export
-  app.post('/api/audit-logs/export', requireAuth, (req: AuthedRequest, res: Response) => {
+  // Record candidate report CSV export (Administrator only)
+  app.post('/api/audit-logs/export', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const count = Number(req.body?.count) || 0;
     const filterSummary = String(req.body?.filter_summary || '').trim();
     logAudit({

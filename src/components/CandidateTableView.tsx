@@ -94,11 +94,11 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
               </button>
             ) : (
               <div
-                title="Excel/CSV exports containing MYR salaries require HR Admin role."
+                title="Excel/CSV exports require System Administrator privileges."
                 className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-500 bg-slate-100 border border-slate-200 rounded-md whitespace-nowrap shrink-0"
               >
                 <Lock className="w-3.5 h-3.5" />
-                <span>CSV Export · HR Admin Only</span>
+                <span>Excel Export · Administrator Only</span>
               </div>
             )}
           </div>
