@@ -13,10 +13,10 @@ import {
   ExternalLink,
   FileText,
   GraduationCap,
-  Link2,
   Loader2,
   Mail,
   MapPin,
+  MessageCircle,
   Phone,
   Printer,
   RefreshCw,
@@ -33,6 +33,7 @@ import {
   bookInterviewSlotAtomically,
   deleteCandidate,
   getProtectedFileUrl,
+  logWhatsAppOutreach,
   reanalyzeDocumentWithAi,
   resendEmailLog,
   sendDocReminder,
@@ -45,13 +46,25 @@ import {
   updateOfferStatus,
   uploadCandidateDocument,
 } from '../lib/apiService';
-import { formatMYR, formatTimestamp, getDoc, getMissingMandatoryDocs } from '../lib/atsHelpers';
+import {
+  buildWhatsAppMessage,
+  formatMalaysiaWhatsAppUrl,
+  formatMYR,
+  formatTimestamp,
+  getDefaultWhatsAppTemplateKey,
+  getDoc,
+  getMissingMandatoryDocs,
+  getWhatsAppTemplateLabel,
+  normalizeMalaysiaMobile,
+  openExternalWhatsAppUrl,
+  WHATSAPP_TEMPLATES,
+  WhatsAppTemplateKey,
+} from '../lib/atsHelpers';
 import {
   CandidateDocument,
   CandidateRecord,
   DocType,
   EmailLogRecord,
-  GOOGLE_APPS_SCRIPT_URLS,
   InterviewSlot,
   OfferStatus,
   PostInterviewDecision,
@@ -79,26 +92,29 @@ const DOC_META: Array<{
   label: string;
   requiredLabel: string;
   allowUpload: boolean;
-  externalUrl?: string;
 }> = [
   {
-    type: 'APP_FORM',
+    type: 'APPLICATION_FORM',
     label: 'Employment Application Form',
-    requiredLabel: 'Mandatory · Google Apps Script',
-    allowUpload: false,
-    externalUrl: GOOGLE_APPS_SCRIPT_URLS.employmentApplicationForm,
+    requiredLabel: 'Mandatory · Direct File Upload',
+    allowUpload: true,
   },
   {
     type: 'DISC',
-    label: 'DISC Personality Assessment',
-    requiredLabel: 'Mandatory · Google Apps Script',
-    allowUpload: false,
-    externalUrl: GOOGLE_APPS_SCRIPT_URLS.discPersonalityAssessment,
+    label: 'DISC Assessment Report / Sheet',
+    requiredLabel: 'Mandatory · Direct File Upload',
+    allowUpload: true,
+  },
+  {
+    type: 'VAKAD',
+    label: 'VAKAD Assessment Report / Sheet',
+    requiredLabel: 'Mandatory · Direct File Upload',
+    allowUpload: true,
   },
   {
     type: 'SPM',
     label: 'SPM Examination Results',
-    requiredLabel: 'Mandatory Academic Doc',
+    requiredLabel: 'Mandatory · Academic Document',
     allowUpload: true,
   },
   {
@@ -110,13 +126,13 @@ const DOC_META: Array<{
   {
     type: 'DEGREE',
     label: 'University Degree Certificate',
-    requiredLabel: 'Mandatory Academic Doc',
+    requiredLabel: 'Mandatory · Academic Document',
     allowUpload: true,
   },
   {
     type: 'TRANSCRIPT',
     label: 'University Academic Transcript',
-    requiredLabel: 'Mandatory Academic Doc',
+    requiredLabel: 'Mandatory · Academic Document',
     allowUpload: true,
   },
 ];
@@ -189,6 +205,15 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   );
   const [confirmDelete, setConfirmDelete] = useState(false);
 
+  // WhatsApp Outreach state
+  const [whatsAppTemplate, setWhatsAppTemplate] = useState<WhatsAppTemplateKey>(() =>
+    getDefaultWhatsAppTemplateKey(candidate.stage)
+  );
+  const [whatsAppMessage, setWhatsAppMessage] = useState<string>(() =>
+    buildWhatsAppMessage(candidate, getDefaultWhatsAppTemplateKey(candidate.stage))
+  );
+  const [whatsAppPopoverOpen, setWhatsAppPopoverOpen] = useState(false);
+
   useEffect(() => {
     setScreeningRemarks(candidate.screening_remarks || '');
     setDiscProfile(candidate.disc_profile || '');
@@ -197,6 +222,10 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     setInterviewFeedback(candidate.interview_feedback || '');
     setInterviewRating(candidate.interview_rating || 4);
     setFinalNotes(candidate.final_decision_notes || '');
+    const defaultTpl = getDefaultWhatsAppTemplateKey(candidate.stage);
+    setWhatsAppTemplate(defaultTpl);
+    setWhatsAppMessage(buildWhatsAppMessage(candidate, defaultTpl));
+    setWhatsAppPopoverOpen(false);
     if (candidate.offer) {
       if (candidate.offer.salary_myr !== null) setOfferSalary(candidate.offer.salary_myr);
       if (candidate.offer.allowance_myr !== null) setOfferAllowance(candidate.offer.allowance_myr);
@@ -207,6 +236,60 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
       setOfferResponseNote(candidate.offer.candidate_response_note || '');
     }
   }, [candidate]);
+
+  const normalizedWhatsAppPhone = normalizeMalaysiaMobile(candidate.phone);
+  const whatsAppDisabledReason = normalizedWhatsAppPhone
+    ? ''
+    : 'Valid Malaysian mobile number required (e.g., 011-31832623 or +6012-3456789).';
+
+  const handleSelectWhatsAppTemplate = (nextKey: WhatsAppTemplateKey) => {
+    setWhatsAppTemplate(nextKey);
+    setWhatsAppMessage(buildWhatsAppMessage(candidate, nextKey));
+  };
+
+  const handleLaunchWhatsApp = (options?: {
+    templateKey?: WhatsAppTemplateKey;
+    useStageDefault?: boolean;
+    closePopover?: boolean;
+  }) => {
+    if (!isAdmin) return;
+    const chosenKey = options?.templateKey
+      ? options.templateKey
+      : options?.useStageDefault
+        ? getDefaultWhatsAppTemplateKey(candidate.stage)
+        : whatsAppTemplate;
+
+    const finalMessage =
+      options?.templateKey || options?.useStageDefault
+        ? buildWhatsAppMessage(candidate, chosenKey)
+        : whatsAppMessage.trim() || buildWhatsAppMessage(candidate, chosenKey);
+
+    const waUrl = formatMalaysiaWhatsAppUrl(candidate.phone, finalMessage);
+    const normalized = normalizeMalaysiaMobile(candidate.phone);
+    if (!waUrl || !normalized) {
+      onNotify(`Cannot open WhatsApp: ${candidate.full_name} does not have a valid Malaysian mobile number.`);
+      return;
+    }
+
+    openExternalWhatsAppUrl(waUrl);
+    if (options?.closePopover) {
+      setWhatsAppPopoverOpen(false);
+    }
+
+    const templateLabel = getWhatsAppTemplateLabel(chosenKey);
+    onNotify(`Opened WhatsApp for ${candidate.full_name} (+${normalized}) · ${templateLabel}`);
+
+    void logWhatsAppOutreach(candidate.id, {
+      phone: candidate.phone,
+      normalizedPhone: normalized,
+      templateName: templateLabel,
+      pageVisited: 'Candidate Detail Drawer',
+    })
+      .then(() => onUpdated())
+      .catch(() => {
+        // Non-blocking: WhatsApp tab already opened
+      });
+  };
 
   const portalUrl =
     typeof window !== 'undefined'
@@ -560,11 +643,27 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="relative flex items-center gap-2 shrink-0">
+            {isAdmin && (
+              <button
+                type="button"
+                disabled={!normalizedWhatsAppPhone}
+                onClick={() => setWhatsAppPopoverOpen((prev) => !prev)}
+                title={
+                  normalizedWhatsAppPhone
+                    ? `Send WhatsApp message to +${normalizedWhatsAppPhone}`
+                    : whatsAppDisabledReason
+                }
+                className="inline-flex items-center gap-1.5 rounded-md bg-[#16A34A] border border-[#15803D] px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-[#15803D] disabled:bg-[#E2E8F0] disabled:border-[#CBD5E1] disabled:text-[#94A3B8] disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <MessageCircle className="h-3.5 w-3.5 text-[#DCFCE7]" />
+                WhatsApp Candidate
+              </button>
+            )}
             <button
               type="button"
               onClick={copyPortalLink}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] transition-colors whitespace-nowrap shrink-0"
               title="Copy public candidate self-service portal URL"
             >
               {copiedPortal ? <Check className="h-3.5 w-3.5 text-[#15803D]" /> : <Copy className="h-3.5 w-3.5" />}
@@ -573,7 +672,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
             <button
               type="button"
               onClick={() => onOpenPortalPreview(candidate)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1.5 text-xs font-semibold text-[#0F766E] hover:bg-[#CCFBF1] transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1.5 text-xs font-semibold text-[#0F766E] hover:bg-[#CCFBF1] transition-colors whitespace-nowrap shrink-0"
             >
               <ExternalLink className="h-3.5 w-3.5" />
               Portal View
@@ -586,6 +685,82 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
             >
               <X className="h-5 w-5" />
             </button>
+
+            {isAdmin && whatsAppPopoverOpen && normalizedWhatsAppPhone && (
+              <div className="absolute right-0 top-full mt-2 z-30 w-[380px] max-w-[90vw] rounded-lg border border-[#CBD5E1] bg-white shadow-xl p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="h-2 w-2 rounded-full bg-[#25D366]" />
+                    <span className="text-xs font-bold text-[#0F172A]">WhatsApp Quick Outreach</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[11px] text-[#15803D] font-semibold">
+                      +{normalizedWhatsAppPhone}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setWhatsAppPopoverOpen(false)}
+                      className="rounded p-0.5 text-[#64748B] hover:text-[#0F172A]"
+                      aria-label="Close WhatsApp popover"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-[#475569] mb-1">
+                    Message Template
+                  </label>
+                  <select
+                    value={whatsAppTemplate}
+                    onChange={(e) => handleSelectWhatsAppTemplate(e.target.value as WhatsAppTemplateKey)}
+                    className="w-full rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs text-[#0F172A] focus:border-[#16A34A] focus:outline-none"
+                  >
+                    {WHATSAPP_TEMPLATES.map((tpl) => (
+                      <option key={tpl.key} value={tpl.key}>
+                        {tpl.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[11px] font-semibold text-[#475569]">
+                      Pre-filled Message (Editable)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setWhatsAppMessage(buildWhatsAppMessage(candidate, whatsAppTemplate))}
+                      className="text-[11px] font-medium text-[#0F766E] hover:underline"
+                    >
+                      Reset Template
+                    </button>
+                  </div>
+                  <textarea
+                    rows={4}
+                    value={whatsAppMessage}
+                    onChange={(e) => setWhatsAppMessage(e.target.value)}
+                    className="w-full rounded-md border border-[#CBD5E1] bg-[#F8FAFC] px-2.5 py-2 text-xs text-[#0F172A] focus:bg-white focus:border-[#16A34A] focus:outline-none leading-relaxed"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <span className="text-[11px] text-[#64748B]">
+                    Opens wa.me &amp; logs in Audit Trail
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleLaunchWhatsApp({ closePopover: true })}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#16A34A] hover:bg-[#15803D] px-3 py-1.5 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <MessageCircle className="h-3.5 w-3.5" />
+                    Send Instant WhatsApp
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -718,9 +893,27 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     <Mail className="h-4 w-4 text-[#64748B]" />
                     <span className="truncate">{candidate.email}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[#0F172A]">
-                    <Phone className="h-4 w-4 text-[#64748B]" />
-                    <span className="font-mono text-xs">{candidate.phone}</span>
+                  <div className="flex items-center justify-between gap-2 text-[#0F172A]">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Phone className="h-4 w-4 text-[#64748B] shrink-0" />
+                      <span className="font-mono text-xs truncate">{candidate.phone || 'Not provided'}</span>
+                    </div>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        disabled={!normalizedWhatsAppPhone}
+                        onClick={() => handleLaunchWhatsApp({ useStageDefault: true })}
+                        title={
+                          normalizedWhatsAppPhone
+                            ? `Instant WhatsApp (+${normalizedWhatsAppPhone}) using stage-appropriate template`
+                            : whatsAppDisabledReason
+                        }
+                        className="inline-flex items-center gap-1 rounded border border-[#25D366] bg-[#F0FDF4] px-2 py-0.5 text-[11px] font-semibold text-[#15803D] hover:bg-[#DCFCE7] disabled:border-[#E2E8F0] disabled:bg-[#F8FAFC] disabled:text-[#94A3B8] disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <MessageCircle className="h-3 w-3" />
+                        WhatsApp
+                      </button>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 text-[#475569]">
                     <MapPin className="h-4 w-4 text-[#64748B]" />
@@ -858,7 +1051,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     <h3 className="text-sm font-bold text-[#0F172A]">Stage 3–4 · HR Screening Decision</h3>
                     <p className="text-xs text-[#64748B]">
                       {isAdmin
-                        ? 'Selecting "Proceed to Next Stage" automatically sends the Employment Application Form, DISC Assessment, and Academic Docs instructions via email.'
+                        ? 'Selecting "Proceed to Next Stage" automatically emails the Candidate Self-Service Portal upload link for Application Form, DISC, VAKAD, and academic certificates.'
                         : 'Recorded screening decision and HR reviewer notes.'}
                     </p>
                   </div>
@@ -885,7 +1078,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                         className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
                       >
                         <Send className="h-3.5 w-3.5" />
-                        Proceed to Next Stage &amp; Auto-Send Forms
+                        Proceed &amp; Send Portal Upload Request
                       </button>
                       <button
                         type="button"
@@ -904,6 +1097,95 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   </p>
                 )}
               </div>
+
+              {/* Direct WhatsApp Candidate Outreach Section (Administrator Only) */}
+              {isAdmin && (
+                <div className="border border-[#BBF7D0] rounded-lg p-4 bg-[#F0FDF4]/60 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-bold text-[#0F172A] flex items-center gap-2">
+                        <MessageCircle className="h-4 w-4 text-[#16A34A]" />
+                        WhatsApp Candidate Outreach
+                      </h3>
+                      <p className="text-xs text-[#475569]">
+                        Send an instant stage-matched WhatsApp follow-up via Malaysian mobile routing. Automatically recorded in the immutable Audit Trail.
+                      </p>
+                    </div>
+                    {normalizedWhatsAppPhone ? (
+                      <span className="font-mono text-xs font-semibold text-[#15803D]">
+                        MY Mobile: +{normalizedWhatsAppPhone}
+                      </span>
+                    ) : (
+                      <span className="text-xs font-semibold text-[#B45309]">
+                        Invalid / Missing MY Mobile
+                      </span>
+                    )}
+                  </div>
+
+                  {normalizedWhatsAppPhone ? (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        {WHATSAPP_TEMPLATES.map((tpl) => {
+                          const active = whatsAppTemplate === tpl.key;
+                          return (
+                            <button
+                              key={tpl.key}
+                              type="button"
+                              onClick={() => handleSelectWhatsAppTemplate(tpl.key)}
+                              className={`text-left rounded-md border px-2.5 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                                active
+                                  ? 'border-[#16A34A] bg-white text-[#15803D] font-semibold'
+                                  : 'border-[#E2E8F0] bg-white/80 text-[#475569] hover:border-[#86EFAC]'
+                              }`}
+                            >
+                              {tpl.shortLabel}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-[11px] font-semibold uppercase tracking-wider text-[#475569]">
+                            Message Preview ({getWhatsAppTemplateLabel(whatsAppTemplate)})
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => setWhatsAppMessage(buildWhatsAppMessage(candidate, whatsAppTemplate))}
+                            className="text-[11px] font-medium text-[#15803D] hover:underline"
+                          >
+                            Reset to Default Copy
+                          </button>
+                        </div>
+                        <textarea
+                          rows={3}
+                          value={whatsAppMessage}
+                          onChange={(e) => setWhatsAppMessage(e.target.value)}
+                          className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#16A34A] focus:outline-none leading-relaxed"
+                        />
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[11px] text-[#475569]">
+                          Opens <span className="font-mono">wa.me/{normalizedWhatsAppPhone}</span> in a new browser tab.
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleLaunchWhatsApp()}
+                          className="inline-flex items-center gap-1.5 rounded-md bg-[#16A34A] hover:bg-[#15803D] px-3.5 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <MessageCircle className="h-3.5 w-3.5" />
+                          Send Instant WhatsApp
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="rounded-md border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2 text-xs text-[#92400E]">
+                      Cannot launch WhatsApp: <span className="font-mono">{candidate.phone || 'empty'}</span> is not a valid 11–12 digit Malaysian mobile number (e.g., <span className="font-mono">011-31832623</span> or <span className="font-mono">+6012-3456789</span>).
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Candidate Email Dispatch & Real SMTP Delivery Status */}
               {candidate.recent_emails && candidate.recent_emails.length > 0 && (
@@ -1020,11 +1302,11 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
               <div className="flex flex-wrap items-center justify-between gap-3 border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC]">
                 <div>
                   <h3 className="text-sm font-bold text-[#0F172A]">
-                    Stage 5–7 · Forms, DISC &amp; Malaysian Academic Documents
+                    Stage 5–7 · Application Form, DISC, VAKAD &amp; Academic Documents
                   </h3>
                   <p className="text-xs text-[#64748B]">
                     {missingDocs.length === 0
-                      ? 'All mandatory forms and academic certificates are complete.'
+                      ? 'All mandatory forms, assessments, and academic certificates are complete.'
                       : `${missingDocs.length} mandatory item(s) still pending: ${missingDocs.join(', ')}`}
                   </p>
                   {candidate.last_doc_reminder_at && (
@@ -1034,15 +1316,31 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   )}
                 </div>
                 {isAdmin && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={handleSendReminder}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-[#F59E0B] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#B45309] hover:bg-[#FEF3C7] disabled:opacity-50"
-                  >
-                    <BellRing className="h-3.5 w-3.5" />
-                    Send Document Reminder Email
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={!normalizedWhatsAppPhone}
+                      onClick={() => handleLaunchWhatsApp({ templateKey: 'shortlisted_docs' })}
+                      title={
+                        normalizedWhatsAppPhone
+                          ? `WhatsApp document & form reminder to +${normalizedWhatsAppPhone}`
+                          : whatsAppDisabledReason
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-md bg-[#16A34A] hover:bg-[#15803D] px-3 py-1.5 text-xs font-semibold text-white disabled:bg-[#E2E8F0] disabled:text-[#94A3B8] disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <MessageCircle className="h-3.5 w-3.5" />
+                      WhatsApp Docs Reminder
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={handleSendReminder}
+                      className="inline-flex items-center gap-1.5 rounded-md border border-[#F59E0B] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#B45309] hover:bg-[#FEF3C7] disabled:opacity-50 whitespace-nowrap shrink-0"
+                    >
+                      <BellRing className="h-3.5 w-3.5" />
+                      Send Document Reminder Email
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -1052,10 +1350,10 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   <thead className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[#64748B] uppercase tracking-wider text-[11px]">
                     <tr>
                       <th className="px-3.5 py-2.5 font-semibold">Requirement</th>
-                      <th className="px-3 py-2.5 font-semibold text-center">Submitted</th>
-                      <th className="px-3 py-2.5 font-semibold text-center">HR Verified</th>
-                      <th className="px-3 py-2.5 font-semibold text-center">N/A</th>
-                      <th className="px-3.5 py-2.5 font-semibold text-right">File / Link</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-center">Submitted</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-center">HR Verified</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-center">N/A</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-right">Uploaded File</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E2E8F0]">
@@ -1071,6 +1369,25 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                       if (ai) {
                         if (ai.candidate_name_on_doc) {
                           extractedHighlights.push({ label: 'Name on Doc', value: ai.candidate_name_on_doc });
+                        }
+                        if (ai.expected_salary_myr !== undefined && ai.expected_salary_myr !== '') {
+                          extractedHighlights.push({
+                            label: 'Expected Salary',
+                            value: String(ai.expected_salary_myr),
+                            mono: true,
+                          });
+                        }
+                        if (ai.notice_period) {
+                          extractedHighlights.push({ label: 'Notice Period', value: ai.notice_period });
+                        }
+                        if (ai.availability_date) {
+                          extractedHighlights.push({ label: 'Availability', value: ai.availability_date, mono: true });
+                        }
+                        if (ai.disc_profile_type) {
+                          extractedHighlights.push({ label: 'DISC Type', value: ai.disc_profile_type });
+                        }
+                        if (ai.vakad_dominant_style) {
+                          extractedHighlights.push({ label: 'VAKAD Style', value: ai.vakad_dominant_style });
                         }
                         if (ai.school_name) {
                           extractedHighlights.push({ label: 'School', value: ai.school_name });
@@ -1180,17 +1497,6 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                             </td>
                             <td className="px-3.5 py-3 text-right whitespace-nowrap">
                               <div className="inline-flex items-center gap-2">
-                                {item.externalUrl && (
-                                  <a
-                                    href={item.externalUrl}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
-                                  >
-                                    <Link2 className="h-3 w-3" />
-                                    Open Form
-                                  </a>
-                                )}
                                 {doc?.file_path && (
                                   <a
                                     href={getProtectedFileUrl(doc.file_path)}
@@ -1208,10 +1514,10 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                                     ) : (
                                       <Upload className="h-3 w-3" />
                                     )}
-                                    {uploadingDoc === item.type ? 'Scanning...' : 'Upload'}
+                                    {uploadingDoc === item.type ? 'Scanning...' : doc?.file_path ? 'Replace' : 'Upload'}
                                     <input
                                       type="file"
-                                      accept=".pdf,.jpg,.jpeg,.png,.webp"
+                                      accept=".pdf,.jpg,.jpeg,.png,.webp,.docx"
                                       className="hidden"
                                       onChange={(e) => {
                                         const f = e.target.files?.[0];
@@ -1317,6 +1623,20 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                                           </span>
                                         </span>
                                       ))}
+                                    </div>
+                                  )}
+
+                                  {ai?.key_traits_summary && (
+                                    <div className="text-[11px] text-[#334155]">
+                                      <span className="text-[#64748B]">Key DISC Traits:</span>{' '}
+                                      <span className="text-[#0F172A]">{ai.key_traits_summary}</span>
+                                    </div>
+                                  )}
+
+                                  {ai?.scores_summary && (
+                                    <div className="text-[11px] text-[#334155]">
+                                      <span className="text-[#64748B]">VAKAD Scores:</span>{' '}
+                                      <span className="font-mono text-[#0F172A]">{ai.scores_summary}</span>
                                     </div>
                                   )}
 
@@ -1864,7 +2184,16 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
 function buildDocFlags(
   candidate: CandidateRecord
 ): Record<DocType, { completed: boolean; verified: boolean; not_applicable: boolean }> {
-  const types: DocType[] = ['RESUME', 'APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
+  const types: DocType[] = [
+    'RESUME',
+    'APPLICATION_FORM',
+    'DISC',
+    'VAKAD',
+    'SPM',
+    'UEC',
+    'DEGREE',
+    'TRANSCRIPT',
+  ];
   const result = {} as Record<
     DocType,
     { completed: boolean; verified: boolean; not_applicable: boolean }

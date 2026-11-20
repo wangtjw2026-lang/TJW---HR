@@ -104,6 +104,9 @@ function getActionToneClass(action: string): string {
   ) {
     return 'text-[#B91C1C]';
   }
+  if (upper === 'WHATSAPP_OUTREACH') {
+    return 'text-[#15803D]';
+  }
   if (
     upper.includes('CREATE') ||
     upper.includes('APPROVE') ||
@@ -176,7 +179,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState<StaffRole>('manager');
-  const [newDept, setNewDept] = useState<string>('Human Resources');
+  const [newDept, setNewDept] = useState<string>('HR');
   const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<number | null>(null);
   const [pendingRoleDrafts, setPendingRoleDrafts] = useState<Record<number, StaffRole>>({});
 

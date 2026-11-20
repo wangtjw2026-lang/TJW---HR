@@ -1015,6 +1015,8 @@ export default function App() {
                 onExportCsv={handleExportCsv}
                 exportingCsv={exportingCsv}
                 role={staffUser.role}
+                onNotify={notify}
+                onWhatsAppLogged={() => void refreshWorkspace()}
               />
             )}
 

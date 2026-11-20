@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { Download, RotateCcw, Search, Lock } from 'lucide-react';
+import { Download, RotateCcw, Search, Lock, MessageCircle } from 'lucide-react';
 import {
   CandidateFilters,
   CandidateRecord,
@@ -11,7 +11,17 @@ import {
   STATUS_META,
   WORKFLOW_STAGES,
 } from '../types/ats';
-import { filterCandidates, getStageTitle } from '../lib/atsHelpers';
+import {
+  buildWhatsAppMessage,
+  filterCandidates,
+  formatMalaysiaWhatsAppUrl,
+  getDefaultWhatsAppTemplateKey,
+  getStageTitle,
+  getWhatsAppTemplateLabel,
+  normalizeMalaysiaMobile,
+  openExternalWhatsAppUrl,
+} from '../lib/atsHelpers';
+import { logWhatsAppOutreach } from '../lib/apiService';
 
 interface CandidateTableViewProps {
   candidates: CandidateRecord[];
@@ -22,6 +32,8 @@ interface CandidateTableViewProps {
   onExportCsv: (filtered: CandidateRecord[]) => Promise<void>;
   exportingCsv: boolean;
   role: StaffRole;
+  onNotify?: (message: string) => void;
+  onWhatsAppLogged?: () => void;
 }
 
 const TONE_CLASS: Record<'neutral' | 'teal' | 'amber' | 'green' | 'red', string> = {
@@ -41,6 +53,8 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
   onExportCsv,
   exportingCsv,
   role,
+  onNotify,
+  onWhatsAppLogged,
 }) => {
   const filtered = useMemo(() => filterCandidates(candidates, filters), [candidates, filters]);
 
@@ -49,12 +63,35 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
     return Array.from(set).sort();
   }, [candidates]);
 
-  const dynamicDepartments = useMemo(() => {
-    const set = new Set<string>([...DEPARTMENTS, ...candidates.map((c) => c.department)]);
-    return Array.from(set).sort();
-  }, [candidates]);
-
+  const isAdmin = role === 'administrator';
   const canExport = ROLE_META[role].canExportCsv;
+
+  const handleRowWhatsApp = (e: React.MouseEvent, candidate: CandidateRecord) => {
+    e.stopPropagation();
+    if (!isAdmin) return;
+    const normalized = normalizeMalaysiaMobile(candidate.phone);
+    const templateKey = getDefaultWhatsAppTemplateKey(candidate.stage);
+    const message = buildWhatsAppMessage(candidate, templateKey);
+    const waUrl = formatMalaysiaWhatsAppUrl(candidate.phone, message);
+    if (!waUrl || !normalized) return;
+
+    openExternalWhatsAppUrl(waUrl);
+    const templateLabel = getWhatsAppTemplateLabel(templateKey);
+    onNotify?.(`Opened WhatsApp for ${candidate.full_name} (+${normalized}) · ${templateLabel}`);
+
+    void logWhatsAppOutreach(candidate.id, {
+      phone: candidate.phone,
+      normalizedPhone: normalized,
+      templateName: templateLabel,
+      pageVisited: 'Candidate Database',
+    })
+      .then(() => {
+        onWhatsAppLogged?.();
+      })
+      .catch(() => {
+        // Non-blocking audit log call
+      });
+  };
 
   return (
     <div className="space-y-4">
@@ -147,7 +184,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
               className="w-full px-2 py-1.5 text-xs bg-white border border-slate-200 rounded focus:outline-none focus:border-teal-700"
             >
               <option value="">All Departments</option>
-              {dynamicDepartments.map((dept) => (
+              {DEPARTMENTS.map((dept) => (
                 <option key={dept} value={dept}>
                   {dept}
                 </option>
@@ -244,18 +281,20 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
                 <th className="py-2.5 px-4 whitespace-nowrap">Stage Milestone</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Status</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Interview / Offer</th>
+                {isAdmin && <th className="py-2.5 px-4 whitespace-nowrap text-right">Actions</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="py-10 px-4 text-center text-slate-500">
+                  <td colSpan={isAdmin ? 8 : 7} className="py-10 px-4 text-center text-slate-500">
                     No candidates match the active filter criteria.
                   </td>
                 </tr>
               ) : (
                 filtered.map((c) => {
                   const statusInfo = STATUS_META[c.status] || { label: c.status, tone: 'neutral' as const };
+                  const normalizedPhone = normalizeMalaysiaMobile(c.phone);
                   return (
                     <tr
                       key={c.id}
@@ -313,6 +352,28 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
                           <span className="text-slate-400">—</span>
                         )}
                       </td>
+                      {isAdmin && (
+                        <td
+                          className="py-3 px-4 align-middle whitespace-nowrap text-right"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            disabled={!normalizedPhone}
+                            onClick={(e) => handleRowWhatsApp(e, c)}
+                            title={
+                              normalizedPhone
+                                ? `WhatsApp ${c.full_name} (+${normalizedPhone})`
+                                : 'Valid Malaysian mobile number required (01X-XXXXXXX or +601X-XXXXXXX)'
+                            }
+                            aria-label={`WhatsApp ${c.full_name}`}
+                            className="inline-flex items-center gap-1 rounded-md border border-[#25D366] bg-[#F0FDF4] px-2.5 py-1 text-[11px] font-semibold text-[#15803D] hover:bg-[#DCFCE7] disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            <MessageCircle className="h-3.5 w-3.5" />
+                            <span>WhatsApp</span>
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   );
                 })

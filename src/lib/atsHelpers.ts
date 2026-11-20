@@ -34,8 +34,9 @@ export function getMissingMandatoryDocs(candidate: CandidateRecord): string[] {
       missing.push(label);
     }
   };
-  check('APP_FORM', 'Employment Application Form');
-  check('DISC', 'DISC Personality Assessment');
+  check('APPLICATION_FORM', 'Employment Application Form');
+  check('DISC', 'DISC Assessment Report / Sheet');
+  check('VAKAD', 'VAKAD Assessment Report / Sheet');
   check('SPM', 'SPM Examination Results');
   check('UEC', 'UEC Examination Results');
   check('DEGREE', 'University Degree Certificate');
@@ -183,8 +184,9 @@ export function exportCandidatesToExcelCsv(candidates: CandidateRecord[], _role:
     'AI Match Score (%)',
     'Years Experience',
     'Screening Decision',
-    'Employment Form',
-    'DISC Form',
+    'Employment Application Form',
+    'DISC Assessment',
+    'VAKAD Assessment',
     'DISC Profile',
     'SPM Doc',
     'UEC Doc',
@@ -214,8 +216,9 @@ export function exportCandidatesToExcelCsv(candidates: CandidateRecord[], _role:
     c.ai_score,
     c.years_experience,
     c.screening_decision,
-    docStatusLabel(c, 'APP_FORM'),
+    docStatusLabel(c, 'APPLICATION_FORM'),
     docStatusLabel(c, 'DISC'),
+    docStatusLabel(c, 'VAKAD'),
     c.disc_profile || '-',
     docStatusLabel(c, 'SPM'),
     docStatusLabel(c, 'UEC'),
@@ -260,3 +263,103 @@ export function formatTimestamp(ts: string | undefined | null): string {
   if (Number.isNaN(d.getTime())) return ts;
   return d.toLocaleString('en-MY', { dateStyle: 'medium', timeStyle: 'short' });
 }
+
+// =============================================================================
+// MALAYSIAN WHATSAPP OUTREACH HELPERS
+// =============================================================================
+export type WhatsAppTemplateKey = 'shortlisted_docs' | 'interview_reminder' | 'general_followup';
+
+export interface WhatsAppTemplateOption {
+  key: WhatsAppTemplateKey;
+  label: string;
+  shortLabel: string;
+}
+
+export const WHATSAPP_TEMPLATES: WhatsAppTemplateOption[] = [
+  {
+    key: 'shortlisted_docs',
+    label: 'Shortlisted / Stage 3 Document & Form Reminder',
+    shortLabel: 'Shortlisted & Docs Reminder',
+  },
+  {
+    key: 'interview_reminder',
+    label: 'Interview Invitation / Reminder',
+    shortLabel: 'Interview Reminder',
+  },
+  {
+    key: 'general_followup',
+    label: 'General Follow-Up',
+    shortLabel: 'General Follow-Up',
+  },
+];
+
+/**
+ * Normalizes a Malaysian mobile phone number into international E.164 digits without '+'.
+ * Examples:
+ *  - "011-31832623"   -> "601131832623"
+ *  - "+60 12-345 6789" -> "60123456789"
+ *  - "60191234567"    -> "60191234567"
+ * Returns null if the number is missing or not a valid 11-12 digit Malaysian mobile (/^601[0-9]{8,9}$/).
+ */
+export function normalizeMalaysiaMobile(phone: string | undefined | null): string | null {
+  if (!phone) return null;
+  const cleaned = String(phone).replace(/[\s\-()+]/g, '');
+  if (!cleaned) return null;
+  let normalized = cleaned;
+  if (normalized.startsWith('0')) {
+    normalized = `60${normalized.slice(1)}`;
+  }
+  if (!/^601[0-9]{8,9}$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+export function formatMalaysiaWhatsAppUrl(
+  phone: string | undefined | null,
+  message: string
+): string | null {
+  const normalizedPhone = normalizeMalaysiaMobile(phone);
+  if (!normalizedPhone) return null;
+  return `https://wa.me/${normalizedPhone}?text=${encodeURIComponent(message)}`;
+}
+
+export function getDefaultWhatsAppTemplateKey(stage: number): WhatsAppTemplateKey {
+  if (stage >= 9 && stage <= 12) return 'interview_reminder';
+  if (stage >= 3 && stage <= 8) return 'shortlisted_docs';
+  return 'general_followup';
+}
+
+export function getWhatsAppTemplateLabel(key: WhatsAppTemplateKey): string {
+  return WHATSAPP_TEMPLATES.find((t) => t.key === key)?.label ?? 'General Follow-Up';
+}
+
+export function buildWhatsAppMessage(
+  candidate: Pick<CandidateRecord, 'full_name' | 'position' | 'email'>,
+  templateKey: WhatsAppTemplateKey
+): string {
+  const name = candidate.full_name || 'Candidate';
+  const position = candidate.position || 'open';
+  const email = candidate.email || 'your email address';
+
+  switch (templateKey) {
+    case 'shortlisted_docs':
+      return `Hi ${name}, this is HR from TJW. Congratulations on being shortlisted for the ${position} role! We have sent an email to ${email} with your Candidate Self-Service Portal link to upload your completed Employment Application Form, DISC Assessment, VAKAD Assessment, and academic certificates (SPM, UEC if applicable, Degree, and Transcript). Please check your inbox (and Spam/Junk folder) and let us know if you have any questions.`;
+    case 'interview_reminder':
+      return `Hi ${name}, this is HR from TJW regarding your ${position} application. Please confirm your interview slot via our Candidate Portal or reply here if you need any assistance.`;
+    case 'general_followup':
+    default:
+      return `Hi ${name}, this is HR from TJW following up on your application for ${position}.`;
+  }
+}
+
+export function openExternalWhatsAppUrl(url: string): void {
+  const link = document.createElement('a');
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+

@@ -591,6 +591,21 @@ export async function sendBatchDocReminders(
   );
 }
 
+export async function logWhatsAppOutreach(
+  candidateId: number,
+  payload: {
+    phone: string;
+    normalizedPhone?: string;
+    templateName: string;
+    pageVisited?: string;
+  }
+): Promise<{ logged: boolean }> {
+  return apiFetch<{ logged: boolean }>(`/api/candidates/${candidateId}/whatsapp-log`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function submitQualificationDecision(
   candidateId: number,
   qualification_status: QualificationStatus,
@@ -763,25 +778,6 @@ export async function portalUploadDocument(
     { method: 'POST', body: form },
     false,
     95_000
-  );
-}
-
-export async function portalMarkFormsComplete(
-  portalToken: string,
-  appFormCompleted: boolean,
-  discCompleted: boolean
-): Promise<{ candidate: CandidateRecord; availableSlots: InterviewSlot[] }> {
-  return apiFetch(
-    `/api/portal/${encodeURIComponent(portalToken)}`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        action: 'complete_forms',
-        app_form_completed: appFormCompleted,
-        disc_completed: discCompleted,
-      }),
-    },
-    false
   );
 }
 

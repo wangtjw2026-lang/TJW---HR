@@ -8,7 +8,6 @@ import {
   CheckCircle2,
   Clock,
   Copy,
-  ExternalLink,
   FileText,
   Loader2,
   MapPin,
@@ -22,7 +21,6 @@ import {
   fetchPortalData,
   getProtectedFileUrl,
   portalBookInterviewSlot,
-  portalMarkFormsComplete,
   portalRespondToOffer,
   portalUploadDocument,
 } from '../lib/apiService';
@@ -30,7 +28,6 @@ import { formatMYR, getDoc } from '../lib/atsHelpers';
 import {
   CandidateRecord,
   DocType,
-  GOOGLE_APPS_SCRIPT_URLS,
   InterviewSlot,
   STATUS_META,
 } from '../types/ats';
@@ -46,6 +43,28 @@ interface CandidatePortalViewProps {
   onNotify?: (message: string) => void;
 }
 
+const FORMS_AND_ASSESSMENT_DOCS: Array<{
+  type: DocType;
+  label: string;
+  subtitle: string;
+}> = [
+  {
+    type: 'APPLICATION_FORM',
+    label: 'Employment Application Form',
+    subtitle: 'Mandatory · Upload completed Employment Application Form (PDF, PNG, JPG, WEBP, DOCX)',
+  },
+  {
+    type: 'DISC',
+    label: 'DISC Assessment Report / Sheet',
+    subtitle: 'Mandatory · Upload completed DISC Personality Assessment report or sheet (PDF, PNG, JPG, WEBP, DOCX)',
+  },
+  {
+    type: 'VAKAD',
+    label: 'VAKAD Assessment Report / Sheet',
+    subtitle: 'Mandatory · Upload completed VAKAD Assessment report or sheet (PDF, PNG, JPG, WEBP, DOCX)',
+  },
+];
+
 const ACADEMIC_DOCS: Array<{
   type: DocType;
   label: string;
@@ -54,7 +73,7 @@ const ACADEMIC_DOCS: Array<{
   {
     type: 'SPM',
     label: 'SPM Examination Results',
-    subtitle: 'Mandatory · Sijil Pelajaran Malaysia slip or certificate (PDF / Image)',
+    subtitle: 'Mandatory · Sijil Pelajaran Malaysia slip or certificate (PDF, PNG, JPG, WEBP, DOCX)',
   },
   {
     type: 'UEC',
@@ -102,8 +121,6 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
   const [successMsg, setSuccessMsg] = useState('');
   const [copiedLink, setCopiedLink] = useState(false);
 
-  const [appFormChecked, setAppFormChecked] = useState(false);
-  const [discChecked, setDiscChecked] = useState(false);
   const [offerNote, setOfferNote] = useState('');
 
   useEffect(() => {
@@ -135,10 +152,6 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
       const data = await fetchPortalData(token);
       setPortalCandidate(data.candidate);
       setAvailableSlots(data.availableSlots);
-      const appDoc = getDoc(data.candidate, 'APP_FORM');
-      const discDoc = getDoc(data.candidate, 'DISC');
-      setAppFormChecked(Boolean(appDoc?.completed));
-      setDiscChecked(Boolean(discDoc?.completed));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load candidate portal.');
       setPortalCandidate(null);
@@ -182,24 +195,6 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
       setError(err instanceof Error ? err.message : 'Upload failed.');
     } finally {
       setUploadingType(null);
-    }
-  };
-
-  const handleSaveForms = async () => {
-    if (!selectedToken) return;
-    setBusy(true);
-    setError('');
-    setSuccessMsg('');
-    try {
-      const data = await portalMarkFormsComplete(selectedToken, appFormChecked, discChecked);
-      setPortalCandidate(data.candidate);
-      setAvailableSlots(data.availableSlots);
-      await onRefreshWorkspace?.();
-      notify('Form completion status saved. HR has been notified for document review.');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update form status.');
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -372,91 +367,113 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
               </div>
             </div>
 
-            {/* Section 1: Online Forms (Google Apps Script) */}
+            {/* Section 1: Application Form, DISC & VAKAD Assessments (Upload Only) */}
             <div className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4">
               <div>
                 <h3 className="text-sm font-bold text-[#0F172A]">
-                  Step 1 · Mandatory Online Forms &amp; DISC Assessment
+                  Step 1 · Employment Application Form, DISC &amp; VAKAD Assessments
                 </h3>
                 <p className="text-xs text-[#64748B] mt-0.5">
-                  Complete both official forms below, then tick the checkboxes and confirm your submission.
+                  Upload your completed Employment Application Form, DISC Assessment, and VAKAD Assessment files (PDF, PNG, JPG, WEBP, or DOCX).
                 </p>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="rounded-md border border-[#E2E8F0] p-3.5 flex flex-col justify-between gap-3">
-                  <div>
-                    <div className="text-xs font-bold text-[#0F172A]">Employment Application Form</div>
-                    <p className="text-[11px] text-[#64748B] mt-0.5">
-                      Official company employment application hosted on Google Apps Script.
-                    </p>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#F1F5F9]">
-                    <a
-                      href={GOOGLE_APPS_SCRIPT_URLS.employmentApplicationForm}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-xs font-semibold text-[#0F766E] hover:underline"
+              <div className="divide-y divide-[#E2E8F0] border border-[#E2E8F0] rounded-md">
+                {FORMS_AND_ASSESSMENT_DOCS.map((item) => {
+                  const doc = getDoc(portalCandidate, item.type);
+                  return (
+                    <div
+                      key={item.type}
+                      className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
                     >
-                      Open Application Form
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                    <label className="inline-flex items-center gap-1.5 text-xs text-[#334155] cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={appFormChecked}
-                        disabled={!canInteract}
-                        onChange={(e) => setAppFormChecked(e.target.checked)}
-                        className="h-4 w-4 accent-[#0F766E] disabled:opacity-50"
-                      />
-                      Completed
-                    </label>
-                  </div>
-                </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-[#0F172A]">{item.label}</span>
+                          {doc?.verified ? (
+                            <span className="text-[11px] font-semibold text-[#15803D]">Verified by HR</span>
+                          ) : doc?.completed ? (
+                            <span className="text-[11px] font-semibold text-[#0F766E]">Uploaded</span>
+                          ) : (
+                            <span className="text-[11px] font-semibold text-[#B45309]">Pending Upload</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-[#64748B]">{item.subtitle}</div>
+                        {doc?.file_name && (
+                          <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-[#0F766E]">
+                            <FileText className="h-3 w-3" />
+                            <span>{doc.file_name}</span>
+                            {doc.file_path && (
+                              <a
+                                href={getProtectedFileUrl(doc.file_path, selectedToken)}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="underline"
+                              >
+                                View File
+                              </a>
+                            )}
+                          </div>
+                        )}
+                        {doc?.file_path && doc.ai_verified_status && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+                            {doc.ai_verified_status === 'VERIFIED_MATCH' ? (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#15803D]">
+                                <Sparkles className="h-3 w-3" />
+                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name matched
+                              </span>
+                            ) : doc.ai_verified_status === 'NAME_MISMATCH' ? (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#DC2626]">
+                                <AlertTriangle className="h-3 w-3 shrink-0" />
+                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name on document
+                                {doc.ai_extracted?.candidate_name_on_doc
+                                  ? ` ("${doc.ai_extracted.candidate_name_on_doc}")`
+                                  : ''}{' '}
+                                does not match your profile. Please verify or replace if incorrect.
+                              </span>
+                            ) : doc.ai_verified_status === 'AI_FAILED' ? (
+                              <span className="inline-flex items-center gap-1 text-[#64748B]">
+                                <AlertCircle className="h-3 w-3 shrink-0" />
+                                File received · Queued for manual HR verification.
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#B45309]">
+                                <Sparkles className="h-3 w-3 shrink-0" />
+                                Detected: {doc.ai_extracted?.document_detected || 'Uploaded document'} · Pending HR
+                                verification
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
 
-                <div className="rounded-md border border-[#E2E8F0] p-3.5 flex flex-col justify-between gap-3">
-                  <div>
-                    <div className="text-xs font-bold text-[#0F172A]">DISC Personality Assessment</div>
-                    <p className="text-[11px] text-[#64748B] mt-0.5">
-                      Complete the behavioral assessment prior to HR qualification review.
-                    </p>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#F1F5F9]">
-                    <a
-                      href={GOOGLE_APPS_SCRIPT_URLS.discPersonalityAssessment}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-xs font-semibold text-[#0F766E] hover:underline"
-                    >
-                      Open DISC Assessment
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                    <label className="inline-flex items-center gap-1.5 text-xs text-[#334155] cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={discChecked}
-                        disabled={!canInteract}
-                        onChange={(e) => setDiscChecked(e.target.checked)}
-                        className="h-4 w-4 accent-[#0F766E] disabled:opacity-50"
-                      />
-                      Completed
-                    </label>
-                  </div>
-                </div>
+                      {canInteract && (
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC] whitespace-nowrap shrink-0">
+                          {uploadingType === item.type ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />
+                          ) : (
+                            <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
+                          )}
+                          {uploadingType === item.type
+                            ? 'Uploading & Scanning...'
+                            : doc?.completed
+                              ? 'Replace File'
+                              : 'Upload File'}
+                          <input
+                            type="file"
+                            accept=".pdf,.jpg,.jpeg,.png,.webp,.docx"
+                            className="hidden"
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) void handleUploadDoc(item.type, f);
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-
-              {canInteract && (
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={handleSaveForms}
-                    className="rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
-                  >
-                    Confirm Online Forms Completed
-                  </button>
-                </div>
-              )}
             </div>
 
             {/* Section 2: Academic Documents Upload */}
@@ -466,7 +483,7 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                   Step 2 · Required Malaysian Academic Documents
                 </h3>
                 <p className="text-xs text-[#64748B] mt-0.5">
-                  Upload clear PDF or image scans of your SPM, UEC (if applicable), University Degree Certificate, and Academic Transcript.
+                  Upload clear PDF, image, or DOCX copies of your SPM, UEC (if applicable), University Degree Certificate, and Academic Transcript.
                 </p>
               </div>
 
@@ -488,7 +505,7 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                           ) : doc?.not_applicable ? (
                             <span className="text-[11px] font-medium text-[#64748B]">Not Applicable</span>
                           ) : (
-                            <span className="text-[11px] font-semibold text-[#B45309]">Pending</span>
+                            <span className="text-[11px] font-semibold text-[#B45309]">Pending Upload</span>
                           )}
                         </div>
                         <div className="text-[11px] text-[#64748B]">{item.subtitle}</div>
@@ -541,7 +558,7 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                       </div>
 
                       {canInteract && !doc?.not_applicable && (
-                        <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC]">
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC] whitespace-nowrap shrink-0">
                           {uploadingType === item.type ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />
                           ) : (
@@ -550,11 +567,11 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                           {uploadingType === item.type
                             ? 'Uploading & Scanning...'
                             : doc?.completed
-                            ? 'Replace File'
-                            : 'Upload File'}
+                              ? 'Replace File'
+                              : 'Upload File'}
                           <input
                             type="file"
-                            accept=".pdf,.jpg,.jpeg,.png,.webp"
+                            accept=".pdf,.jpg,.jpeg,.png,.webp,.docx"
                             className="hidden"
                             onChange={(e) => {
                               const f = e.target.files?.[0];

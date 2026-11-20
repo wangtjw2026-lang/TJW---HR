@@ -1,10 +1,3 @@
-export const GOOGLE_APPS_SCRIPT_URLS = {
-  employmentApplicationForm:
-    'https://script.google.com/macros/s/AKfycbzmwDILioaOGbozPl9t13wCJLpdF_T99WHAglBDJJXvEZTmWIt2oilSNYLyyatK6cG0/exec',
-  discPersonalityAssessment:
-    'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec',
-} as const;
-
 export type StaffRole = 'administrator' | 'manager';
 
 export type ApplicationSource = 'JobStreet' | 'Email';
@@ -27,7 +20,15 @@ export type CandidateStatus =
   | 'offer_expired'
   | 'rejected_post_interview';
 
-export type DocType = 'RESUME' | 'APP_FORM' | 'DISC' | 'SPM' | 'UEC' | 'DEGREE' | 'TRANSCRIPT';
+export type DocType =
+  | 'RESUME'
+  | 'APPLICATION_FORM'
+  | 'DISC'
+  | 'VAKAD'
+  | 'SPM'
+  | 'UEC'
+  | 'DEGREE'
+  | 'TRANSCRIPT';
 
 export type ScreeningDecision = 'pending' | 'proceed' | 'reject';
 export type QualificationStatus = 'pending' | 'qualified' | 'not_qualified';
@@ -119,11 +120,21 @@ export type AiDocumentVerificationStatus =
   | 'AI_FAILED';
 
 export interface AiDocumentExtractionPayload {
-  // Common academic & certificate fields
+  // Common academic, form & assessment fields
   document_detected?: string;
   candidate_name_on_doc?: string;
   name_matches_candidate?: boolean;
   verification_notes?: string;
+  // Employment Application Form fields
+  expected_salary_myr?: string | number;
+  notice_period?: string;
+  availability_date?: string;
+  // DISC Assessment fields
+  disc_profile_type?: string;
+  key_traits_summary?: string;
+  // VAKAD Assessment fields
+  vakad_dominant_style?: string;
+  scores_summary?: string;
   // SPM & UEC fields
   exam_year?: string;
   school_name?: string;
@@ -390,8 +401,8 @@ export const WORKFLOW_STAGES: WorkflowStageMeta[] = [
   { stage: 2, title: 'Register Candidate', shortTitle: 'Register', phase: 'Intake & Screening' },
   { stage: 3, title: 'Initial Resume Screening', shortTitle: 'Screen', phase: 'Intake & Screening' },
   { stage: 4, title: 'HR Screening Decision', shortTitle: 'Decision', phase: 'Intake & Screening' },
-  { stage: 5, title: 'Auto-Send Forms & Links', shortTitle: 'Forms Sent', phase: 'Forms & Verification' },
-  { stage: 6, title: 'Collect Academic Docs', shortTitle: 'Academic Docs', phase: 'Forms & Verification' },
+  { stage: 5, title: 'Send Portal Upload Request', shortTitle: 'Docs Requested', phase: 'Forms & Verification' },
+  { stage: 6, title: 'Collect Forms & Docs', shortTitle: 'Docs Upload', phase: 'Forms & Verification' },
   { stage: 7, title: 'HR Document Review', shortTitle: 'Doc Review', phase: 'Forms & Verification' },
   { stage: 8, title: 'Qualification Decision', shortTitle: 'Qualify', phase: 'Forms & Verification' },
   { stage: 9, title: 'Send Interview Invite', shortTitle: 'Invite Sent', phase: 'Interviews' },
@@ -404,24 +415,24 @@ export const WORKFLOW_STAGES: WorkflowStageMeta[] = [
 ];
 
 export const DEPARTMENTS = [
-  'Engineering & Technology',
-  'Finance & Accounting',
-  'Human Resources',
-  'Operations & Supply Chain',
-  'Sales & Commercial',
-  'Product & Design',
-  'Legal & Compliance',
+  'HR',
+  'Finance',
+  'Audit',
+  'Tax',
+  'Secretarial',
+  'Account',
 ] as const;
 
 export const POSITIONS = [
-  'Senior Full-Stack Engineer',
+  'HR Executive',
+  'Finance Executive',
+  'Audit Associate',
+  'Senior Audit Associate',
+  'Tax Associate',
+  'Senior Tax Consultant',
+  'Company Secretarial Executive',
+  'Accounts Executive',
   'Financial Accountant (MIA/ACCA)',
-  'HR Business Partner',
-  'Supply Chain & Logistics Lead',
-  'Enterprise Sales Manager',
-  'Product Designer (UI/UX)',
-  'Data & BI Analyst',
-  'Compliance & PDPA Executive',
 ] as const;
 
 export const STATUS_META: Record<

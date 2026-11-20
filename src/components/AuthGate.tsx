@@ -38,7 +38,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
 
   // Initial Setup & Access Request fields
   const [fullName, setFullName] = useState('');
-  const [department, setDepartment] = useState<string>('Human Resources');
+  const [department, setDepartment] = useState<string>('HR');
   const [requestedRole, setRequestedRole] = useState<StaffRole>('manager');
   const [confirmPassword, setConfirmPassword] = useState('');
 

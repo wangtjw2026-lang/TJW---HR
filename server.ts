@@ -8,6 +8,7 @@ import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
+import mammoth from 'mammoth';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   db,
@@ -26,10 +27,24 @@ const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'talentflow-my-dev-jwt-secret-change-in-prod';
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes of inactivity
 
-const EMPLOYMENT_FORM_URL =
-  'https://script.google.com/macros/s/AKfycbzmwDILioaOGbozPl9t13wCJLpdF_T99WHAglBDJJXvEZTmWIt2oilSNYLyyatK6cG0/exec';
-const DISC_FORM_URL =
-  'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec';
+const ALLOWED_DEPARTMENTS = ['HR', 'Finance', 'Audit', 'Tax', 'Secretarial', 'Account'] as const;
+const ALLOWED_DEPARTMENTS_MAP = new Map<string, (typeof ALLOWED_DEPARTMENTS)[number]>(
+  ALLOWED_DEPARTMENTS.map((dept) => [dept.toLowerCase(), dept])
+);
+
+function normalizeDepartment(raw: unknown, fallback: (typeof ALLOWED_DEPARTMENTS)[number] = 'HR'): string {
+  const cleaned = String(raw || '').trim();
+  if (!cleaned) return fallback;
+  const exact = ALLOWED_DEPARTMENTS_MAP.get(cleaned.toLowerCase());
+  if (exact) return exact;
+  if (/human\s*resource|\bhr\b/i.test(cleaned)) return 'HR';
+  if (/audit/i.test(cleaned)) return 'Audit';
+  if (/\btax/i.test(cleaned)) return 'Tax';
+  if (/secretar/i.test(cleaned)) return 'Secretarial';
+  if (/account/i.test(cleaned)) return 'Account';
+  if (/finance/i.test(cleaned)) return 'Finance';
+  return fallback;
+}
 
 type StaffRole = 'administrator' | 'manager';
 type UserApprovalStatus = 'pending' | 'approved' | 'rejected';
@@ -59,7 +74,7 @@ function serializePublicUser(row: Record<string, unknown>) {
     name: String(row.name || ''),
     email: String(row.email || ''),
     role: (row.role === 'administrator' ? 'administrator' : 'manager') as StaffRole,
-    department: String(row.department || 'Human Resources'),
+    department: normalizeDepartment(row.department, 'HR'),
     status: (row.status === 'pending' || row.status === 'rejected' ? row.status : 'approved') as UserApprovalStatus,
     approved_by: String(row.approved_by || ''),
     approved_at: String(row.approved_at || ''),
@@ -554,6 +569,7 @@ function inferResumeMimeType(mimeType: string, fileName: string): string {
   if (ext === '.png') return 'image/png';
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
   if (ext === '.webp') return 'image/webp';
+  if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if (ext === '.txt') return 'text/plain';
   const normalized = (mimeType || '').toLowerCase().split(';')[0].trim();
   if (normalized === 'image/jpg') return 'image/jpeg';
@@ -610,16 +626,29 @@ function parseResumeMultipartIfPresent(req: Request, res: Response, next: NextFu
 // =============================================================================
 // UNIFIED GEMINI MULTIMODAL DOCUMENT EXTRACTION ENGINE
 // =============================================================================
-type ExtractableDocType = 'RESUME' | 'SPM' | 'UEC' | 'DEGREE' | 'TRANSCRIPT';
+type ExtractableDocType =
+  | 'RESUME'
+  | 'APPLICATION_FORM'
+  | 'DISC'
+  | 'VAKAD'
+  | 'SPM'
+  | 'UEC'
+  | 'DEGREE'
+  | 'TRANSCRIPT';
 type AiDocumentVerificationStatus = '' | 'VERIFIED_MATCH' | 'NAME_MISMATCH' | 'REVIEW_NEEDED' | 'AI_FAILED';
 
 const EXTRACTABLE_DOC_TYPES = new Set<ExtractableDocType>([
   'RESUME',
+  'APPLICATION_FORM',
+  'DISC',
+  'VAKAD',
   'SPM',
   'UEC',
   'DEGREE',
   'TRANSCRIPT',
 ]);
+
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
 const SUPPORTED_INLINE_DOCUMENT_MIMES = new Set([
   'application/pdf',
@@ -690,7 +719,7 @@ function buildDocumentPromptAndSchema(params: {
   department?: string;
   rubric?: string;
 }) {
-  const { docType, candidateName = '', position = 'General Role', department = 'Operations', rubric = '' } = params;
+  const { docType, candidateName = '', position = 'General Role', department = 'HR', rubric = '' } = params;
   const candidateContext = candidateName
     ? `Expected candidate full name on file: "${candidateName}". Compare the name printed on the document carefully (accounting for Malaysian naming conventions such as bin/binti/a/l/a/p, Chinese surname order, initials, or minor casing differences).`
     : 'No reference candidate name was provided; set name_matches_candidate to true if a clear candidate name is printed on the document, otherwise false.';
@@ -765,6 +794,117 @@ function buildDocumentPromptAndSchema(params: {
           'experience',
           'ai_score',
           'ai_summary',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'APPLICATION_FORM') {
+    return {
+      prompt: [
+        'You are a Malaysian enterprise HR recruitment specialist.',
+        'Inspect this uploaded document expecting a completed Employment Application Form.',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "Employment Application Form" if this is an employment application form, otherwise state concisely what document was actually detected.',
+        '- candidate_name_on_doc: Exact candidate full name written on the form (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- expected_salary_myr: Candidate expected monthly salary in MYR as written on the form (e.g. "RM 4,500" or "5000"; empty string if not stated).',
+        '- notice_period: Candidate current notice period (e.g. "1 month", "2 months", "Immediate"; empty string if not stated).',
+        '- availability_date: Earliest available start date if written on the form (e.g. "2026-06-01" or "Immediately"; empty string if not stated).',
+        '- verification_notes: Concise HR verification notes covering form completeness, signature/date presence, key declarations, and any discrepancies or missing sections.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          expected_salary_myr: { type: Type.STRING },
+          notice_period: { type: Type.STRING },
+          availability_date: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'expected_salary_myr',
+          'notice_period',
+          'availability_date',
+          'verification_notes',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'DISC') {
+    return {
+      prompt: [
+        'You are a Malaysian enterprise HR assessment specialist.',
+        'Inspect this uploaded document expecting a DISC Personality Assessment Report or completed DISC Answer Sheet.',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "DISC Personality Assessment" if this is a DISC assessment sheet/report, otherwise state concisely what document was actually detected.',
+        '- candidate_name_on_doc: Exact candidate name printed on the DISC report/sheet (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- disc_profile_type: Dominant DISC profile combination (e.g. "High D / C", "S/C — Steady Conscientious", "D/I", or scores like "D: 28, I: 18, S: 22, C: 32"; empty string if unreadable).',
+        '- key_traits_summary: Concise summary of work style, communication strengths, and behavioral traits indicated by the DISC results.',
+        '- verification_notes: Concise HR verification notes covering assessment completeness, legibility, and any discrepancies.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          disc_profile_type: { type: Type.STRING },
+          key_traits_summary: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'disc_profile_type',
+          'key_traits_summary',
+          'verification_notes',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'VAKAD') {
+    return {
+      prompt: [
+        'You are a Malaysian enterprise HR assessment specialist.',
+        'Inspect this uploaded document expecting a VAKAD (Visual, Auditory, Kinesthetic, Auditory Digital) Assessment Report or Sheet.',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "VAKAD Assessment" if this is a VAKAD assessment sheet/report, otherwise state concisely what document was actually detected.',
+        '- candidate_name_on_doc: Exact candidate name printed on the VAKAD report/sheet (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- vakad_dominant_style: Dominant representational/learning style detected among Visual, Auditory, Kinesthetic, and/or Auditory Digital (e.g. "Visual & Auditory Digital" or "Kinesthetic"; empty string if unreadable).',
+        '- scores_summary: Breakdown of VAKAD scores or percentages if shown (e.g. "Visual: 34, Auditory: 22, Kinesthetic: 26, Auditory Digital: 38"; empty string if not shown).',
+        '- verification_notes: Concise HR verification notes covering assessment completeness, legibility, and any discrepancies.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          vakad_dominant_style: { type: Type.STRING },
+          scores_summary: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'vakad_dominant_style',
+          'scores_summary',
+          'verification_notes',
         ],
       },
     };
@@ -940,6 +1080,9 @@ function normalizeAcademicExtraction(
   parsed: Record<string, unknown>
 ): { data: Record<string, unknown>; status: AiDocumentVerificationStatus; extractedFieldCount: number } {
   const defaultLabels: Record<Exclude<ExtractableDocType, 'RESUME'>, string> = {
+    APPLICATION_FORM: 'Employment Application Form',
+    DISC: 'DISC Personality Assessment',
+    VAKAD: 'VAKAD Assessment',
     SPM: 'SPM Certificate / Slip',
     UEC: 'UEC Certificate / Transcript',
     DEGREE: 'University Degree Certificate',
@@ -954,7 +1097,45 @@ function normalizeAcademicExtraction(
   let data: Record<string, unknown>;
   let keyValues: string[] = [];
 
-  if (docType === 'SPM') {
+  if (docType === 'APPLICATION_FORM') {
+    const expectedSalaryMyr = String(parsed.expected_salary_myr ?? '').trim().slice(0, 80);
+    const noticePeriod = String(parsed.notice_period ?? '').trim().slice(0, 80);
+    const availabilityDate = String(parsed.availability_date ?? '').trim().slice(0, 80);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      expected_salary_myr: expectedSalaryMyr,
+      notice_period: noticePeriod,
+      availability_date: availabilityDate,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, expectedSalaryMyr, noticePeriod, availabilityDate, verificationNotes];
+  } else if (docType === 'DISC') {
+    const discProfileType = String(parsed.disc_profile_type ?? '').trim().slice(0, 160);
+    const keyTraitsSummary = String(parsed.key_traits_summary ?? '').trim().slice(0, 600);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      disc_profile_type: discProfileType,
+      key_traits_summary: keyTraitsSummary,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, discProfileType, keyTraitsSummary];
+  } else if (docType === 'VAKAD') {
+    const vakadDominantStyle = String(parsed.vakad_dominant_style ?? '').trim().slice(0, 160);
+    const scoresSummary = String(parsed.scores_summary ?? '').trim().slice(0, 400);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      vakad_dominant_style: vakadDominantStyle,
+      scores_summary: scoresSummary,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, vakadDominantStyle, scoresSummary];
+  } else if (docType === 'SPM') {
     const examYear = String(parsed.exam_year ?? '').trim().slice(0, 20);
     const schoolName = String(parsed.school_name ?? '').trim().slice(0, 200);
     const gradesSummary = String(parsed.grades_summary ?? '').trim().slice(0, 600);
@@ -1076,6 +1257,13 @@ async function extractDocumentWithGemini(params: {
       if (decodedText) {
         cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
       }
+    } else if (resolvedMime === DOCX_MIME) {
+      const docxExtracted = await mammoth.extractRawText({ buffer: fileBuffer });
+      const decodedText = sanitizeResumeText(docxExtracted.value);
+      if (!decodedText) {
+        throw new Error(`Could not extract readable text from DOCX file "${fileName || params.docType}".`);
+      }
+      cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
     } else if (SUPPORTED_INLINE_DOCUMENT_MIMES.has(resolvedMime)) {
       inlineFile = {
         mimeType: resolvedMime,
@@ -1083,7 +1271,7 @@ async function extractDocumentWithGemini(params: {
       };
     } else {
       throw new Error(
-        `Unsupported file format (${fileName || resolvedMime}). Please upload a PDF, PNG, JPG, WEBP, or TXT document.`
+        `Unsupported file format (${fileName || resolvedMime}). Please upload a PDF, PNG, JPG, WEBP, DOCX, or TXT document.`
       );
     }
   } else if (params.fileBase64) {
@@ -1096,6 +1284,13 @@ async function extractDocumentWithGemini(params: {
       if (decodedText) {
         cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
       }
+    } else if (resolvedMime === DOCX_MIME) {
+      const docxExtracted = await mammoth.extractRawText({ buffer: Buffer.from(cleanBase64, 'base64') });
+      const decodedText = sanitizeResumeText(docxExtracted.value);
+      if (!decodedText) {
+        throw new Error('Could not extract readable text from the uploaded DOCX file.');
+      }
+      cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
     } else if (SUPPORTED_INLINE_DOCUMENT_MIMES.has(resolvedMime)) {
       inlineFile = {
         mimeType: resolvedMime,
@@ -1103,7 +1298,7 @@ async function extractDocumentWithGemini(params: {
       };
     } else {
       throw new Error(
-        'Unsupported document file type. Please upload a PDF, PNG, JPG, WEBP, or TXT file.'
+        'Unsupported document file type. Please upload a PDF, PNG, JPG, WEBP, DOCX, or TXT file.'
       );
     }
   }
@@ -1401,6 +1596,19 @@ async function runAndPersistDocumentExtraction(params: {
           SET ai_score = ?, ai_summary = ?, updated_at = datetime('now')
           WHERE id = ?
         `).run(score || candRow.ai_score, summary || candRow.ai_summary, params.candidateId);
+      }
+    } else if (params.docType === 'DISC') {
+      const extractedDisc = String(result.data.disc_profile_type || '').trim();
+      if (extractedDisc) {
+        const candRow = db
+          .prepare('SELECT disc_profile FROM candidates WHERE id = ?')
+          .get(params.candidateId) as { disc_profile: string } | undefined;
+        if (candRow && (!candRow.disc_profile || params.isReanalysis)) {
+          db.prepare(`UPDATE candidates SET disc_profile = ?, updated_at = datetime('now') WHERE id = ?`).run(
+            extractedDisc,
+            params.candidateId
+          );
+        }
       }
     }
 
@@ -1841,8 +2049,9 @@ function hydrateSlot(slot: Record<string, unknown>) {
 
 function getMissingDocsForCandidate(candidateId: number): string[] {
   const labels: Record<string, string> = {
-    APP_FORM: 'Employment Application Form (Google Apps Script)',
-    DISC: 'DISC Personality Assessment (Google Apps Script)',
+    APPLICATION_FORM: 'Employment Application Form (Upload)',
+    DISC: 'DISC Assessment Report / Sheet (Upload)',
+    VAKAD: 'VAKAD Assessment Report / Sheet (Upload)',
     SPM: 'SPM Examination Results',
     UEC: 'UEC Examination Results',
     DEGREE: 'University Degree Certificate',
@@ -1952,7 +2161,7 @@ async function startServer() {
     const name = String(req.body?.name || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
-    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+    const department = normalizeDepartment(req.body?.department, 'HR');
 
     const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
     if (existingCount > 0) {
@@ -2032,7 +2241,7 @@ async function startServer() {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
     const requestedRole: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+    const department = normalizeDepartment(req.body?.department, 'HR');
 
     if (!name || !email || !email.includes('@') || password.length < 8) {
       res.status(400).json({
@@ -2261,7 +2470,7 @@ async function startServer() {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
     const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+    const department = normalizeDepartment(req.body?.department, 'HR');
 
     if (!name || !email || !email.includes('@') || password.length < 6) {
       res.status(400).json({ error: 'Name, valid email, and password (min 6 characters) are required.' });
@@ -2330,8 +2539,7 @@ async function startServer() {
           : req.body?.role === 'manager'
             ? 'manager'
             : target.role;
-      const assignedDepartment =
-        String(req.body?.department || target.department || 'Human Resources').trim() || 'Human Resources';
+      const assignedDepartment = normalizeDepartment(req.body?.department || target.department, 'HR');
 
       const approvedBy = `${req.user!.name} (${req.user!.email})`;
       const approvedAt = formatAuditTimestamp(new Date());
@@ -2448,7 +2656,7 @@ async function startServer() {
 
     const targetId = Number(req.params.id);
     const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+    const department = normalizeDepartment(req.body?.department, 'HR');
 
     const target = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(targetId) as
       | { id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }
@@ -3183,7 +3391,7 @@ async function startServer() {
 
         const resumeText = sanitizeResumeText(body.resumeText ?? body.resume_text);
         const position = String(body.position ?? body.positionApplied ?? '').trim() || 'General Role';
-        const department = String(body.department ?? '').trim() || 'Operations';
+        const department = normalizeDepartment(body.department, 'HR');
         const rubric = String(body.rubric ?? body.jobRequirements ?? '').trim();
 
         const rawJsonBase64 = String(body.fileBase64 ?? '').trim();
@@ -3286,7 +3494,7 @@ async function startServer() {
     const phone = String(body.phone || '').trim();
     const location = String(body.location || 'Kuala Lumpur, Malaysia').trim();
     const position = String(body.position || body.positionApplied || '').trim();
-    const department = String(body.department || '').trim();
+    const department = normalizeDepartment(body.department, 'HR');
     const source = body.source === 'Email' ? 'Email' : 'JobStreet';
     const education = String(body.education || body.educationSummary || '').trim();
     const experience = String(body.experience || body.experienceSummary || '').trim();
@@ -3483,17 +3691,16 @@ async function startServer() {
           candidateName: String(existing.full_name),
           recipientEmail: String(existing.email),
           templateType: 'shortlist_forms_disc',
-          subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Complete Application & DISC Assessment`,
+          subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Upload Application Form, Assessments & Academic Docs`,
           bodyText: [
             `Dear ${existing.full_name},`,
             '',
             `Congratulations! Your application for ${existing.position} (${existing.department}) has progressed to the next stage.`,
             '',
-            'Please complete both official forms below:',
-            `1. Employment Application Form: ${EMPLOYMENT_FORM_URL}`,
-            `2. DISC Personality Assessment: ${DISC_FORM_URL}`,
-            '',
-            'Required Malaysian Academic Documents to Upload via Your Self-Service Portal:',
+            'Please upload the following completed documents directly via your Candidate Self-Service Portal (accepted formats: PDF, PNG, JPG, WEBP, DOCX):',
+            '- Employment Application Form (Mandatory)',
+            '- DISC Assessment Report / Sheet (Mandatory)',
+            '- VAKAD Assessment Report / Sheet (Mandatory)',
             '- SPM Examination Results (Mandatory)',
             '- UEC Examination Results (If applicable)',
             '- University Degree Certificate (Mandatory)',
@@ -3534,7 +3741,7 @@ async function startServer() {
         targetEntity: `${existing.full_name} (${existing.candidate_code})`,
         details:
           decision === 'proceed'
-            ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Employment Form + DISC Assessment links.`
+            ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Candidate Portal upload request (Application Form, DISC, VAKAD & Academic Docs).`
             : `Updated screening decision for ${existing.full_name} to "${decision}". Remarks: ${remarks || 'None'}`,
       });
     }
@@ -3694,7 +3901,7 @@ async function startServer() {
     else {
       const fullName = String(body.full_name ?? existing.full_name).trim();
       const position = String(body.position ?? existing.position).trim();
-      const department = String(body.department ?? existing.department).trim();
+      const department = normalizeDepartment(body.department ?? existing.department, 'HR');
       db.prepare(`
         UPDATE candidates SET full_name = ?, position = ?, department = ?, updated_at = datetime('now') WHERE id = ?
       `).run(fullName, position, department, id);
@@ -3895,12 +4102,11 @@ async function startServer() {
       bodyText: [
         `Dear ${candidate.full_name},`,
         '',
-        `This is a reminder for your ${candidate.position} application. We are still awaiting the following items:`,
-        ...(missing.length > 0 ? missing.map((m) => `- ${m}`) : ['- Outstanding academic documents / assessments']),
+        `This is a reminder for your ${candidate.position} application. We are still awaiting your direct portal upload for the following items:`,
+        ...(missing.length > 0 ? missing.map((m) => `- ${m}`) : ['- Outstanding application form, assessments, or academic documents']),
         '',
-        `Employment Application Form: ${EMPLOYMENT_FORM_URL}`,
-        `DISC Personality Assessment: ${DISC_FORM_URL}`,
-        `Upload Academic Docs (SPM, UEC if applicable, Degree, Transcript): ${portalUrl}`,
+        `Please upload your completed Application Form, DISC, VAKAD, and academic certificates (SPM, UEC if applicable, Degree, Transcript) directly via your Candidate Self-Service Portal:`,
+        `${portalUrl}`,
         '',
         'Thank you,',
         'TalentFlow MY HR Team',
@@ -3924,6 +4130,40 @@ async function startServer() {
 
     const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
     res.json({ candidate: hydrateCandidate(updated, req.user!.role), emailDelivery });
+  });
+
+  // WhatsApp Outreach Audit Logging (Administrator Only)
+  app.post('/api/candidates/:id/whatsapp-log', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ error: 'Invalid candidate ID.' });
+      return;
+    }
+
+    const candidate = db.prepare('SELECT id, candidate_code, full_name, phone FROM candidates WHERE id = ?').get(id) as
+      | { id: number; candidate_code: string; full_name: string; phone: string }
+      | undefined;
+    if (!candidate) {
+      res.status(404).json({ error: 'Candidate not found.' });
+      return;
+    }
+
+    const rawPhone = String(req.body?.phone || candidate.phone || '').trim();
+    const normalizedPhone = String(req.body?.normalizedPhone || '').trim();
+    const templateName = String(req.body?.templateName || 'General Follow-Up').trim().slice(0, 120);
+    const pageVisited = String(req.body?.pageVisited || 'Candidate Detail Drawer').trim().slice(0, 120);
+    const phoneDisplay = normalizedPhone ? `${rawPhone || normalizedPhone} (+${normalizedPhone})` : rawPhone || 'N/A';
+
+    logAudit({
+      req,
+      actor: req.user,
+      pageVisited,
+      actionTaken: 'WHATSAPP_OUTREACH',
+      targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
+      details: `Opened WhatsApp outreach to ${phoneDisplay} with template: ${templateName}`,
+    });
+
+    res.json({ logged: true });
   });
 
   // Batch 48h Missing-Docs Reminder
@@ -3958,12 +4198,10 @@ async function startServer() {
         bodyText: [
           `Dear ${candidate.full_name},`,
           '',
-          `This is a 48-hour follow-up reminder for your ${candidate.position} application. Outstanding items:`,
+          `This is a 48-hour follow-up reminder for your ${candidate.position} application. Please upload the outstanding items via your Candidate Self-Service Portal:`,
           ...missing.map((m) => `- ${m}`),
           '',
-          `Employment Application Form: ${EMPLOYMENT_FORM_URL}`,
-          `DISC Personality Assessment: ${DISC_FORM_URL}`,
-          `Upload Portal: ${portalUrl}`,
+          `Candidate Self-Service Portal Link: ${portalUrl}`,
           '',
           'Regards,\nTalentFlow MY HR Team',
         ].join('\n'),
@@ -4011,7 +4249,7 @@ async function startServer() {
 
       const body = req.body ?? {};
       const position = String(body.position || candidate.position).trim();
-      const department = String(body.department || candidate.department).trim();
+      const department = normalizeDepartment(body.department || candidate.department, 'HR');
       const salaryMyr = Math.max(0, Number(body.salary_myr) || 0);
       const allowanceMyr = Math.max(0, Number(body.allowance_myr) || 0);
       const probationMonths = Math.max(0, Math.min(24, Math.round(Number(body.probation_months) || 3)));
@@ -4222,7 +4460,7 @@ async function startServer() {
     const capacity = Math.max(1, Math.min(20, Math.round(Number(body.capacity) || 1)));
     const locationOrLink = String(body.location_or_link || '').trim();
     const interviewerName = String(body.interviewer_name || 'Hiring Panel').trim();
-    const department = String(body.department || 'Human Resources').trim();
+    const department = normalizeDepartment(body.department, 'HR');
     const mode = String(body.mode || 'Google Meet').trim();
 
     if (!date || !startTime || !endTime) {
@@ -4473,12 +4711,13 @@ async function startServer() {
   ): Promise<{ errorStatus?: number; errorMessage?: string }> {
     const candidateId = Number(row.id);
     const docType = String(req.body?.doc_type || '').toUpperCase();
-    if (!['SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'].includes(docType)) {
+    const allowedPortalDocs = ['APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
+    if (!allowedPortalDocs.includes(docType)) {
       if (req.file) fs.unlink(req.file.path, () => {});
-      return { errorStatus: 400, errorMessage: 'Invalid academic document type.' };
+      return { errorStatus: 400, errorMessage: 'Invalid document type for portal upload.' };
     }
     if (!req.file) {
-      return { errorStatus: 400, errorMessage: 'Please attach a document file (PDF/Image).' };
+      return { errorStatus: 400, errorMessage: 'Please attach a document file (PDF, PNG, JPG, WEBP, or DOCX).' };
     }
 
     ensureCandidateDocumentRows(candidateId);
@@ -4578,7 +4817,7 @@ async function startServer() {
     const candidateId = Number(row.id);
     const action = String(req.body?.action || '');
 
-    // Action A: Upload academic document (SPM, UEC, DEGREE, TRANSCRIPT)
+    // Action A: Upload candidate form, assessment, or academic document
     if (action === 'upload_document') {
       const result = await processPortalAcademicUpload(req, row);
       if (result.errorStatus) {
@@ -4586,47 +4825,7 @@ async function startServer() {
         return;
       }
     }
-    // Action B: Mark Google Apps Script forms (APP_FORM, DISC) complete
-    else if (action === 'complete_forms') {
-      const appForm = req.body?.app_form_completed === true || req.body?.app_form_completed === 'true';
-      const discForm = req.body?.disc_completed === true || req.body?.disc_completed === 'true';
-
-      ensureCandidateDocumentRows(candidateId);
-      if (appForm) {
-        db.prepare(`
-          UPDATE candidate_documents SET completed = 1, uploaded_at = datetime('now')
-          WHERE candidate_id = ? AND doc_type = 'APP_FORM'
-        `).run(candidateId);
-      }
-      if (discForm) {
-        db.prepare(`
-          UPDATE candidate_documents SET completed = 1, uploaded_at = datetime('now')
-          WHERE candidate_id = ? AND doc_type = 'DISC'
-        `).run(candidateId);
-      }
-
-      const missing = getMissingDocsForCandidate(candidateId);
-      const nextStage = Number(row.stage) < 7 ? (missing.length === 0 ? 7 : 6) : Number(row.stage);
-      const nextStatus =
-        Number(row.stage) <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(row.status);
-
-      db.prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`).run(
-        nextStage,
-        nextStatus,
-        candidateId
-      );
-
-      logAudit({
-        req,
-        actorName: `${row.full_name} (${row.email})`,
-        actorRole: 'candidate_portal',
-        pageVisited: 'Candidate Self-Service Portal',
-        actionTaken: 'VERIFY_DOCUMENT',
-        targetEntity: `${row.full_name} (${row.candidate_code})`,
-        details: `Candidate ${row.full_name} confirmed Google Apps Script form completion via self-service portal.`,
-      });
-    }
-    // Action C: Atomic Self-Service Interview Slot Booking
+    // Action B: Atomic Self-Service Interview Slot Booking
     else if (action === 'book_slot') {
       const slotId = Number(req.body?.slot_id);
       if (!slotId) {

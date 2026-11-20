@@ -238,7 +238,7 @@ export function initializeDatabase() {
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('administrator', 'manager')),
-      department TEXT NOT NULL DEFAULT 'Human Resources',
+      department TEXT NOT NULL DEFAULT 'HR',
       status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('pending', 'approved', 'rejected')),
       approved_by TEXT NOT NULL DEFAULT '',
       approved_at TEXT NOT NULL DEFAULT '',
@@ -289,7 +289,7 @@ export function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS candidate_documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       candidate_id INTEGER NOT NULL,
-      doc_type TEXT NOT NULL CHECK(doc_type IN ('RESUME', 'APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT')),
+      doc_type TEXT NOT NULL CHECK(doc_type IN ('RESUME', 'APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT')),
       completed INTEGER NOT NULL DEFAULT 0,
       verified INTEGER NOT NULL DEFAULT 0,
       not_applicable INTEGER NOT NULL DEFAULT 0,
@@ -311,7 +311,7 @@ export function initializeDatabase() {
       booked_count INTEGER NOT NULL DEFAULT 0,
       location_or_link TEXT NOT NULL DEFAULT '',
       interviewer_name TEXT NOT NULL DEFAULT 'Hiring Panel',
-      department TEXT NOT NULL DEFAULT 'Human Resources',
+      department TEXT NOT NULL DEFAULT 'HR',
       mode TEXT NOT NULL DEFAULT 'Google Meet',
       status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'CANCELLED')),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -367,6 +367,7 @@ export function initializeDatabase() {
 
   ensureUsersSecurityColumns();
   ensureCandidateDocumentsAiColumns();
+  ensureCandidateDocumentsSchemaAndTypes();
   ensureEmailLogsDeliveryColumns();
   ensureImmutableAuditLogsTable();
 }
@@ -445,6 +446,77 @@ function ensureCandidateDocumentsAiColumns() {
   }
 }
 
+function ensureCandidateDocumentsSchemaAndTypes() {
+  const tableDef = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_documents'`)
+    .get() as { sql?: string } | undefined;
+  const sql = String(tableDef?.sql || '');
+
+  const needsMigration =
+    sql.includes("'APP_FORM'") || !sql.includes("'APPLICATION_FORM'") || !sql.includes("'VAKAD'");
+
+  if (needsMigration) {
+    db.pragma('foreign_keys = OFF');
+    try {
+      const migrateDocs = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE candidate_documents_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER NOT NULL,
+            doc_type TEXT NOT NULL CHECK(doc_type IN ('RESUME', 'APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT')),
+            completed INTEGER NOT NULL DEFAULT 0,
+            verified INTEGER NOT NULL DEFAULT 0,
+            not_applicable INTEGER NOT NULL DEFAULT 0,
+            file_name TEXT NOT NULL DEFAULT '',
+            file_path TEXT NOT NULL DEFAULT '',
+            uploaded_at TEXT NOT NULL DEFAULT '',
+            ai_extracted_json TEXT NOT NULL DEFAULT '',
+            ai_verified_status TEXT NOT NULL DEFAULT '',
+            UNIQUE(candidate_id, doc_type),
+            FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
+          );
+
+          INSERT OR IGNORE INTO candidate_documents_v2 (
+            id, candidate_id, doc_type, completed, verified, not_applicable,
+            file_name, file_path, uploaded_at, ai_extracted_json, ai_verified_status
+          )
+          SELECT
+            id,
+            candidate_id,
+            CASE WHEN doc_type = 'APP_FORM' THEN 'APPLICATION_FORM' ELSE doc_type END,
+            completed,
+            verified,
+            not_applicable,
+            file_name,
+            file_path,
+            uploaded_at,
+            ai_extracted_json,
+            ai_verified_status
+          FROM candidate_documents;
+
+          DROP TABLE candidate_documents;
+          ALTER TABLE candidate_documents_v2 RENAME TO candidate_documents;
+        `);
+
+        // Ensure every existing candidate has rows for APPLICATION_FORM and VAKAD
+        const candidateRows = db.prepare(`SELECT id FROM candidates`).all() as Array<{ id: number }>;
+        const insertMissing = db.prepare(`
+          INSERT OR IGNORE INTO candidate_documents (
+            candidate_id, doc_type, completed, verified, not_applicable, file_name, file_path, uploaded_at
+          ) VALUES (?, ?, 0, 0, 0, '', '', '')
+        `);
+        for (const c of candidateRows) {
+          insertMissing.run(c.id, 'APPLICATION_FORM');
+          insertMissing.run(c.id, 'VAKAD');
+        }
+      });
+      migrateDocs();
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+  }
+}
+
 function ensureEmailLogsDeliveryColumns() {
   const columns = db.prepare(`PRAGMA table_info(email_logs)`).all() as Array<{ name: string }>;
   const hasSmtpError = columns.some((c) => c.name === 'smtp_error');
@@ -470,7 +542,16 @@ export function generateCandidateCode(): string {
 }
 
 export function ensureCandidateDocumentRows(candidateId: number, hasUec = false) {
-  const docTypes = ['RESUME', 'APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'] as const;
+  const docTypes = [
+    'RESUME',
+    'APPLICATION_FORM',
+    'DISC',
+    'VAKAD',
+    'SPM',
+    'UEC',
+    'DEGREE',
+    'TRANSCRIPT',
+  ] as const;
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO candidate_documents (candidate_id, doc_type, completed, verified, not_applicable, file_name, file_path, uploaded_at)
     VALUES (?, ?, 0, 0, ?, '', '', '')
