@@ -228,6 +228,9 @@ function parseResumeMultipartIfPresent(req: Request, res: Response, next: NextFu
         res.status(400).json({ error: message });
         return;
       }
+      if (!req.file && Array.isArray(req.files) && req.files.length > 0) {
+        req.file = req.files[0] as Express.Multer.File;
+      }
       next();
     });
     return;
@@ -744,8 +747,11 @@ async function startServer() {
     async (req: AuthedRequest, res: Response) => {
       try {
         const body = (req.body ?? {}) as Record<string, unknown>;
-        const uploadedFiles = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
-        const uploadedFile = uploadedFiles[0] || null;
+        const uploadedFile: Express.Multer.File | null =
+          req.file ||
+          (Array.isArray(req.files) && req.files.length > 0
+            ? (req.files[0] as Express.Multer.File)
+            : null);
 
         let combinedResumeText = String(body.resumeText ?? body.resume_text ?? '').trim();
         const position = String(body.position ?? body.positionApplied ?? '').trim() || 'General Role';
@@ -766,18 +772,33 @@ async function startServer() {
         let inlineFile: { mimeType: string; data: string } | null = null;
 
         if (uploadedFile) {
+          let fileBuffer: Buffer | null = null;
+          if (uploadedFile.buffer && uploadedFile.buffer.length > 0) {
+            fileBuffer = uploadedFile.buffer;
+          } else if (uploadedFile.path && fs.existsSync(uploadedFile.path)) {
+            fileBuffer = fs.readFileSync(uploadedFile.path);
+          }
+
+          if (!fileBuffer || fileBuffer.length === 0) {
+            res.status(400).json({
+              error: `Uploaded file "${uploadedFile.originalname}" appears to be empty (0 bytes). Please upload a valid resume file or paste the CV text directly.`,
+            });
+            return;
+          }
+
           const resolvedMime = inferResumeMimeType(uploadedFile.mimetype, uploadedFile.originalname);
           if (resolvedMime === 'text/plain') {
-            const decodedText = uploadedFile.buffer.toString('utf8').trim();
+            const decodedText = fileBuffer.toString('utf8').trim();
             if (decodedText) {
               combinedResumeText = combinedResumeText
                 ? `${combinedResumeText}\n\n${decodedText}`
                 : decodedText;
             }
           } else if (SUPPORTED_INLINE_MIMES.has(resolvedMime)) {
+            const base64Data = fileBuffer.toString('base64');
             inlineFile = {
               mimeType: resolvedMime,
-              data: uploadedFile.buffer.toString('base64'),
+              data: base64Data,
             };
           } else {
             res.status(400).json({
@@ -818,23 +839,34 @@ async function startServer() {
         }
 
         const ai = getGeminiClient();
+        const geminiModel = (process.env.GEMINI_MODEL || '').trim() || 'gemini-3.8-flash';
+
+        console.log('[Gemini Parse Resume] Request:', {
+          model: geminiModel,
+          hasInlineFile: Boolean(inlineFile),
+          inlineMimeType: inlineFile?.mimeType || null,
+          inlineBase64Length: inlineFile?.data.length || 0,
+          textLength: combinedResumeText.length,
+          fileName: fileName || null,
+          position,
+        });
 
         const prompt = [
           'You are an experienced Malaysian enterprise HR recruitment specialist.',
           `Analyze the candidate resume for the position "${position}" in the "${department}" department.`,
           rubric ? `Screening rubric / role requirements: ${rubric}` : '',
-          'Extract all candidate details accurately from the attached resume file and/or resume text:',
+          'Extract every available candidate detail accurately from the attached resume document and/or resume text into a single flat JSON object with these exact keys:',
           '- full_name: Candidate full name exactly as written on the resume.',
           '- email: Candidate email address (empty string if not present; never invent).',
-          '- phone: Candidate mobile/phone number formatted cleanly for Malaysia (e.g., 012-3456789 or 011-12345678; empty string if not present).',
+          '- phone: Candidate phone number formatted cleanly for Malaysia (e.g., 012-3456789 or 011-12345678; empty string if not present).',
           '- location: City and state in Malaysia (e.g., Petaling Jaya, Selangor or Kuala Lumpur; empty string if not stated).',
+          '- years_experience: Total relevant years of working experience as a number (0 to 50).',
+          '- has_uec: true only if UEC (Unified Examination Certificate) is explicitly mentioned in the resume, otherwise false.',
+          '- skills: Array of up to 15 concise technical, domain, and soft skills found in the resume.',
           '- education: Highest qualification, institution, CGPA/grade, plus Malaysian qualifications (SPM, STPM, UEC, Diploma, Degree) if present.',
           '- experience: Concise summary of relevant roles, employers, key achievements, and total years of experience.',
-          '- skills: Array of up to 15 concise technical, domain, and soft skills found in the resume.',
           '- ai_score: Realistic integer job-fit score from 0 to 100 evaluated against the position and rubric.',
           '- ai_summary: Concise HR screening evaluation covering strengths, gaps, and hiring recommendation.',
-          '- years_experience: Total relevant years of working experience as a number (0 to 50).',
-          '- detected_uec_mention: true only if UEC (Unified Examination Certificate) is explicitly mentioned in the resume.',
         ]
           .filter(Boolean)
           .join('\n');
@@ -853,7 +885,7 @@ async function startServer() {
         parts.push({
           text: combinedResumeText
             ? `${prompt}\n\nCandidate Resume Text (${fileName || 'Pasted Resume'}):\n${combinedResumeText}`
-            : `${prompt}\n\nExtract and score all candidate details from the attached resume file (${fileName || 'uploaded resume'}).`,
+            : `${prompt}\n\nRead the attached resume file (${fileName || 'uploaded resume'}) thoroughly and extract all fields into JSON.`,
         });
 
         const AI_TIMEOUT_MS = 55_000;
@@ -864,16 +896,13 @@ async function startServer() {
           }, AI_TIMEOUT_MS);
         });
 
-        const geminiModel = (process.env.GEMINI_MODEL || '').trim() || 'gemini-3.8-flash';
-
         const response = await Promise.race([
           ai.models.generateContent({
             model: geminiModel,
-            contents: { parts },
+            contents: [{ role: 'user', parts }],
             config: {
-              temperature: 0.1,
               systemInstruction:
-                'Return strictly valid JSON matching the provided schema. Never fabricate email addresses or phone numbers that do not appear in the resume.',
+                'Return strictly valid flat JSON matching the provided schema. Never wrap the JSON inside an extra key or array. Never fabricate email addresses or phone numbers that do not appear in the resume.',
               responseMimeType: 'application/json',
               responseSchema: {
                 type: Type.OBJECT,
@@ -885,6 +914,19 @@ async function startServer() {
                     description: 'Phone number formatted cleanly for Malaysia e.g. 01X-XXXXXXX',
                   },
                   location: { type: Type.STRING, description: 'City / State location' },
+                  years_experience: {
+                    type: Type.NUMBER,
+                    description: 'Total relevant years of working experience (0 to 50)',
+                  },
+                  has_uec: {
+                    type: Type.BOOLEAN,
+                    description: 'Whether UEC qualification is explicitly mentioned',
+                  },
+                  skills: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'List of key technical and domain skills',
+                  },
                   education: {
                     type: Type.STRING,
                     description: 'Highest qualification, institution, CGPA/grade, and SPM/UEC/Degree details',
@@ -893,23 +935,10 @@ async function startServer() {
                     type: Type.STRING,
                     description: 'Concise summary of relevant roles, employers, and years of experience',
                   },
-                  skills: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: 'List of key technical and domain skills',
-                  },
                   ai_score: { type: Type.INTEGER, description: 'Job-fit score from 0 to 100' },
                   ai_summary: {
                     type: Type.STRING,
                     description: 'HR screening summary covering strengths, gaps, and recommendation',
-                  },
-                  years_experience: {
-                    type: Type.NUMBER,
-                    description: 'Total relevant years of working experience (0 to 50)',
-                  },
-                  detected_uec_mention: {
-                    type: Type.BOOLEAN,
-                    description: 'Whether UEC qualification is explicitly mentioned',
                   },
                 },
                 required: [
@@ -917,9 +946,11 @@ async function startServer() {
                   'email',
                   'phone',
                   'location',
+                  'years_experience',
+                  'has_uec',
+                  'skills',
                   'education',
                   'experience',
-                  'skills',
                   'ai_score',
                   'ai_summary',
                 ],
@@ -931,61 +962,115 @@ async function startServer() {
           if (timeoutHandle) clearTimeout(timeoutHandle);
         });
 
-        const rawText = (response.text ?? '').trim();
-        if (!rawText) {
+        const responseText = (response.text ?? '').trim();
+        console.log('Gemini raw extraction:', responseText);
+
+        if (!responseText) {
           res.status(502).json({
-            error: 'Gemini AI returned an empty response. Ensure the uploaded PDF/image is legible and try again.',
+            error:
+              'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.',
           });
           return;
         }
 
-        const cleanedJsonText = rawText
+        const cleanedJsonText = responseText
           .replace(/^```(?:json)?\s*/i, '')
           .replace(/\s*```$/i, '')
           .trim();
 
-        let parsed: Record<string, unknown>;
+        let rawParsed: unknown;
         try {
-          parsed = JSON.parse(cleanedJsonText) as Record<string, unknown>;
+          rawParsed = JSON.parse(cleanedJsonText);
         } catch {
-          res.status(502).json({
-            error: 'Gemini AI returned malformed JSON. Please retry resume analysis.',
-          });
-          return;
+          const objMatch = cleanedJsonText.match(/\{[\s\S]*\}/);
+          if (!objMatch) {
+            res.status(502).json({
+              error: 'Gemini AI returned malformed JSON. Please retry resume analysis.',
+            });
+            return;
+          }
+          try {
+            rawParsed = JSON.parse(objMatch[0]);
+          } catch {
+            res.status(502).json({
+              error: 'Gemini AI returned malformed JSON. Please retry resume analysis.',
+            });
+            return;
+          }
         }
 
-        const fullName = String(parsed.full_name ?? parsed.fullName ?? '').trim().slice(0, 140);
+        const unwrapped = Array.isArray(rawParsed)
+          ? (rawParsed[0] as Record<string, unknown> | undefined) ?? {}
+          : (rawParsed as Record<string, unknown>);
+        const parsed = (
+          (unwrapped.extracted as Record<string, unknown> | undefined) ||
+          (unwrapped.data as Record<string, unknown> | undefined) ||
+          (unwrapped.result as Record<string, unknown> | undefined) ||
+          (unwrapped.candidate as Record<string, unknown> | undefined) ||
+          unwrapped
+        );
+
+        const fullName = String(parsed.full_name ?? parsed.fullName ?? parsed.name ?? '').trim().slice(0, 140);
         const email = String(parsed.email ?? '').trim().slice(0, 254);
-        const phone = formatMalaysianPhone(String(parsed.phone ?? ''));
+        const phone = formatMalaysianPhone(String(parsed.phone ?? parsed.contact_number ?? ''));
         const location = String(parsed.location ?? '').trim().slice(0, 120);
-        const education = String(parsed.education ?? parsed.educationSummary ?? '').trim().slice(0, 600);
-        const experience = String(parsed.experience ?? parsed.experienceSummary ?? '').trim().slice(0, 800);
+        const education = String(parsed.education ?? parsed.education_summary ?? parsed.educationSummary ?? '')
+          .trim()
+          .slice(0, 600);
+        const experience = String(parsed.experience ?? parsed.experience_summary ?? parsed.experienceSummary ?? '')
+          .trim()
+          .slice(0, 800);
         const skills = Array.isArray(parsed.skills)
           ? parsed.skills.map((s: unknown) => String(s).trim().slice(0, 60)).filter(Boolean).slice(0, 20)
-          : [];
-        const rawScore = Number(parsed.ai_score ?? parsed.aiMatchScore);
+          : typeof parsed.skills === 'string'
+            ? parsed.skills
+                .split(',')
+                .map((s) => s.trim().slice(0, 60))
+                .filter(Boolean)
+                .slice(0, 20)
+            : [];
+        const rawScore = Number(parsed.ai_score ?? parsed.aiMatchScore ?? parsed.match_score ?? parsed.score);
         const aiScore = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0;
         const aiSummary = String(parsed.ai_summary ?? parsed.aiSummary ?? '').trim().slice(0, 1200);
         const rawYears = Number(parsed.years_experience ?? parsed.yearsExperience);
         const yearsExperience = Number.isFinite(rawYears)
           ? Math.max(0, Math.min(60, Math.round(rawYears * 2) / 2))
           : 0;
-        const detectedUec =
-          Boolean(parsed.detected_uec_mention ?? parsed.detectedUecMention) ||
+        const hasUec =
+          Boolean(parsed.has_uec ?? parsed.hasUec ?? parsed.detected_uec_mention ?? parsed.detectedUecMention) ||
           /\buec\b/i.test(`${education} ${combinedResumeText}`);
+
+        const extractedFieldCount = [
+          fullName,
+          email,
+          phone,
+          location,
+          education,
+          experience,
+          skills.length > 0 ? 'skills' : '',
+          aiSummary,
+        ].filter(Boolean).length;
+
+        if (extractedFieldCount === 0) {
+          res.status(422).json({
+            error:
+              'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.',
+          });
+          return;
+        }
 
         res.json({
           full_name: fullName,
           email,
           phone,
           location,
+          years_experience: yearsExperience,
+          has_uec: hasUec,
+          skills,
           education,
           experience,
-          skills,
           ai_score: aiScore,
           ai_summary: aiSummary,
-          years_experience: yearsExperience,
-          detected_uec_mention: detectedUec,
         });
       } catch (err: unknown) {
         const rawMessage = err instanceof Error ? err.message : 'Failed to analyze resume with Gemini AI.';

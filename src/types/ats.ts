@@ -181,23 +181,32 @@ export interface ParsedResumeResult {
   email: string;
   phone: string;
   location: string;
+  years_experience: number;
+  has_uec: boolean;
+  skills: string[] | string;
   education: string;
   experience: string;
-  skills: string[];
   ai_score: number;
   ai_summary: string;
-  years_experience?: number;
-  detected_uec_mention?: boolean;
   // Defensive optional aliases
   fullName?: string;
   name?: string;
   contact_number?: string;
+  education_summary?: string;
   educationSummary?: string;
+  experience_summary?: string;
   experienceSummary?: string;
   yearsExperience?: number;
-  aiMatchScore?: number;
-  aiSummary?: string;
+  hasUec?: boolean;
+  detected_uec_mention?: boolean;
   detectedUecMention?: boolean;
+  aiMatchScore?: number;
+  match_score?: number;
+  score?: number;
+  aiSummary?: string;
+  extracted?: Record<string, unknown>;
+  data?: Record<string, unknown>;
+  result?: Record<string, unknown>;
 }
 
 export interface CandidateFilters {

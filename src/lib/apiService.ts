@@ -187,6 +187,51 @@ export async function deleteStaffUser(id: number): Promise<void> {
 // =============================================================================
 // GEMINI AI RESUME PARSER
 // =============================================================================
+function unwrapResumePayload(res: unknown): ParsedResumeResult {
+  const root = (res && typeof res === 'object' ? res : {}) as Record<string, unknown>;
+  const nested =
+    (root.extracted && typeof root.extracted === 'object' ? root.extracted : null) ||
+    (root.data && typeof root.data === 'object' ? root.data : null) ||
+    (root.result && typeof root.result === 'object' ? root.result : null) ||
+    root;
+  const payload = (Array.isArray(nested) ? nested[0] || {} : nested) as Record<string, unknown>;
+
+  const skillsRaw = payload.skills;
+  const skills = Array.isArray(skillsRaw)
+    ? skillsRaw.map((s) => String(s).trim()).filter(Boolean)
+    : typeof skillsRaw === 'string'
+      ? skillsRaw
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+
+  const rawScore = Number(
+    payload.ai_score ?? payload.aiMatchScore ?? payload.match_score ?? payload.score
+  );
+  const rawYears = Number(payload.years_experience ?? payload.yearsExperience);
+
+  return {
+    full_name: String(payload.full_name ?? payload.fullName ?? payload.name ?? '').trim(),
+    email: String(payload.email ?? '').trim(),
+    phone: String(payload.phone ?? payload.contact_number ?? '').trim(),
+    location: String(payload.location ?? '').trim(),
+    years_experience: Number.isFinite(rawYears) ? rawYears : 0,
+    has_uec: Boolean(
+      payload.has_uec ?? payload.hasUec ?? payload.detected_uec_mention ?? payload.detectedUecMention
+    ),
+    skills,
+    education: String(
+      payload.education ?? payload.education_summary ?? payload.educationSummary ?? ''
+    ).trim(),
+    experience: String(
+      payload.experience ?? payload.experience_summary ?? payload.experienceSummary ?? ''
+    ).trim(),
+    ai_score: Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0,
+    ai_summary: String(payload.ai_summary ?? payload.aiSummary ?? '').trim(),
+  };
+}
+
 export async function parseResumeWithAi(payload: {
   file?: File | null;
   resumeText?: string;
@@ -207,7 +252,7 @@ export async function parseResumeWithAi(payload: {
     if (payload.rubric?.trim()) {
       form.append('rubric', payload.rubric.trim());
     }
-    return apiFetch<ParsedResumeResult>(
+    const raw = await apiFetch<unknown>(
       '/api/ai/parse-resume',
       {
         method: 'POST',
@@ -216,9 +261,10 @@ export async function parseResumeWithAi(payload: {
       true,
       65_000
     );
+    return unwrapResumePayload(raw);
   }
 
-  return apiFetch<ParsedResumeResult>(
+  const raw = await apiFetch<unknown>(
     '/api/ai/parse-resume',
     {
       method: 'POST',
@@ -232,6 +278,7 @@ export async function parseResumeWithAi(payload: {
     true,
     65_000
   );
+  return unwrapResumePayload(raw);
 }
 
 // =============================================================================

@@ -119,7 +119,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
     setDuplicateWarning(null);
 
     try {
-      const data = await parseResumeWithAi({
+      const res = await parseResumeWithAi({
         file: resumeFile,
         resumeText: resumeText.trim() || undefined,
         position: positionApplied,
@@ -127,29 +127,75 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
         rubric: rubric.trim() || undefined,
       });
 
-      const extractedName = String(data.full_name || data.fullName || data.name || '').trim();
-      const extractedEmail = String(data.email || '').trim();
-      const extractedPhone = String(data.phone || data.contact_number || '').trim();
-      const extractedLocation = String(data.location || '').trim();
-      const extractedEducation = String(data.education || data.educationSummary || '').trim();
-      const extractedExperience = String(data.experience || data.experienceSummary || '').trim();
-      const extractedSkills = Array.isArray(data.skills)
-        ? data.skills.map((s) => String(s).trim()).filter(Boolean)
-        : [];
-      const rawScore = data.ai_score ?? data.aiMatchScore;
-      const extractedScore =
-        typeof rawScore === 'number' && !Number.isNaN(rawScore)
-          ? Math.max(0, Math.min(100, Math.round(rawScore)))
-          : null;
-      const extractedSummary = String(data.ai_summary || data.aiSummary || '').trim();
-      const rawYears = data.years_experience ?? data.yearsExperience;
+      const resObj = (res && typeof res === 'object' ? res : {}) as unknown as Record<string, unknown>;
+      const payload = (
+        (resObj.extracted as Record<string, unknown> | undefined) ||
+        (resObj.data as Record<string, unknown> | undefined) ||
+        (resObj.result as Record<string, unknown> | undefined) ||
+        resObj
+      );
+
+      const extractedName = String(payload.full_name || payload.fullName || payload.name || '').trim();
+      const extractedEmail = String(payload.email || '').trim();
+      const extractedPhone = String(payload.phone || payload.contact_number || '').trim();
+      const extractedLocation = String(payload.location || '').trim();
+      const extractedEducation = String(
+        payload.education || payload.education_summary || payload.educationSummary || ''
+      ).trim();
+      const extractedExperience = String(
+        payload.experience || payload.experience_summary || payload.experienceSummary || ''
+      ).trim();
+      const extractedSkillsText = Array.isArray(payload.skills)
+        ? payload.skills
+            .map((s) => String(s).trim())
+            .filter(Boolean)
+            .join(', ')
+        : typeof payload.skills === 'string'
+          ? payload.skills.trim()
+          : '';
+      const rawScoreVal = payload.ai_score ?? payload.aiMatchScore ?? payload.match_score ?? payload.score;
+      const numericScore = rawScoreVal !== undefined && rawScoreVal !== null && rawScoreVal !== ''
+        ? Number(rawScoreVal)
+        : NaN;
+      const extractedScore = Number.isFinite(numericScore)
+        ? Math.max(0, Math.min(100, Math.round(numericScore)))
+        : null;
+      const extractedSummary = String(payload.ai_summary || payload.aiSummary || '').trim();
+      const rawYearsVal = payload.years_experience ?? payload.yearsExperience;
+      const numericYears = rawYearsVal !== undefined && rawYearsVal !== null && rawYearsVal !== ''
+        ? Number(rawYearsVal)
+        : NaN;
       const extractedYears =
-        typeof rawYears === 'number' && !Number.isNaN(rawYears) && rawYears > 0
-          ? Math.max(0, Math.min(60, rawYears))
+        Number.isFinite(numericYears) && numericYears > 0
+          ? Math.max(0, Math.min(60, numericYears))
           : inferYearsFromText(extractedExperience);
       const extractedUec =
-        Boolean(data.detected_uec_mention ?? data.detectedUecMention) ||
-        /\buec\b/i.test(`${extractedEducation} ${resumeText}`);
+        Boolean(
+          payload.has_uec ||
+            payload.hasUec ||
+            payload.detected_uec_mention ||
+            payload.detectedUecMention
+        ) || /\buec\b/i.test(`${extractedEducation} ${resumeText}`);
+
+      const extractedCount = [
+        extractedName,
+        extractedEmail,
+        extractedPhone,
+        extractedLocation,
+        extractedEducation,
+        extractedExperience,
+        extractedSkillsText,
+        extractedSummary,
+      ].filter(Boolean).length;
+
+      if (extractedCount === 0) {
+        setAiMatchScore(null);
+        setParseSuccess(null);
+        setParseError(
+          'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
+        );
+        return;
+      }
 
       setFullName(extractedName);
       setEmail(extractedEmail);
@@ -158,26 +204,15 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
       setEducationSummary(extractedEducation);
       setExperienceSummary(extractedExperience);
       setYearsExperience(extractedYears);
-      setSkillsText(extractedSkills.join(', '));
+      setSkillsText(extractedSkillsText);
       setAiMatchScore(extractedScore);
       setAiSummary(extractedSummary);
       setHasUec(extractedUec);
 
       checkDuplicates(extractedEmail, extractedPhone);
 
-      const filledCount = [
-        extractedName,
-        extractedEmail,
-        extractedPhone,
-        extractedLocation,
-        extractedEducation,
-        extractedExperience,
-        extractedSkills.length > 0 ? 'skills' : '',
-        extractedSummary,
-      ].filter(Boolean).length;
-
       setParseSuccess(
-        `Gemini AI extracted ${filledCount} profile fields and auto-filled the form below${
+        `Gemini AI extracted ${extractedCount} profile fields and auto-filled the form below${
           extractedScore !== null ? ` · Job-Fit Score: ${extractedScore}%` : ''
         }.`
       );
