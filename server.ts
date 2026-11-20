@@ -864,9 +864,11 @@ async function startServer() {
           }, AI_TIMEOUT_MS);
         });
 
+        const geminiModel = (process.env.GEMINI_MODEL || '').trim() || 'gemini-3.8-flash';
+
         const response = await Promise.race([
           ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: geminiModel,
             contents: { parts },
             config: {
               temperature: 0.1,

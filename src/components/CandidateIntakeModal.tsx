@@ -248,7 +248,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
               Stages 1–2 · Register Candidate & Gemini AI Resume Screening
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Intake from JobStreet or Email · Stores resume in local uploads/, runs Gemini 2.5 Flash extraction & prevents duplicates
+              Intake from JobStreet or Email · Stores resume in local uploads/, runs Gemini AI extraction & prevents duplicates
             </p>
           </div>
           <button
