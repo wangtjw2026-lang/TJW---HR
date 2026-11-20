@@ -76,15 +76,35 @@ const memoryUpload = multer({
 // EMAIL AUTOMATION (Nodemailer with SQLite email_logs + console fallback)
 // =============================================================================
 function createMailTransporter() {
-  if (!process.env.SMTP_HOST) return null;
+  const rawHost = String(process.env.SMTP_HOST || '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const nonRoutableHosts = new Set(['', 'localhost', '127.0.0.1', '::1', '0.0.0.0', 'smtp.example.com']);
+  if (!rawHost || nonRoutableHosts.has(rawHost.toLowerCase())) {
+    return null;
+  }
+
+  const smtpUser = String(process.env.SMTP_USER || '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const smtpPass = String(process.env.SMTP_PASS || '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const smtpPort = Number(String(process.env.SMTP_PORT || '587').replace(/^["']|["']$/g, '').trim()) || 587;
+  const smtpSecure =
+    String(process.env.SMTP_SECURE || '')
+      .replace(/^["']|["']$/g, '')
+      .trim()
+      .toLowerCase() === 'true';
+
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: process.env.SMTP_SECURE === 'true',
-    auth:
-      process.env.SMTP_USER && process.env.SMTP_PASS
-        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-        : undefined,
+    host: rawHost,
+    port: smtpPort,
+    secure: smtpSecure,
+    connectionTimeout: 5_000,
+    greetingTimeout: 5_000,
+    socketTimeout: 10_000,
+    auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
   });
 }
 
@@ -239,8 +259,9 @@ async function dispatchEmail(params: {
       });
       deliveryStatus = 'SENT_SMTP';
     } catch (err) {
-      console.error('[Email Automation] SMTP send failed, logged to DB:', err);
-      deliveryStatus = 'SMTP_FAILED_LOGGED';
+      const reason = err instanceof Error ? err.message : String(err);
+      console.log(`[Email Automation] SMTP unavailable (${reason}); recorded email in SQLite email_logs.`);
+      deliveryStatus = 'LOGGED_LOCAL';
     }
   } else {
     console.log(
@@ -369,6 +390,857 @@ function parseResumeMultipartIfPresent(req: Request, res: Response, next: NextFu
 }
 
 // =============================================================================
+// UNIFIED GEMINI MULTIMODAL DOCUMENT EXTRACTION ENGINE
+// =============================================================================
+type ExtractableDocType = 'RESUME' | 'SPM' | 'UEC' | 'DEGREE' | 'TRANSCRIPT';
+type AiDocumentVerificationStatus = '' | 'VERIFIED_MATCH' | 'NAME_MISMATCH' | 'REVIEW_NEEDED' | 'AI_FAILED';
+
+const EXTRACTABLE_DOC_TYPES = new Set<ExtractableDocType>([
+  'RESUME',
+  'SPM',
+  'UEC',
+  'DEGREE',
+  'TRANSCRIPT',
+]);
+
+const SUPPORTED_INLINE_DOCUMENT_MIMES = new Set([
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+]);
+
+function isExtractableDocType(docType: string): docType is ExtractableDocType {
+  return EXTRACTABLE_DOC_TYPES.has(docType as ExtractableDocType);
+}
+
+function getGeminiModelCandidates(): string[] {
+  const configuredModel = String(process.env.GEMINI_MODEL || '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  // Skip non-generateContent / stalling alias gemini-3.8-flash if left in env
+  const validConfigured =
+    configuredModel && !/^gemini-3\.8-flash$/i.test(configuredModel) ? configuredModel : '';
+
+  return Array.from(
+    new Set([
+      ...(validConfigured ? [validConfigured] : []),
+      'gemini-3.1-flash-lite',
+      'gemini-4-hydrogen',
+    ])
+  );
+}
+
+function getPerAttemptTimeoutMs(modelName: string): number {
+  if (modelName === 'gemini-3.1-flash-lite') {
+    return 35_000;
+  }
+  return 45_000;
+}
+
+function formatGeminiError(err: unknown): { statusCode: number; userMessage: string } {
+  const rawMessage = err instanceof Error ? err.message : 'Failed to analyze document with Gemini AI.';
+  if (/timed out/i.test(rawMessage)) {
+    return {
+      statusCode: 504,
+      userMessage: 'Gemini AI document analysis timed out. Please retry with Re-Analyze with Gemini AI.',
+    };
+  }
+  if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(rawMessage)) {
+    return {
+      statusCode: 500,
+      userMessage:
+        'Invalid or unauthorized GEMINI_API_KEY on the server. Please verify your Gemini API key in Settings > Secrets.',
+    };
+  }
+  if (/429|RESOURCE_EXHAUSTED|quota/i.test(rawMessage)) {
+    return {
+      statusCode: 429,
+      userMessage: 'Gemini API rate limit or quota reached. Please wait a moment and try again.',
+    };
+  }
+  if (/GEMINI_API_KEY is not configured/i.test(rawMessage)) {
+    return { statusCode: 500, userMessage: rawMessage };
+  }
+  return { statusCode: 500, userMessage: rawMessage };
+}
+
+function buildDocumentPromptAndSchema(params: {
+  docType: ExtractableDocType;
+  candidateName?: string;
+  position?: string;
+  department?: string;
+  rubric?: string;
+}) {
+  const { docType, candidateName = '', position = 'General Role', department = 'Operations', rubric = '' } = params;
+  const candidateContext = candidateName
+    ? `Expected candidate full name on file: "${candidateName}". Compare the name printed on the document carefully (accounting for Malaysian naming conventions such as bin/binti/a/l/a/p, Chinese surname order, initials, or minor casing differences).`
+    : 'No reference candidate name was provided; set name_matches_candidate to true if a clear candidate name is printed on the document, otherwise false.';
+
+  if (docType === 'RESUME') {
+    return {
+      prompt: [
+        'You are an experienced Malaysian enterprise HR recruitment specialist.',
+        `Analyze the candidate resume for the position "${position}" in the "${department}" department.`,
+        rubric ? `Screening rubric / role requirements: ${rubric}` : '',
+        'Extract every available candidate detail accurately from the resume into a single flat JSON object with these exact keys:',
+        '- full_name: Candidate full name exactly as written on the resume.',
+        '- email: Candidate email address (empty string if not present; never invent).',
+        '- phone: Candidate phone number formatted cleanly for Malaysia (e.g., 012-3456789 or 011-12345678; empty string if not present).',
+        '- location: City and state in Malaysia (e.g., Petaling Jaya, Selangor or Kuala Lumpur; empty string if not stated).',
+        '- years_experience: Total relevant years of working experience as a number (0 to 50).',
+        '- has_uec: true only if UEC (Unified Examination Certificate) is explicitly mentioned in the resume, otherwise false.',
+        '- skills: Array of up to 15 concise technical, domain, and soft skills found in the resume.',
+        '- education: Highest qualification, institution, CGPA/grade, plus Malaysian qualifications (SPM, STPM, UEC, Diploma, Degree) if present.',
+        '- experience: Concise summary of relevant roles, employers, key achievements, and total years of experience.',
+        '- ai_score: Realistic integer job-fit score from 0 to 100 evaluated against the position and rubric.',
+        '- ai_summary: Concise HR screening evaluation covering strengths, gaps, and hiring recommendation.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          full_name: { type: Type.STRING, description: 'Candidate full name' },
+          email: { type: Type.STRING, description: 'Candidate email address if present, else empty string' },
+          phone: {
+            type: Type.STRING,
+            description: 'Phone number formatted cleanly for Malaysia e.g. 01X-XXXXXXX',
+          },
+          location: { type: Type.STRING, description: 'City / State location' },
+          years_experience: {
+            type: Type.NUMBER,
+            description: 'Total relevant years of working experience (0 to 50)',
+          },
+          has_uec: {
+            type: Type.BOOLEAN,
+            description: 'Whether UEC qualification is explicitly mentioned',
+          },
+          skills: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'List of key technical and domain skills',
+          },
+          education: {
+            type: Type.STRING,
+            description: 'Highest qualification, institution, CGPA/grade, and SPM/UEC/Degree details',
+          },
+          experience: {
+            type: Type.STRING,
+            description: 'Concise summary of relevant roles, employers, and years of experience',
+          },
+          ai_score: { type: Type.INTEGER, description: 'Job-fit score from 0 to 100' },
+          ai_summary: {
+            type: Type.STRING,
+            description: 'HR screening summary covering strengths, gaps, and recommendation',
+          },
+        },
+        required: [
+          'full_name',
+          'email',
+          'phone',
+          'location',
+          'years_experience',
+          'has_uec',
+          'skills',
+          'education',
+          'experience',
+          'ai_score',
+          'ai_summary',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'SPM') {
+    return {
+      prompt: [
+        'You are a Malaysian HR academic credential verification specialist.',
+        'Inspect this uploaded document expecting a Malaysian SPM (Sijil Pelajaran Malaysia) Certificate or Examination Result Slip.',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "SPM Certificate / Slip" if this is an SPM certificate/slip, otherwise state concisely what document was actually detected (e.g. "Unrelated Document", "Blurry / Unreadable Scan", "University Transcript").',
+        '- candidate_name_on_doc: Exact candidate name printed on the document (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- exam_year: 4-digit examination year (e.g. "2018") or empty string if not visible.',
+        '- school_name: Secondary school or examination centre name (empty string if not visible).',
+        '- grades_summary: Concise comma-separated summary of subjects and grades (e.g. "BM: A, English: A-, Maths: A+, Sejarah: A, Add Maths: B+").',
+        '- total_credits: Summary of total distinctions/credits/passes (e.g. "9 Credits (6A, 3B)" or numeric credit count).',
+        '- verification_notes: Concise HR verification notes covering legibility, document authenticity indicators, BM/Sejarah pass status, and any discrepancies or mismatches.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          exam_year: { type: Type.STRING },
+          school_name: { type: Type.STRING },
+          grades_summary: { type: Type.STRING },
+          total_credits: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'exam_year',
+          'school_name',
+          'grades_summary',
+          'total_credits',
+          'verification_notes',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'UEC') {
+    return {
+      prompt: [
+        'You are a Malaysian HR academic credential verification specialist.',
+        'Inspect this uploaded document expecting a Malaysian UEC (Unified Examination Certificate / Dong Zong) Certificate or Transcript.',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "UEC Certificate / Transcript" if this is a UEC document, otherwise state concisely what document was actually detected.',
+        '- candidate_name_on_doc: Exact candidate name printed on the document (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- exam_year: 4-digit examination year (e.g. "2019") or empty string if not visible.',
+        '- school_name: Independent Chinese High School name (empty string if not visible).',
+        '- grades_summary: Concise comma-separated summary of UEC subjects and grades (e.g. "Chinese: A1, English: A2, Mathematics: A1, Accounting: B3").',
+        '- verification_notes: Concise HR verification notes covering legibility, Senior/Junior UEC level, and any discrepancies or mismatches.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          exam_year: { type: Type.STRING },
+          school_name: { type: Type.STRING },
+          grades_summary: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'exam_year',
+          'school_name',
+          'grades_summary',
+          'verification_notes',
+        ],
+      },
+    };
+  }
+
+  if (docType === 'DEGREE') {
+    return {
+      prompt: [
+        'You are a Malaysian HR academic credential verification specialist.',
+        'Inspect this uploaded document expecting a University Degree Certificate (scroll or official convocation certificate).',
+        candidateContext,
+        'Return strictly valid flat JSON with these exact keys:',
+        '- document_detected: Set to "University Degree Certificate" if this is a university degree certificate/scroll, otherwise state concisely what document was actually detected.',
+        '- candidate_name_on_doc: Exact graduate name printed on the certificate (empty string if not visible).',
+        '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+        '- university_name: Awarding university or institution name (empty string if not visible).',
+        '- degree_title: Full degree title (e.g. "Bachelor of Computer Science (Hons) in Software Engineering").',
+        '- honours_class: Honours classification or distinction if printed (e.g. "First Class Honours", "Second Class Upper (2:1)", or "Not Stated").',
+        '- graduation_year: 4-digit conferral / graduation year (empty string if not visible).',
+        '- verification_notes: Concise HR verification notes covering legibility, seal/signatory visibility, and any discrepancies or mismatches.',
+      ].join('\n'),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_detected: { type: Type.STRING },
+          candidate_name_on_doc: { type: Type.STRING },
+          name_matches_candidate: { type: Type.BOOLEAN },
+          university_name: { type: Type.STRING },
+          degree_title: { type: Type.STRING },
+          honours_class: { type: Type.STRING },
+          graduation_year: { type: Type.STRING },
+          verification_notes: { type: Type.STRING },
+        },
+        required: [
+          'document_detected',
+          'candidate_name_on_doc',
+          'name_matches_candidate',
+          'university_name',
+          'degree_title',
+          'honours_class',
+          'graduation_year',
+          'verification_notes',
+        ],
+      },
+    };
+  }
+
+  // TRANSCRIPT
+  return {
+    prompt: [
+      'You are a Malaysian HR academic credential verification specialist.',
+      'Inspect this uploaded document expecting a University Academic Transcript showing course grades and CGPA.',
+      candidateContext,
+      'Return strictly valid flat JSON with these exact keys:',
+      '- document_detected: Set to "University Academic Transcript" if this is an academic transcript, otherwise state concisely what document was actually detected.',
+      '- candidate_name_on_doc: Exact student name printed on the transcript (empty string if not visible).',
+      '- name_matches_candidate: Boolean true only if candidate_name_on_doc matches the expected candidate name.',
+      '- university_name: University or college name (empty string if not visible).',
+      '- program_name: Degree / diploma program name (empty string if not visible).',
+      '- cgpa: Cumulative GPA as printed (e.g. "3.78 / 4.00" or "3.65"; empty string if not visible).',
+      '- semesters_completed: Number or summary of semesters/trimesters completed (e.g. "8 Semesters (Complete)" or "6 Semesters").',
+      '- verification_notes: Concise HR verification notes covering transcript completeness, legibility, standing/dean list, and any discrepancies or mismatches.',
+    ].join('\n'),
+    responseSchema: {
+      type: Type.OBJECT,
+      properties: {
+        document_detected: { type: Type.STRING },
+        candidate_name_on_doc: { type: Type.STRING },
+        name_matches_candidate: { type: Type.BOOLEAN },
+        university_name: { type: Type.STRING },
+        program_name: { type: Type.STRING },
+        cgpa: { type: Type.STRING },
+        semesters_completed: { type: Type.STRING },
+        verification_notes: { type: Type.STRING },
+      },
+      required: [
+        'document_detected',
+        'candidate_name_on_doc',
+        'name_matches_candidate',
+        'university_name',
+        'program_name',
+        'cgpa',
+        'semesters_completed',
+        'verification_notes',
+      ],
+    },
+  };
+}
+
+function normalizeAcademicExtraction(
+  docType: Exclude<ExtractableDocType, 'RESUME'>,
+  parsed: Record<string, unknown>
+): { data: Record<string, unknown>; status: AiDocumentVerificationStatus; extractedFieldCount: number } {
+  const defaultLabels: Record<Exclude<ExtractableDocType, 'RESUME'>, string> = {
+    SPM: 'SPM Certificate / Slip',
+    UEC: 'UEC Certificate / Transcript',
+    DEGREE: 'University Degree Certificate',
+    TRANSCRIPT: 'University Academic Transcript',
+  };
+
+  const documentDetected = String(parsed.document_detected ?? '').trim().slice(0, 140) || defaultLabels[docType];
+  const candidateNameOnDoc = String(parsed.candidate_name_on_doc ?? '').trim().slice(0, 140);
+  const nameMatchesCandidate = Boolean(parsed.name_matches_candidate);
+  const verificationNotes = String(parsed.verification_notes ?? '').trim().slice(0, 800);
+
+  let data: Record<string, unknown>;
+  let keyValues: string[] = [];
+
+  if (docType === 'SPM') {
+    const examYear = String(parsed.exam_year ?? '').trim().slice(0, 20);
+    const schoolName = String(parsed.school_name ?? '').trim().slice(0, 200);
+    const gradesSummary = String(parsed.grades_summary ?? '').trim().slice(0, 600);
+    const totalCredits = String(parsed.total_credits ?? '').trim().slice(0, 100);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      exam_year: examYear,
+      school_name: schoolName,
+      grades_summary: gradesSummary,
+      total_credits: totalCredits,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, examYear, schoolName, gradesSummary, totalCredits];
+  } else if (docType === 'UEC') {
+    const examYear = String(parsed.exam_year ?? '').trim().slice(0, 20);
+    const schoolName = String(parsed.school_name ?? '').trim().slice(0, 200);
+    const gradesSummary = String(parsed.grades_summary ?? '').trim().slice(0, 600);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      exam_year: examYear,
+      school_name: schoolName,
+      grades_summary: gradesSummary,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, examYear, schoolName, gradesSummary];
+  } else if (docType === 'DEGREE') {
+    const universityName = String(parsed.university_name ?? '').trim().slice(0, 200);
+    const degreeTitle = String(parsed.degree_title ?? '').trim().slice(0, 240);
+    const honoursClass = String(parsed.honours_class ?? '').trim().slice(0, 120);
+    const graduationYear = String(parsed.graduation_year ?? '').trim().slice(0, 20);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      university_name: universityName,
+      degree_title: degreeTitle,
+      honours_class: honoursClass,
+      graduation_year: graduationYear,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, universityName, degreeTitle, honoursClass, graduationYear];
+  } else {
+    const universityName = String(parsed.university_name ?? '').trim().slice(0, 200);
+    const programName = String(parsed.program_name ?? '').trim().slice(0, 240);
+    const cgpa = String(parsed.cgpa ?? '').trim().slice(0, 40);
+    const semestersCompleted = String(parsed.semesters_completed ?? '').trim().slice(0, 80);
+    data = {
+      document_detected: documentDetected,
+      candidate_name_on_doc: candidateNameOnDoc,
+      name_matches_candidate: nameMatchesCandidate,
+      university_name: universityName,
+      program_name: programName,
+      cgpa,
+      semesters_completed: semestersCompleted,
+      verification_notes: verificationNotes,
+    };
+    keyValues = [candidateNameOnDoc, universityName, programName, cgpa, semestersCompleted];
+  }
+
+  const extractedFieldCount = keyValues.filter(Boolean).length;
+  const looksUnrelated = /unrelated|unreadable|blurry|not a |wrong document|blank|invoice|receipt/i.test(
+    documentDetected
+  );
+
+  let status: AiDocumentVerificationStatus;
+  if (candidateNameOnDoc && !nameMatchesCandidate) {
+    status = 'NAME_MISMATCH';
+  } else if (looksUnrelated || extractedFieldCount < 2 || !candidateNameOnDoc) {
+    status = 'REVIEW_NEEDED';
+  } else if (nameMatchesCandidate) {
+    status = 'VERIFIED_MATCH';
+  } else {
+    status = 'REVIEW_NEEDED';
+  }
+
+  return { data, status, extractedFieldCount };
+}
+
+async function extractDocumentWithGemini(params: {
+  filePath?: string;
+  fileBuffer?: Buffer;
+  fileBase64?: string;
+  fileName?: string;
+  mimeType?: string;
+  rawText?: string;
+  docType: ExtractableDocType;
+  candidateName?: string;
+  position?: string;
+  department?: string;
+  rubric?: string;
+}): Promise<{
+  data: Record<string, unknown>;
+  status: AiDocumentVerificationStatus;
+  modelUsed: string;
+  extractedFieldCount: number;
+}> {
+  let cleanText = sanitizeResumeText(params.rawText);
+  let inlineFile: { mimeType: string; data: string } | null = null;
+  const fileName = params.fileName || (params.filePath ? path.basename(params.filePath) : '');
+
+  let fileBuffer: Buffer | null = null;
+  if (params.fileBuffer && params.fileBuffer.length > 0) {
+    fileBuffer = params.fileBuffer;
+  } else if (params.filePath && fs.existsSync(params.filePath)) {
+    fileBuffer = fs.readFileSync(params.filePath);
+  }
+
+  if (fileBuffer) {
+    if (fileBuffer.length === 0) {
+      throw new Error(`Uploaded file "${fileName || params.docType}" appears to be empty (0 bytes).`);
+    }
+    const resolvedMime = inferResumeMimeType(params.mimeType || '', fileName);
+    if (resolvedMime === 'text/plain') {
+      const decodedText = sanitizeResumeText(fileBuffer.toString('utf8'));
+      if (decodedText) {
+        cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
+      }
+    } else if (SUPPORTED_INLINE_DOCUMENT_MIMES.has(resolvedMime)) {
+      inlineFile = {
+        mimeType: resolvedMime,
+        data: fileBuffer.toString('base64'),
+      };
+    } else {
+      throw new Error(
+        `Unsupported file format (${fileName || resolvedMime}). Please upload a PDF, PNG, JPG, WEBP, or TXT document.`
+      );
+    }
+  } else if (params.fileBase64) {
+    const cleanBase64 = params.fileBase64.includes(',')
+      ? params.fileBase64.split(',')[1]
+      : params.fileBase64;
+    const resolvedMime = inferResumeMimeType(params.mimeType || '', fileName);
+    if (resolvedMime === 'text/plain') {
+      const decodedText = sanitizeResumeText(Buffer.from(cleanBase64, 'base64').toString('utf8'));
+      if (decodedText) {
+        cleanText = cleanText ? `${cleanText}\n\n${decodedText}` : decodedText;
+      }
+    } else if (SUPPORTED_INLINE_DOCUMENT_MIMES.has(resolvedMime)) {
+      inlineFile = {
+        mimeType: resolvedMime,
+        data: cleanBase64,
+      };
+    } else {
+      throw new Error(
+        'Unsupported document file type. Please upload a PDF, PNG, JPG, WEBP, or TXT file.'
+      );
+    }
+  }
+
+  if (!inlineFile && !cleanText) {
+    throw new Error(
+      params.docType === 'RESUME'
+        ? 'No resume file or text provided.'
+        : `No readable ${params.docType} document file provided.`
+    );
+  }
+
+  const ai = getGeminiClient();
+  const modelCandidates = getGeminiModelCandidates();
+  const { prompt, responseSchema } = buildDocumentPromptAndSchema({
+    docType: params.docType,
+    candidateName: params.candidateName,
+    position: params.position,
+    department: params.department,
+    rubric: params.rubric,
+  });
+
+  console.log(`[Gemini Document Engine] Request (${params.docType}):`, {
+    models: modelCandidates,
+    hasInlineFile: Boolean(inlineFile),
+    inlineMimeType: inlineFile?.mimeType || null,
+    inlineBase64Length: inlineFile?.data.length || 0,
+    textLength: cleanText.length,
+    fileName: fileName || null,
+    candidateName: params.candidateName || null,
+  });
+
+  const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [
+    { text: prompt },
+  ];
+
+  if (inlineFile) {
+    parts.push({
+      inlineData: {
+        mimeType: inlineFile.mimeType,
+        data: inlineFile.data,
+      },
+    });
+  }
+
+  if (cleanText) {
+    parts.push({
+      text: `${params.docType === 'RESUME' ? 'Resume Content' : `${params.docType} Document Text`}:\n${cleanText.slice(0, 60_000)}`,
+    });
+  }
+
+  let responseText = '';
+  let modelUsed = modelCandidates[0] || 'gemini-3.1-flash-lite';
+  let lastError: unknown = null;
+
+  for (let i = 0; i < modelCandidates.length; i++) {
+    const modelName = modelCandidates[i];
+    const hasNextFallback = i < modelCandidates.length - 1;
+    const attemptTimeoutMs = getPerAttemptTimeoutMs(modelName);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const abortController = new AbortController();
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeoutHandle = setTimeout(() => {
+        abortController.abort();
+        reject(new Error(`Model ${modelName} timed out after ${attemptTimeoutMs / 1000}s.`));
+      }, attemptTimeoutMs);
+    });
+
+    const thinkingConfig =
+      modelName === 'gemini-3.1-flash-lite'
+        ? { thinkingLevel: ThinkingLevel.MINIMAL }
+        : /^gemini-(3|4)/i.test(modelName)
+          ? { thinkingLevel: ThinkingLevel.LOW }
+          : undefined;
+
+    try {
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: modelName,
+          contents: [{ role: 'user', parts }],
+          config: {
+            abortSignal: abortController.signal,
+            systemInstruction:
+              'Return strictly valid flat JSON matching the provided schema. Never wrap the JSON inside an extra key or array. Never fabricate personal details, grades, or qualifications that are not visibly present in the document.',
+            responseMimeType: 'application/json',
+            responseSchema,
+            ...(thinkingConfig ? { thinkingConfig } : {}),
+          },
+        }),
+        timeoutPromise,
+      ]).finally(() => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+
+      const candidateText = (response.text ?? '').trim();
+      if (candidateText) {
+        responseText = candidateText;
+        modelUsed = modelName;
+        console.log(`[Gemini Document Engine] Succeeded (${params.docType}) with model=${modelName}`);
+        break;
+      }
+      lastError = new Error(`Model ${modelName} returned an empty response.`);
+    } catch (attemptErr: unknown) {
+      lastError = attemptErr;
+      const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+      if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|429|RESOURCE_EXHAUSTED/i.test(errMsg)) {
+        throw attemptErr;
+      }
+      if (hasNextFallback) {
+        console.log(
+          `[Gemini Document Engine] Switching to fallback after ${modelName} (${params.docType}): ${errMsg}`
+        );
+      } else {
+        console.error(`[Gemini Document Engine] Final model ${modelName} failed (${params.docType}):`, errMsg);
+      }
+    }
+  }
+
+  console.log(`Gemini raw extraction (${params.docType}):`, responseText);
+
+  if (!responseText) {
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    throw new Error(
+      inlineFile
+        ? `Could not read text from the uploaded ${params.docType} document. Please check that the file is legible and not password-protected.`
+        : 'Could not extract details from the provided document text. Please try again.'
+    );
+  }
+
+  const cleanedJsonText = responseText
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  let rawParsed: unknown;
+  try {
+    rawParsed = JSON.parse(cleanedJsonText);
+  } catch {
+    const objMatch = cleanedJsonText.match(/\{[\s\S]*\}/);
+    if (!objMatch) {
+      throw new Error('Gemini AI returned malformed JSON. Please retry analysis.');
+    }
+    try {
+      rawParsed = JSON.parse(objMatch[0]);
+    } catch {
+      throw new Error('Gemini AI returned malformed JSON. Please retry analysis.');
+    }
+  }
+
+  const unwrapped = Array.isArray(rawParsed)
+    ? ((rawParsed[0] as Record<string, unknown> | undefined) ?? {})
+    : (rawParsed as Record<string, unknown>);
+  const parsed =
+    (unwrapped.extracted as Record<string, unknown> | undefined) ||
+    (unwrapped.data as Record<string, unknown> | undefined) ||
+    (unwrapped.result as Record<string, unknown> | undefined) ||
+    (unwrapped.candidate as Record<string, unknown> | undefined) ||
+    unwrapped;
+
+  if (params.docType === 'RESUME') {
+    const fullName = String(parsed.full_name ?? parsed.fullName ?? parsed.name ?? '').trim().slice(0, 140);
+    const email = String(parsed.email ?? '').trim().slice(0, 254);
+    const phone = formatMalaysianPhone(String(parsed.phone ?? parsed.contact_number ?? ''));
+    const location = String(parsed.location ?? '').trim().slice(0, 120);
+    const education = String(parsed.education ?? parsed.education_summary ?? parsed.educationSummary ?? '')
+      .trim()
+      .slice(0, 600);
+    const experience = String(parsed.experience ?? parsed.experience_summary ?? parsed.experienceSummary ?? '')
+      .trim()
+      .slice(0, 800);
+    const skills = Array.isArray(parsed.skills)
+      ? parsed.skills.map((s: unknown) => String(s).trim().slice(0, 60)).filter(Boolean).slice(0, 20)
+      : typeof parsed.skills === 'string'
+        ? parsed.skills
+            .split(',')
+            .map((s) => s.trim().slice(0, 60))
+            .filter(Boolean)
+            .slice(0, 20)
+        : [];
+    const rawScore = Number(parsed.ai_score ?? parsed.aiMatchScore ?? parsed.match_score ?? parsed.score);
+    const aiScore = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0;
+    const aiSummary = String(parsed.ai_summary ?? parsed.aiSummary ?? '').trim().slice(0, 1200);
+    const rawYears = Number(parsed.years_experience ?? parsed.yearsExperience);
+    const yearsExperience = Number.isFinite(rawYears)
+      ? Math.max(0, Math.min(60, Math.round(rawYears * 2) / 2))
+      : 0;
+    const hasUec =
+      Boolean(parsed.has_uec ?? parsed.hasUec ?? parsed.detected_uec_mention ?? parsed.detectedUecMention) ||
+      /\buec\b/i.test(`${education} ${cleanText}`);
+
+    const extractedFieldCount = [
+      fullName,
+      email,
+      phone,
+      location,
+      education,
+      experience,
+      skills.length > 0 ? 'skills' : '',
+      aiSummary,
+    ].filter(Boolean).length;
+
+    const resumeData = {
+      full_name: fullName,
+      email,
+      phone,
+      location,
+      years_experience: yearsExperience,
+      has_uec: hasUec,
+      skills,
+      education,
+      experience,
+      ai_score: aiScore,
+      ai_summary: aiSummary,
+    };
+
+    const status: AiDocumentVerificationStatus =
+      extractedFieldCount >= 3 ? 'VERIFIED_MATCH' : extractedFieldCount > 0 ? 'REVIEW_NEEDED' : 'AI_FAILED';
+
+    return { data: resumeData, status, modelUsed, extractedFieldCount };
+  }
+
+  const normalized = normalizeAcademicExtraction(params.docType, parsed);
+  return {
+    data: normalized.data,
+    status: normalized.status,
+    modelUsed,
+    extractedFieldCount: normalized.extractedFieldCount,
+  };
+}
+
+async function runAndPersistDocumentExtraction(params: {
+  req?: Request;
+  actor?: AuthPayload | null;
+  actorName?: string;
+  actorRole?: AuditActorRole;
+  pageVisited: string;
+  candidateId: number;
+  candidateCode: string;
+  candidateName: string;
+  position?: string;
+  department?: string;
+  docType: ExtractableDocType;
+  filePath: string;
+  fileName: string;
+  mimeType?: string;
+  isReanalysis?: boolean;
+}): Promise<{
+  status: AiDocumentVerificationStatus;
+  data: Record<string, unknown>;
+  modelUsed?: string;
+  error?: string;
+}> {
+  const resolvedDiskPath = path.isAbsolute(params.filePath)
+    ? params.filePath
+    : path.join(UPLOADS_ROOT, path.basename(params.filePath));
+
+  try {
+    const result = await extractDocumentWithGemini({
+      filePath: resolvedDiskPath,
+      fileName: params.fileName,
+      mimeType: params.mimeType,
+      docType: params.docType,
+      candidateName: params.candidateName,
+      position: params.position,
+      department: params.department,
+    });
+
+    const payloadWithMeta: Record<string, unknown> = {
+      ...result.data,
+      model_used: result.modelUsed,
+      extracted_at: new Date().toISOString(),
+    };
+
+    // Never auto-set verified = 1; HR manual sign-off remains required
+    db.prepare(`
+      UPDATE candidate_documents
+      SET ai_extracted_json = ?, ai_verified_status = ?
+      WHERE candidate_id = ? AND doc_type = ?
+    `).run(JSON.stringify(payloadWithMeta), result.status, params.candidateId, params.docType);
+
+    if (params.docType === 'RESUME') {
+      const score = Number(result.data.ai_score || 0);
+      const summary = String(result.data.ai_summary || '').trim();
+      const candRow = db
+        .prepare('SELECT ai_score, ai_summary FROM candidates WHERE id = ?')
+        .get(params.candidateId) as { ai_score: number; ai_summary: string } | undefined;
+      if (
+        candRow &&
+        (params.isReanalysis || (!candRow.ai_summary && summary) || (candRow.ai_score === 0 && score > 0))
+      ) {
+        db.prepare(`
+          UPDATE candidates
+          SET ai_score = ?, ai_summary = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(score || candRow.ai_score, summary || candRow.ai_summary, params.candidateId);
+      }
+    }
+
+    const detected = String(result.data.document_detected || params.docType);
+    const summaryHighlight =
+      params.docType === 'RESUME'
+        ? `Job-Fit Score: ${result.data.ai_score ?? 0}%`
+        : `Detected: "${detected}", Name Match: ${result.data.name_matches_candidate ? 'YES' : 'NO'}, Status: ${result.status}`;
+
+    logAudit({
+      req: params.req,
+      actor: params.actor,
+      actorName: params.actorName,
+      actorRole: params.actorRole,
+      pageVisited: params.pageVisited,
+      actionTaken: 'AI_DOCUMENT_EXTRACTION',
+      targetEntity: `${params.candidateName} (${params.candidateCode}) — ${params.docType}`,
+      details: `${params.isReanalysis ? 'Re-analyzed' : 'Auto-scanned'} ${params.docType} (${params.fileName}) via Gemini (${result.modelUsed}). ${summaryHighlight}.`,
+    });
+
+    return {
+      status: result.status,
+      data: payloadWithMeta,
+      modelUsed: result.modelUsed,
+    };
+  } catch (err: unknown) {
+    const { userMessage } = formatGeminiError(err);
+    const errorPayload = {
+      error: userMessage,
+      extracted_at: new Date().toISOString(),
+    };
+
+    db.prepare(`
+      UPDATE candidate_documents
+      SET ai_extracted_json = ?, ai_verified_status = 'AI_FAILED'
+      WHERE candidate_id = ? AND doc_type = ?
+    `).run(JSON.stringify(errorPayload), params.candidateId, params.docType);
+
+    logAudit({
+      req: params.req,
+      actor: params.actor,
+      actorName: params.actorName,
+      actorRole: params.actorRole,
+      pageVisited: params.pageVisited,
+      actionTaken: 'AI_DOCUMENT_EXTRACTION',
+      targetEntity: `${params.candidateName} (${params.candidateCode}) — ${params.docType}`,
+      details: `Gemini AI ${params.isReanalysis ? 're-analysis' : 'auto-scan'} failed for ${params.docType} (${params.fileName}): ${userMessage}`,
+    });
+
+    return {
+      status: 'AI_FAILED',
+      data: errorPayload,
+      error: userMessage,
+    };
+  }
+}
+
+// =============================================================================
 // AUTH & RBAC MIDDLEWARE
 // =============================================================================
 function verifyJwtToken(token: string): AuthPayload | null {
@@ -446,22 +1318,57 @@ function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CAND
     skills = [];
   }
 
-  const canSeeSalary = true;
+  const isCandidatePortal = _role === 'CANDIDATE';
 
   return {
     ...row,
     skills,
-    documents: docs.map((d) => ({
-      id: Number(d.id),
-      candidate_id: Number(d.candidate_id),
-      doc_type: String(d.doc_type),
-      completed: Boolean(d.completed),
-      verified: Boolean(d.verified),
-      not_applicable: Boolean(d.not_applicable),
-      file_name: String(d.file_name || ''),
-      file_path: String(d.file_path || ''),
-      uploaded_at: String(d.uploaded_at || ''),
-    })),
+    documents: docs.map((d) => {
+      const rawAiJson = String(d.ai_extracted_json || '');
+      const aiStatus = String(d.ai_verified_status || '') as AiDocumentVerificationStatus;
+      let parsedAi: Record<string, unknown> | null = null;
+      if (rawAiJson) {
+        try {
+          const obj = JSON.parse(rawAiJson);
+          if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+            parsedAi = obj as Record<string, unknown>;
+          }
+        } catch {
+          parsedAi = null;
+        }
+      }
+
+      // Candidate portal only receives detected document type + name match status (keep grades/CGPA/HR notes private)
+      const safeAiExtracted =
+        parsedAi && isCandidatePortal
+          ? {
+              document_detected:
+                typeof parsedAi.document_detected === 'string' ? parsedAi.document_detected : undefined,
+              candidate_name_on_doc:
+                typeof parsedAi.candidate_name_on_doc === 'string' ? parsedAi.candidate_name_on_doc : undefined,
+              name_matches_candidate:
+                typeof parsedAi.name_matches_candidate === 'boolean'
+                  ? parsedAi.name_matches_candidate
+                  : undefined,
+              error: typeof parsedAi.error === 'string' ? parsedAi.error : undefined,
+            }
+          : parsedAi;
+
+      return {
+        id: Number(d.id),
+        candidate_id: Number(d.candidate_id),
+        doc_type: String(d.doc_type),
+        completed: Boolean(d.completed),
+        verified: Boolean(d.verified),
+        not_applicable: Boolean(d.not_applicable),
+        file_name: String(d.file_name || ''),
+        file_path: String(d.file_path || ''),
+        uploaded_at: String(d.uploaded_at || ''),
+        ai_extracted_json: isCandidatePortal ? '' : rawAiJson,
+        ai_verified_status: aiStatus,
+        ai_extracted: safeAiExtracted,
+      };
+    }),
     active_booking: bookingRow
       ? {
           id: Number(bookingRow.id),
@@ -483,8 +1390,8 @@ function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CAND
           candidate_id: Number(offerRow.candidate_id),
           position: String(offerRow.position),
           department: String(offerRow.department),
-          salary_myr: canSeeSalary ? Number(offerRow.salary_myr) : null,
-          allowance_myr: canSeeSalary ? Number(offerRow.allowance_myr) : null,
+          salary_myr: Number(offerRow.salary_myr),
+          allowance_myr: Number(offerRow.allowance_myr),
           probation_months: Number(offerRow.probation_months),
           start_date: String(offerRow.start_date),
           issue_date: String(offerRow.issue_date),
@@ -900,7 +1807,7 @@ async function startServer() {
             ? (req.files[0] as Express.Multer.File)
             : null);
 
-        let resumeText = sanitizeResumeText(body.resumeText ?? body.resume_text);
+        const resumeText = sanitizeResumeText(body.resumeText ?? body.resume_text);
         const position = String(body.position ?? body.positionApplied ?? '').trim() || 'General Role';
         const department = String(body.department ?? '').trim() || 'Operations';
         const rubric = String(body.rubric ?? body.jobRequirements ?? '').trim();
@@ -909,384 +1816,68 @@ async function startServer() {
         const rawJsonMimeType = String(body.fileMimeType ?? '').trim();
         const fileName = uploadedFile?.originalname || String(body.fileName ?? '').trim();
 
-        const SUPPORTED_INLINE_MIMES = new Set([
-          'application/pdf',
-          'image/png',
-          'image/jpeg',
-          'image/webp',
-        ]);
-
-        let inlineFile: { mimeType: string; data: string } | null = null;
-
-        if (uploadedFile) {
-          let fileBuffer: Buffer | null = null;
-          if (uploadedFile.buffer && uploadedFile.buffer.length > 0) {
-            fileBuffer = uploadedFile.buffer;
-          } else if (uploadedFile.path && fs.existsSync(uploadedFile.path)) {
-            fileBuffer = fs.readFileSync(uploadedFile.path);
-          }
-
-          if (!fileBuffer || fileBuffer.length === 0) {
-            res.status(400).json({
-              error: `Uploaded file "${uploadedFile.originalname}" appears to be empty (0 bytes). Please upload a valid resume file or paste the CV text directly.`,
-            });
-            return;
-          }
-
-          const resolvedMime = inferResumeMimeType(uploadedFile.mimetype, uploadedFile.originalname);
-          if (resolvedMime === 'text/plain') {
-            const decodedText = sanitizeResumeText(fileBuffer.toString('utf8'));
-            if (decodedText) {
-              resumeText = resumeText ? `${resumeText}\n\n${decodedText}` : decodedText;
-            }
-          } else if (SUPPORTED_INLINE_MIMES.has(resolvedMime)) {
-            inlineFile = {
-              mimeType: resolvedMime,
-              data: fileBuffer.toString('base64'),
-            };
-          } else {
-            res.status(400).json({
-              error: `Unsupported file format (${uploadedFile.originalname}). Please upload a PDF, PNG, JPG, WEBP, or TXT resume, or paste the resume text directly.`,
-            });
-            return;
-          }
-        } else if (rawJsonBase64) {
-          const cleanBase64 = rawJsonBase64.includes(',')
-            ? rawJsonBase64.split(',')[1]
-            : rawJsonBase64;
-          const resolvedMime = inferResumeMimeType(rawJsonMimeType, fileName);
-          if (resolvedMime === 'text/plain') {
-            const decodedText = sanitizeResumeText(Buffer.from(cleanBase64, 'base64').toString('utf8'));
-            if (decodedText) {
-              resumeText = resumeText ? `${resumeText}\n\n${decodedText}` : decodedText;
-            }
-          } else if (SUPPORTED_INLINE_MIMES.has(resolvedMime)) {
-            inlineFile = {
-              mimeType: resolvedMime,
-              data: cleanBase64,
-            };
-          } else {
-            res.status(400).json({
-              error: 'Unsupported resume file type. Please upload a PDF, PNG, JPG, WEBP, or TXT file.',
-            });
-            return;
-          }
-        }
-
-        if (!inlineFile && !resumeText) {
+        if (!uploadedFile && !rawJsonBase64 && !resumeText) {
           res.status(400).json({ error: 'No resume file or text provided.' });
           return;
         }
 
-        const ai = getGeminiClient();
-        const configuredModel = (process.env.GEMINI_MODEL || '').trim();
-        const modelCandidates = Array.from(
-          new Set([
-            ...(configuredModel ? [configuredModel] : []),
-            'gemini-4-hydrogen',
-            'gemini-3.1-flash-lite',
-          ])
-        );
-
-        console.log('[Gemini Parse Resume] Request:', {
-          models: modelCandidates,
-          hasInlineFile: Boolean(inlineFile),
-          inlineMimeType: inlineFile?.mimeType || null,
-          inlineBase64Length: inlineFile?.data.length || 0,
-          textLength: resumeText.length,
-          fileName: fileName || null,
+        const result = await extractDocumentWithGemini({
+          filePath: uploadedFile?.path,
+          fileBuffer: uploadedFile?.buffer,
+          fileBase64: !uploadedFile ? rawJsonBase64 : undefined,
+          fileName,
+          mimeType: uploadedFile?.mimetype || rawJsonMimeType,
+          rawText: resumeText,
+          docType: 'RESUME',
           position,
+          department,
+          rubric,
         });
 
-        const prompt = [
-          'You are an experienced Malaysian enterprise HR recruitment specialist.',
-          `Analyze the candidate resume for the position "${position}" in the "${department}" department.`,
-          rubric ? `Screening rubric / role requirements: ${rubric}` : '',
-          'Extract every available candidate detail accurately from the resume into a single flat JSON object with these exact keys:',
-          '- full_name: Candidate full name exactly as written on the resume.',
-          '- email: Candidate email address (empty string if not present; never invent).',
-          '- phone: Candidate phone number formatted cleanly for Malaysia (e.g., 012-3456789 or 011-12345678; empty string if not present).',
-          '- location: City and state in Malaysia (e.g., Petaling Jaya, Selangor or Kuala Lumpur; empty string if not stated).',
-          '- years_experience: Total relevant years of working experience as a number (0 to 50).',
-          '- has_uec: true only if UEC (Unified Examination Certificate) is explicitly mentioned in the resume, otherwise false.',
-          '- skills: Array of up to 15 concise technical, domain, and soft skills found in the resume.',
-          '- education: Highest qualification, institution, CGPA/grade, plus Malaysian qualifications (SPM, STPM, UEC, Diploma, Degree) if present.',
-          '- experience: Concise summary of relevant roles, employers, key achievements, and total years of experience.',
-          '- ai_score: Realistic integer job-fit score from 0 to 100 evaluated against the position and rubric.',
-          '- ai_summary: Concise HR screening evaluation covering strengths, gaps, and hiring recommendation.',
-        ]
-          .filter(Boolean)
-          .join('\n');
-
-        const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [
-          { text: prompt },
-        ];
-
-        if (inlineFile) {
-          parts.push({
-            inlineData: {
-              mimeType: inlineFile.mimeType,
-              data: inlineFile.data,
-            },
-          });
-        }
-
-        if (resumeText) {
-          parts.push({
-            text: `Resume Content:\n${resumeText.slice(0, 60_000)}`,
-          });
-        }
-
-        const responseSchema = {
-          type: Type.OBJECT,
-          properties: {
-            full_name: { type: Type.STRING, description: 'Candidate full name' },
-            email: { type: Type.STRING, description: 'Candidate email address if present, else empty string' },
-            phone: {
-              type: Type.STRING,
-              description: 'Phone number formatted cleanly for Malaysia e.g. 01X-XXXXXXX',
-            },
-            location: { type: Type.STRING, description: 'City / State location' },
-            years_experience: {
-              type: Type.NUMBER,
-              description: 'Total relevant years of working experience (0 to 50)',
-            },
-            has_uec: {
-              type: Type.BOOLEAN,
-              description: 'Whether UEC qualification is explicitly mentioned',
-            },
-            skills: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: 'List of key technical and domain skills',
-            },
-            education: {
-              type: Type.STRING,
-              description: 'Highest qualification, institution, CGPA/grade, and SPM/UEC/Degree details',
-            },
-            experience: {
-              type: Type.STRING,
-              description: 'Concise summary of relevant roles, employers, and years of experience',
-            },
-            ai_score: { type: Type.INTEGER, description: 'Job-fit score from 0 to 100' },
-            ai_summary: {
-              type: Type.STRING,
-              description: 'HR screening summary covering strengths, gaps, and recommendation',
-            },
-          },
-          required: [
-            'full_name',
-            'email',
-            'phone',
-            'location',
-            'years_experience',
-            'has_uec',
-            'skills',
-            'education',
-            'experience',
-            'ai_score',
-            'ai_summary',
-          ],
-        };
-
-        const PER_ATTEMPT_TIMEOUT_MS = 28_000;
-        let responseText = '';
-        let lastError: unknown = null;
-
-        for (const modelName of modelCandidates) {
-          let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-          const abortController = new AbortController();
-          const timeoutPromise = new Promise<never>((_resolve, reject) => {
-            timeoutHandle = setTimeout(() => {
-              abortController.abort();
-              reject(new Error(`Model ${modelName} timed out after ${PER_ATTEMPT_TIMEOUT_MS / 1000}s.`));
-            }, PER_ATTEMPT_TIMEOUT_MS);
-          });
-
-          const thinkingConfig =
-            modelName === 'gemini-3.1-flash-lite'
-              ? { thinkingLevel: ThinkingLevel.MINIMAL }
-              : /^gemini-(3|4)/i.test(modelName)
-                ? { thinkingLevel: ThinkingLevel.LOW }
-                : undefined;
-
-          try {
-            const response = await Promise.race([
-              ai.models.generateContent({
-                model: modelName,
-                contents: [{ role: 'user', parts }],
-                config: {
-                  abortSignal: abortController.signal,
-                  systemInstruction:
-                    'Return strictly valid flat JSON matching the provided schema. Never wrap the JSON inside an extra key or array. Never fabricate email addresses or phone numbers that do not appear in the resume.',
-                  responseMimeType: 'application/json',
-                  responseSchema,
-                  ...(thinkingConfig ? { thinkingConfig } : {}),
-                },
-              }),
-              timeoutPromise,
-            ]).finally(() => {
-              if (timeoutHandle) clearTimeout(timeoutHandle);
-            });
-
-            const candidateText = (response.text ?? '').trim();
-            if (candidateText) {
-              responseText = candidateText;
-              console.log(`[Gemini Parse Resume] Succeeded with model=${modelName}`);
-              break;
-            }
-            lastError = new Error(`Model ${modelName} returned an empty response.`);
-          } catch (attemptErr: unknown) {
-            lastError = attemptErr;
-            const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
-            console.warn(`[Gemini Parse Resume] Attempt failed on model=${modelName}:`, errMsg);
-            // Stop retrying immediately on invalid API key or quota exhaustion
-            if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|429|RESOURCE_EXHAUSTED/i.test(errMsg)) {
-              throw attemptErr;
-            }
-          }
-        }
-
-        console.log('Gemini raw extraction:', responseText);
-
-        if (!responseText) {
-          if (lastError instanceof Error) {
-            throw lastError;
-          }
-          res.status(502).json({
-            error: inlineFile
-              ? 'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
-              : 'Could not extract candidate details from the pasted resume text. Please try again.',
-          });
-          return;
-        }
-
-        const cleanedJsonText = responseText
-          .replace(/^```(?:json)?\s*/i, '')
-          .replace(/\s*```$/i, '')
-          .trim();
-
-        let rawParsed: unknown;
-        try {
-          rawParsed = JSON.parse(cleanedJsonText);
-        } catch {
-          const objMatch = cleanedJsonText.match(/\{[\s\S]*\}/);
-          if (!objMatch) {
-            res.status(502).json({
-              error: 'Gemini AI returned malformed JSON. Please retry resume analysis.',
-            });
-            return;
-          }
-          try {
-            rawParsed = JSON.parse(objMatch[0]);
-          } catch {
-            res.status(502).json({
-              error: 'Gemini AI returned malformed JSON. Please retry resume analysis.',
-            });
-            return;
-          }
-        }
-
-        const unwrapped = Array.isArray(rawParsed)
-          ? (rawParsed[0] as Record<string, unknown> | undefined) ?? {}
-          : (rawParsed as Record<string, unknown>);
-        const parsed = (
-          (unwrapped.extracted as Record<string, unknown> | undefined) ||
-          (unwrapped.data as Record<string, unknown> | undefined) ||
-          (unwrapped.result as Record<string, unknown> | undefined) ||
-          (unwrapped.candidate as Record<string, unknown> | undefined) ||
-          unwrapped
-        );
-
-        const fullName = String(parsed.full_name ?? parsed.fullName ?? parsed.name ?? '').trim().slice(0, 140);
-        const email = String(parsed.email ?? '').trim().slice(0, 254);
-        const phone = formatMalaysianPhone(String(parsed.phone ?? parsed.contact_number ?? ''));
-        const location = String(parsed.location ?? '').trim().slice(0, 120);
-        const education = String(parsed.education ?? parsed.education_summary ?? parsed.educationSummary ?? '')
-          .trim()
-          .slice(0, 600);
-        const experience = String(parsed.experience ?? parsed.experience_summary ?? parsed.experienceSummary ?? '')
-          .trim()
-          .slice(0, 800);
-        const skills = Array.isArray(parsed.skills)
-          ? parsed.skills.map((s: unknown) => String(s).trim().slice(0, 60)).filter(Boolean).slice(0, 20)
-          : typeof parsed.skills === 'string'
-            ? parsed.skills
-                .split(',')
-                .map((s) => s.trim().slice(0, 60))
-                .filter(Boolean)
-                .slice(0, 20)
-            : [];
-        const rawScore = Number(parsed.ai_score ?? parsed.aiMatchScore ?? parsed.match_score ?? parsed.score);
-        const aiScore = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0;
-        const aiSummary = String(parsed.ai_summary ?? parsed.aiSummary ?? '').trim().slice(0, 1200);
-        const rawYears = Number(parsed.years_experience ?? parsed.yearsExperience);
-        const yearsExperience = Number.isFinite(rawYears)
-          ? Math.max(0, Math.min(60, Math.round(rawYears * 2) / 2))
-          : 0;
-        const hasUec =
-          Boolean(parsed.has_uec ?? parsed.hasUec ?? parsed.detected_uec_mention ?? parsed.detectedUecMention) ||
-          /\buec\b/i.test(`${education} ${resumeText}`);
-
-        const extractedFieldCount = [
-          fullName,
-          email,
-          phone,
-          location,
-          education,
-          experience,
-          skills.length > 0 ? 'skills' : '',
-          aiSummary,
-        ].filter(Boolean).length;
-
-        if (extractedFieldCount === 0) {
+        if (result.extractedFieldCount === 0) {
           res.status(422).json({
-            error: inlineFile
+            error: uploadedFile || rawJsonBase64
               ? 'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
               : 'Could not extract candidate profile fields from the pasted resume text. Please include more candidate details and try again.',
           });
           return;
         }
 
+        const extracted = result.data;
         logAudit({
           req,
           actor: req.user,
           pageVisited: 'Candidate Intake Modal',
           actionTaken: 'AI_RESUME_SCREENING',
-          targetEntity: fullName || fileName || position,
-          details: `Ran Gemini AI resume screening (${inlineFile ? fileName || inlineFile.mimeType : 'pasted text'}) for ${position} — extracted ${extractedFieldCount} field(s), Job-Fit Score: ${aiScore}%.`,
+          targetEntity: String(extracted.full_name || fileName || position),
+          details: `Ran Gemini AI resume screening (${uploadedFile || rawJsonBase64 ? fileName || 'uploaded file' : 'pasted text'}) via ${result.modelUsed} for ${position} — extracted ${result.extractedFieldCount} field(s), Job-Fit Score: ${extracted.ai_score ?? 0}%.`,
         });
 
         res.json({
-          full_name: fullName,
-          email,
-          phone,
-          location,
-          years_experience: yearsExperience,
-          has_uec: hasUec,
-          skills,
-          education,
-          experience,
-          ai_score: aiScore,
-          ai_summary: aiSummary,
+          full_name: String(extracted.full_name ?? ''),
+          email: String(extracted.email ?? ''),
+          phone: String(extracted.phone ?? ''),
+          location: String(extracted.location ?? ''),
+          years_experience: Number(extracted.years_experience ?? 0),
+          has_uec: Boolean(extracted.has_uec),
+          skills: Array.isArray(extracted.skills) ? extracted.skills : [],
+          education: String(extracted.education ?? ''),
+          experience: String(extracted.experience ?? ''),
+          ai_score: Number(extracted.ai_score ?? 0),
+          ai_summary: String(extracted.ai_summary ?? ''),
         });
       } catch (err: unknown) {
-        const rawMessage = err instanceof Error ? err.message : 'Failed to analyze resume with Gemini AI.';
         console.error('Gemini resume parse error:', err);
-
-        let statusCode = 500;
-        let userMessage = rawMessage;
-        if (/timed out/i.test(rawMessage)) {
-          statusCode = 504;
-          userMessage = 'Gemini AI resume analysis timed out. Please retry or paste the plain resume text.';
-        } else if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(rawMessage)) {
-          userMessage =
-            'Invalid or unauthorized GEMINI_API_KEY on the server. Please verify your Gemini API key in Settings > Secrets.';
-        } else if (/429|RESOURCE_EXHAUSTED|quota/i.test(rawMessage)) {
-          statusCode = 429;
-          userMessage = 'Gemini API rate limit or quota reached. Please wait a moment and try again.';
+        const rawMessage = err instanceof Error ? err.message : '';
+        if (/Unsupported file format|Unsupported document file type|appears to be empty|No resume file or text provided/i.test(rawMessage)) {
+          res.status(400).json({ error: rawMessage });
+          return;
         }
-
+        if (/malformed JSON/i.test(rawMessage)) {
+          res.status(502).json({ error: rawMessage });
+          return;
+        }
+        const { statusCode, userMessage } = formatGeminiError(err);
         res.status(statusCode).json({ error: userMessage });
       }
     }
@@ -1314,7 +1905,7 @@ async function startServer() {
     res.json({ candidate: hydrateCandidate(row, req.user!.role) });
   });
 
-  app.post('/api/candidates', requireAuth, requireRole('administrator'), upload.single('resumeFile'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/candidates', requireAuth, requireRole('administrator'), upload.single('resumeFile'), async (req: AuthedRequest, res: Response) => {
     const body = req.body ?? {};
     const fullName = String(body.full_name || body.fullName || '').trim();
     const email = String(body.email || '').trim().toLowerCase();
@@ -1416,6 +2007,43 @@ async function startServer() {
         SET completed = 1, verified = 1, file_name = ?, file_path = ?, uploaded_at = datetime('now')
         WHERE candidate_id = ? AND doc_type = 'RESUME'
       `).run(req.file.originalname, req.file.filename, candidateId);
+
+      if (aiSummary || aiScore > 0) {
+        const intakeResumeJson = JSON.stringify({
+          full_name: fullName,
+          email,
+          phone,
+          location,
+          years_experience: yearsExperience,
+          has_uec: hasUec,
+          skills: skillsArr,
+          education,
+          experience,
+          ai_score: aiScore,
+          ai_summary: aiSummary,
+          extracted_at: new Date().toISOString(),
+        });
+        db.prepare(`
+          UPDATE candidate_documents
+          SET ai_extracted_json = ?, ai_verified_status = 'VERIFIED_MATCH'
+          WHERE candidate_id = ? AND doc_type = 'RESUME'
+        `).run(intakeResumeJson, candidateId);
+      } else {
+        await runAndPersistDocumentExtraction({
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Intake Modal',
+          candidateId,
+          candidateCode,
+          candidateName: fullName,
+          position,
+          department,
+          docType: 'RESUME',
+          filePath: req.file.path,
+          fileName: req.file.originalname,
+          mimeType: req.file.mimetype,
+        });
+      }
     } else if (body.resumeFileName) {
       db.prepare(`
         UPDATE candidate_documents
@@ -1711,18 +2339,17 @@ async function startServer() {
     res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
   });
 
-  // Upload a candidate document file (HR staff)
+  // Upload a candidate document file (HR staff) + automatic Gemini AI multimodal extraction
   app.post(
     '/api/candidates/:id/documents',
     requireAuth,
     requireRole('administrator'),
     upload.single('file'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const candidateId = Number(req.params.id);
       const docType = String(req.body?.doc_type || '').toUpperCase();
-      const allowedTypes = ['RESUME', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
 
-      if (!allowedTypes.includes(docType)) {
+      if (!isExtractableDocType(docType)) {
         if (req.file) fs.unlink(req.file.path, () => {});
         res.status(400).json({ error: 'Invalid document type.' });
         return;
@@ -1733,8 +2360,10 @@ async function startServer() {
       }
 
       const candidate = db
-        .prepare('SELECT id, candidate_code, full_name FROM candidates WHERE id = ?')
-        .get(candidateId) as { id: number; candidate_code: string; full_name: string } | undefined;
+        .prepare('SELECT id, candidate_code, full_name, position, department FROM candidates WHERE id = ?')
+        .get(candidateId) as
+        | { id: number; candidate_code: string; full_name: string; position: string; department: string }
+        | undefined;
       if (!candidate) {
         fs.unlink(req.file.path, () => {});
         res.status(404).json({ error: 'Candidate not found.' });
@@ -1744,7 +2373,8 @@ async function startServer() {
       ensureCandidateDocumentRows(candidateId);
       db.prepare(`
         UPDATE candidate_documents
-        SET completed = 1, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now')
+        SET completed = 1, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
+            ai_extracted_json = '', ai_verified_status = ''
         WHERE candidate_id = ? AND doc_type = ?
       `).run(req.file.originalname, req.file.filename, candidateId, docType);
 
@@ -1757,8 +2387,107 @@ async function startServer() {
         details: `Uploaded ${docType} (${req.file.originalname}) for ${candidate.full_name}.`,
       });
 
+      const aiExtraction = await runAndPersistDocumentExtraction({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        candidateId,
+        candidateCode: candidate.candidate_code,
+        candidateName: candidate.full_name,
+        position: candidate.position,
+        department: candidate.department,
+        docType,
+        filePath: req.file.path,
+        fileName: req.file.originalname,
+        mimeType: req.file.mimetype,
+      });
+
       const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
-      res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
+      res.json({
+        candidate: hydrateCandidate(updated, req.user!.role),
+        aiExtraction,
+      });
+    }
+  );
+
+  // Manual Gemini AI re-scan for any uploaded candidate document (Administrator only)
+  app.post(
+    '/api/documents/:docId/ai-extract',
+    requireAuth,
+    requireRole('administrator'),
+    async (req: AuthedRequest, res: Response) => {
+      const docId = Number(req.params.docId);
+      if (!Number.isInteger(docId) || docId <= 0) {
+        res.status(400).json({ error: 'Invalid document ID.' });
+        return;
+      }
+
+      const docRow = db
+        .prepare(`
+          SELECT d.*, c.candidate_code, c.full_name, c.position, c.department
+          FROM candidate_documents d
+          JOIN candidates c ON c.id = d.candidate_id
+          WHERE d.id = ?
+        `)
+        .get(docId) as
+        | {
+            id: number;
+            candidate_id: number;
+            doc_type: string;
+            file_name: string;
+            file_path: string;
+            candidate_code: string;
+            full_name: string;
+            position: string;
+            department: string;
+          }
+        | undefined;
+
+      if (!docRow) {
+        res.status(404).json({ error: 'Document record not found.' });
+        return;
+      }
+
+      const docType = String(docRow.doc_type || '').toUpperCase();
+      if (!isExtractableDocType(docType)) {
+        res.status(400).json({ error: `Document type "${docType}" does not support Gemini AI file extraction.` });
+        return;
+      }
+
+      const safeFile = path.basename(String(docRow.file_path || ''));
+      if (!safeFile) {
+        res.status(400).json({ error: 'No uploaded file is attached to this document row yet.' });
+        return;
+      }
+
+      const diskPath = path.join(UPLOADS_ROOT, safeFile);
+      if (!fs.existsSync(diskPath)) {
+        res.status(404).json({ error: 'Stored document file could not be found on disk. Please re-upload the file.' });
+        return;
+      }
+
+      const aiExtraction = await runAndPersistDocumentExtraction({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        candidateId: docRow.candidate_id,
+        candidateCode: docRow.candidate_code,
+        candidateName: docRow.full_name,
+        position: docRow.position,
+        department: docRow.department,
+        docType,
+        filePath: diskPath,
+        fileName: docRow.file_name || safeFile,
+        isReanalysis: true,
+      });
+
+      const updated = db
+        .prepare('SELECT * FROM candidates WHERE id = ?')
+        .get(docRow.candidate_id) as Record<string, unknown>;
+      res.json({
+        candidate: hydrateCandidate(updated, req.user!.role),
+        aiExtraction,
+      });
     }
   );
 
@@ -2352,6 +3081,101 @@ async function startServer() {
     });
   });
 
+  async function processPortalAcademicUpload(
+    req: Request,
+    row: Record<string, unknown>
+  ): Promise<{ errorStatus?: number; errorMessage?: string }> {
+    const candidateId = Number(row.id);
+    const docType = String(req.body?.doc_type || '').toUpperCase();
+    if (!['SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'].includes(docType)) {
+      if (req.file) fs.unlink(req.file.path, () => {});
+      return { errorStatus: 400, errorMessage: 'Invalid academic document type.' };
+    }
+    if (!req.file) {
+      return { errorStatus: 400, errorMessage: 'Please attach a document file (PDF/Image).' };
+    }
+
+    ensureCandidateDocumentRows(candidateId);
+    // Reset verified = 0 when replacing a document so HR performs manual sign-off on the new scan
+    db.prepare(`
+      UPDATE candidate_documents
+      SET completed = 1, verified = 0, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
+          ai_extracted_json = '', ai_verified_status = ''
+      WHERE candidate_id = ? AND doc_type = ?
+    `).run(req.file.originalname, req.file.filename, candidateId, docType);
+
+    const missing = getMissingDocsForCandidate(candidateId);
+    const nextStage = Number(row.stage) < 7 ? (missing.length === 0 ? 7 : 6) : Number(row.stage);
+    const nextStatus =
+      Number(row.stage) <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(row.status);
+
+    db.prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`).run(
+      nextStage,
+      nextStatus,
+      candidateId
+    );
+
+    const candidateActorName = `${row.full_name} (${row.email})`;
+    logAudit({
+      req,
+      actorName: candidateActorName,
+      actorRole: 'candidate_portal',
+      pageVisited: 'Candidate Self-Service Portal',
+      actionTaken: 'UPLOAD_DOCUMENT',
+      targetEntity: `${row.full_name} (${row.candidate_code}) — ${docType}`,
+      details: `Candidate ${row.full_name} uploaded ${docType} (${req.file.originalname}) via self-service portal.`,
+    });
+
+    await runAndPersistDocumentExtraction({
+      req,
+      actorName: candidateActorName,
+      actorRole: 'candidate_portal',
+      pageVisited: 'Candidate Self-Service Portal',
+      candidateId,
+      candidateCode: String(row.candidate_code),
+      candidateName: String(row.full_name),
+      position: String(row.position || ''),
+      department: String(row.department || ''),
+      docType: docType as ExtractableDocType,
+      filePath: req.file.path,
+      fileName: req.file.originalname,
+      mimeType: req.file.mimetype,
+    });
+
+    return {};
+  }
+
+  // Dedicated Candidate Portal academic document upload + automatic Gemini AI extraction
+  app.post('/api/portal/:token/documents', upload.single('file'), async (req: Request, res: Response) => {
+    const token = String(req.params.token || '').trim();
+    const row = db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token) as
+      | Record<string, unknown>
+      | undefined;
+
+    if (!row) {
+      if (req.file) fs.unlink(req.file.path, () => {});
+      res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
+      return;
+    }
+
+    const result = await processPortalAcademicUpload(req, row);
+    if (result.errorStatus) {
+      res.status(result.errorStatus).json({ error: result.errorMessage });
+      return;
+    }
+
+    const candidateId = Number(row.id);
+    const refreshed = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
+    const availableSlots = db
+      .prepare(`SELECT * FROM interview_slots WHERE status = 'ACTIVE' AND booked_count < capacity ORDER BY date ASC, start_time ASC`)
+      .all();
+
+    res.json({
+      candidate: hydrateCandidate(refreshed, 'CANDIDATE'),
+      availableSlots,
+    });
+  });
+
   // Candidate portal actions: upload doc, mark Google Apps Script forms done, book slot, respond to offer
   app.post('/api/portal/:token', upload.single('file'), async (req: Request, res: Response) => {
     const token = String(req.params.token || '').trim();
@@ -2370,44 +3194,11 @@ async function startServer() {
 
     // Action A: Upload academic document (SPM, UEC, DEGREE, TRANSCRIPT)
     if (action === 'upload_document') {
-      const docType = String(req.body?.doc_type || '').toUpperCase();
-      if (!['SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'].includes(docType)) {
-        if (req.file) fs.unlink(req.file.path, () => {});
-        res.status(400).json({ error: 'Invalid academic document type.' });
+      const result = await processPortalAcademicUpload(req, row);
+      if (result.errorStatus) {
+        res.status(result.errorStatus).json({ error: result.errorMessage });
         return;
       }
-      if (!req.file) {
-        res.status(400).json({ error: 'Please attach a document file (PDF/Image).' });
-        return;
-      }
-
-      ensureCandidateDocumentRows(candidateId);
-      db.prepare(`
-        UPDATE candidate_documents
-        SET completed = 1, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now')
-        WHERE candidate_id = ? AND doc_type = ?
-      `).run(req.file.originalname, req.file.filename, candidateId, docType);
-
-      const missing = getMissingDocsForCandidate(candidateId);
-      const nextStage = Number(row.stage) < 7 ? (missing.length === 0 ? 7 : 6) : Number(row.stage);
-      const nextStatus =
-        Number(row.stage) <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(row.status);
-
-      db.prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`).run(
-        nextStage,
-        nextStatus,
-        candidateId
-      );
-
-      logAudit({
-        req,
-        actorName: `${row.full_name} (${row.email})`,
-        actorRole: 'candidate_portal',
-        pageVisited: 'Candidate Self-Service Portal',
-        actionTaken: 'UPLOAD_DOCUMENT',
-        targetEntity: `${row.full_name} (${row.candidate_code}) — ${docType}`,
-        details: `Candidate ${row.full_name} uploaded ${docType} (${req.file.originalname}) via self-service portal.`,
-      });
     }
     // Action B: Mark Google Apps Script forms (APP_FORM, DISC) complete
     else if (action === 'complete_forms') {

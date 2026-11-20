@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   BellRing,
   Briefcase,
   Calendar,
@@ -13,11 +14,14 @@ import {
   FileText,
   GraduationCap,
   Link2,
+  Loader2,
   Mail,
   MapPin,
   Phone,
   Printer,
+  RefreshCw,
   Send,
+  Sparkles,
   Star,
   Trash2,
   Upload,
@@ -29,6 +33,7 @@ import {
   bookInterviewSlotAtomically,
   deleteCandidate,
   getProtectedFileUrl,
+  reanalyzeDocumentWithAi,
   sendDocReminder,
   sendEmploymentOffer,
   submitPostInterviewDecision,
@@ -41,6 +46,7 @@ import {
 } from '../lib/apiService';
 import { formatMYR, formatTimestamp, getDoc, getMissingMandatoryDocs } from '../lib/atsHelpers';
 import {
+  CandidateDocument,
   CandidateRecord,
   DocType,
   GOOGLE_APPS_SCRIPT_URLS,
@@ -133,6 +139,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
 
   const [busy, setBusy] = useState(false);
   const [uploadingDoc, setUploadingDoc] = useState<DocType | null>(null);
+  const [analyzingDocId, setAnalyzingDocId] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [copiedPortal, setCopiedPortal] = useState(false);
 
@@ -262,11 +269,40 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
     try {
       const updated = await uploadCandidateDocument(candidate.id, docType, file);
       await onUpdated(updated);
-      onNotify(`Uploaded ${file.name} (${docType}) to secure local storage.`);
+      const scannedDoc = updated.documents.find((d) => d.doc_type === docType);
+      if (scannedDoc?.ai_verified_status === 'AI_FAILED') {
+        onNotify(`Saved ${file.name} (${docType}), but Gemini AI scan failed — use Re-Analyze to retry.`);
+      } else if (scannedDoc?.ai_verified_status === 'NAME_MISMATCH') {
+        onNotify(`Uploaded ${file.name} (${docType}) — Gemini AI flagged a candidate name mismatch.`);
+      } else {
+        onNotify(`Uploaded ${file.name} (${docType}) and completed Gemini AI document extraction.`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload document.');
     } finally {
       setUploadingDoc(null);
+    }
+  };
+
+  const handleReanalyzeDoc = async (doc: CandidateDocument) => {
+    if (!isAdmin || !doc.id) return;
+    setAnalyzingDocId(doc.id);
+    setError('');
+    try {
+      const updated = await reanalyzeDocumentWithAi(doc.id);
+      await onUpdated(updated);
+      const refreshedDoc = updated.documents.find((d) => d.id === doc.id);
+      if (refreshedDoc?.ai_verified_status === 'AI_FAILED') {
+        onNotify(`Gemini AI re-analysis failed for ${doc.doc_type}. Please review the warning note.`);
+      } else if (refreshedDoc?.ai_verified_status === 'NAME_MISMATCH') {
+        onNotify(`Gemini AI re-analysis flagged a name mismatch on ${doc.doc_type}.`);
+      } else {
+        onNotify(`Gemini AI re-analysis completed for ${doc.doc_type}.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to re-analyze document with Gemini AI.');
+    } finally {
+      setAnalyzingDocId(null);
     }
   };
 
@@ -598,35 +634,66 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     {candidate.ai_summary || 'Resume registered and queued for HR screening.'}
                   </p>
                   {resumeDoc && (
-                    <div className="pt-2 border-t border-[#F1F5F9] flex items-center justify-between text-xs">
-                      <span className="flex items-center gap-1.5 text-[#334155] truncate">
-                        <FileText className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
-                        <span className="truncate">{resumeDoc.file_name || 'Resume file'}</span>
-                      </span>
-                      {resumeDoc.file_path ? (
-                        <a
-                          href={getProtectedFileUrl(resumeDoc.file_path)}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-semibold text-[#0F766E] hover:underline shrink-0 ml-2"
-                        >
-                          Download
-                        </a>
-                      ) : isAdmin ? (
-                        <label className="cursor-pointer font-semibold text-[#0F766E] hover:underline shrink-0 ml-2">
-                          {uploadingDoc === 'RESUME' ? 'Uploading...' : 'Attach PDF'}
-                          <input
-                            type="file"
-                            accept=".pdf,.doc,.docx,.txt"
-                            className="hidden"
-                            onChange={(e) => {
-                              const file = e.target.files?.[0];
-                              if (file) void handleFileUpload('RESUME', file);
-                            }}
-                          />
-                        </label>
-                      ) : (
-                        <span className="text-[#94A3B8] shrink-0 ml-2">No file attached</span>
+                    <div className="pt-2 border-t border-[#F1F5F9] space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 text-[#334155] truncate">
+                          <FileText className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
+                          <span className="truncate">{resumeDoc.file_name || 'Resume file'}</span>
+                        </span>
+                        <div className="flex items-center gap-2.5 shrink-0">
+                          {resumeDoc.file_path && (
+                            <a
+                              href={getProtectedFileUrl(resumeDoc.file_path)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="font-semibold text-[#0F766E] hover:underline"
+                            >
+                              Download
+                            </a>
+                          )}
+                          {isAdmin && resumeDoc.file_path && (
+                            <button
+                              type="button"
+                              disabled={analyzingDocId === resumeDoc.id}
+                              onClick={() => void handleReanalyzeDoc(resumeDoc)}
+                              className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-0.5 text-[11px] font-semibold text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50"
+                            >
+                              {analyzingDocId === resumeDoc.id ? (
+                                <Loader2 className="h-3 w-3 animate-spin text-[#0F766E]" />
+                              ) : (
+                                <RefreshCw className="h-3 w-3 text-[#0F766E]" />
+                              )}
+                              {analyzingDocId === resumeDoc.id ? 'Scanning...' : 'Re-Analyze with Gemini AI'}
+                            </button>
+                          )}
+                          {!resumeDoc.file_path &&
+                            (isAdmin ? (
+                              <label className="cursor-pointer font-semibold text-[#0F766E] hover:underline">
+                                {uploadingDoc === 'RESUME' ? 'Uploading & Scanning...' : 'Attach PDF / Image'}
+                                <input
+                                  type="file"
+                                  accept=".pdf,.png,.jpg,.jpeg,.webp,.txt"
+                                  className="hidden"
+                                  onChange={(e) => {
+                                    const file = e.target.files?.[0];
+                                    if (file) void handleFileUpload('RESUME', file);
+                                    e.target.value = '';
+                                  }}
+                                />
+                              </label>
+                            ) : (
+                              <span className="text-[#94A3B8]">No file attached</span>
+                            ))}
+                        </div>
+                      </div>
+                      {resumeDoc.ai_verified_status === 'AI_FAILED' && (
+                        <div className="flex items-start gap-1.5 rounded border border-[#FDE68A] bg-[#FFFBEB] px-2.5 py-1.5 text-[11px] text-[#92400E]">
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-[#D97706]" />
+                          <span>
+                            {resumeDoc.ai_extracted?.error ||
+                              'Gemini AI scan did not complete for this resume. Click Re-Analyze to retry.'}
+                          </span>
+                        </div>
                       )}
                     </div>
                   )}
@@ -814,112 +881,282 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     {DOC_META.map((item) => {
                       const doc = getDoc(candidate, item.type);
                       const flag = docFlags[item.type];
+                      const ai = doc?.ai_extracted;
+                      const aiStatus = doc?.ai_verified_status || '';
+                      const isScanningThis =
+                        uploadingDoc === item.type || (doc?.id !== undefined && analyzingDocId === doc.id);
+
+                      const extractedHighlights: Array<{ label: string; value: string; mono?: boolean }> = [];
+                      if (ai) {
+                        if (ai.candidate_name_on_doc) {
+                          extractedHighlights.push({ label: 'Name on Doc', value: ai.candidate_name_on_doc });
+                        }
+                        if (ai.school_name) {
+                          extractedHighlights.push({ label: 'School', value: ai.school_name });
+                        }
+                        if (ai.university_name) {
+                          extractedHighlights.push({ label: 'University', value: ai.university_name });
+                        }
+                        if (ai.degree_title) {
+                          extractedHighlights.push({ label: 'Degree', value: ai.degree_title });
+                        }
+                        if (ai.program_name) {
+                          extractedHighlights.push({ label: 'Program', value: ai.program_name });
+                        }
+                        if (ai.honours_class) {
+                          extractedHighlights.push({ label: 'Honours', value: ai.honours_class });
+                        }
+                        if (ai.exam_year) {
+                          extractedHighlights.push({ label: 'Exam Year', value: ai.exam_year, mono: true });
+                        }
+                        if (ai.graduation_year) {
+                          extractedHighlights.push({ label: 'Grad Year', value: ai.graduation_year, mono: true });
+                        }
+                        if (ai.total_credits !== undefined && ai.total_credits !== '') {
+                          extractedHighlights.push({
+                            label: 'Credits',
+                            value: String(ai.total_credits),
+                            mono: true,
+                          });
+                        }
+                        if (ai.cgpa) {
+                          extractedHighlights.push({ label: 'CGPA', value: ai.cgpa, mono: true });
+                        }
+                        if (ai.semesters_completed !== undefined && ai.semesters_completed !== '') {
+                          extractedHighlights.push({
+                            label: 'Semesters',
+                            value: String(ai.semesters_completed),
+                            mono: true,
+                          });
+                        }
+                      }
+
                       return (
-                        <tr key={item.type} className="hover:bg-[#FAFBFC]">
-                          <td className="px-3.5 py-3">
-                            <div className="font-semibold text-[#0F172A]">{item.label}</div>
-                            <div className="text-[11px] text-[#64748B]">{item.requiredLabel}</div>
-                            {doc?.file_name && (
-                              <div className="mt-0.5 font-mono text-[11px] text-[#0F766E] truncate max-w-[230px]">
-                                {doc.file_name}
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-3 py-3 text-center">
-                            <input
-                              type="checkbox"
-                              checked={flag.completed}
-                              disabled={!isAdmin || flag.not_applicable}
-                              onChange={(e) =>
-                                setDocFlags((prev) => ({
-                                  ...prev,
-                                  [item.type]: { ...prev[item.type], completed: e.target.checked },
-                                }))
-                              }
-                              className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
-                            />
-                          </td>
-                          <td className="px-3 py-3 text-center">
-                            <input
-                              type="checkbox"
-                              checked={flag.verified}
-                              disabled={!isAdmin || flag.not_applicable}
-                              onChange={(e) =>
-                                setDocFlags((prev) => ({
-                                  ...prev,
-                                  [item.type]: {
-                                    ...prev[item.type],
-                                    verified: e.target.checked,
-                                    completed: e.target.checked ? true : prev[item.type].completed,
-                                  },
-                                }))
-                              }
-                              className="h-4 w-4 accent-[#15803D] disabled:opacity-60"
-                            />
-                          </td>
-                          <td className="px-3 py-3 text-center">
-                            {item.type === 'UEC' ? (
+                        <React.Fragment key={item.type}>
+                          <tr className="hover:bg-[#FAFBFC]">
+                            <td className="px-3.5 py-3">
+                              <div className="font-semibold text-[#0F172A]">{item.label}</div>
+                              <div className="text-[11px] text-[#64748B]">{item.requiredLabel}</div>
+                              {doc?.file_name && (
+                                <div className="mt-0.5 font-mono text-[11px] text-[#0F766E] truncate max-w-[230px]">
+                                  {doc.file_name}
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-3 py-3 text-center">
                               <input
                                 type="checkbox"
-                                checked={flag.not_applicable}
-                                disabled={!isAdmin}
+                                checked={flag.completed}
+                                disabled={!isAdmin || flag.not_applicable}
+                                onChange={(e) =>
+                                  setDocFlags((prev) => ({
+                                    ...prev,
+                                    [item.type]: { ...prev[item.type], completed: e.target.checked },
+                                  }))
+                                }
+                                className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
+                              />
+                            </td>
+                            <td className="px-3 py-3 text-center">
+                              <input
+                                type="checkbox"
+                                checked={flag.verified}
+                                disabled={!isAdmin || flag.not_applicable}
                                 onChange={(e) =>
                                   setDocFlags((prev) => ({
                                     ...prev,
                                     [item.type]: {
-                                      completed: false,
-                                      verified: false,
-                                      not_applicable: e.target.checked,
+                                      ...prev[item.type],
+                                      verified: e.target.checked,
+                                      completed: e.target.checked ? true : prev[item.type].completed,
                                     },
                                   }))
                                 }
-                                className="h-4 w-4 accent-[#64748B] disabled:opacity-60"
+                                className="h-4 w-4 accent-[#15803D] disabled:opacity-60"
                               />
-                            ) : (
-                              <span className="text-[#CBD5E1]">—</span>
-                            )}
-                          </td>
-                          <td className="px-3.5 py-3 text-right whitespace-nowrap">
-                            <div className="inline-flex items-center gap-2">
-                              {item.externalUrl && (
-                                <a
-                                  href={item.externalUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
-                                >
-                                  <Link2 className="h-3 w-3" />
-                                  Open Form
-                                </a>
+                            </td>
+                            <td className="px-3 py-3 text-center">
+                              {item.type === 'UEC' ? (
+                                <input
+                                  type="checkbox"
+                                  checked={flag.not_applicable}
+                                  disabled={!isAdmin}
+                                  onChange={(e) =>
+                                    setDocFlags((prev) => ({
+                                      ...prev,
+                                      [item.type]: {
+                                        completed: false,
+                                        verified: false,
+                                        not_applicable: e.target.checked,
+                                      },
+                                    }))
+                                  }
+                                  className="h-4 w-4 accent-[#64748B] disabled:opacity-60"
+                                />
+                              ) : (
+                                <span className="text-[#CBD5E1]">—</span>
                               )}
-                              {doc?.file_path && (
-                                <a
-                                  href={getProtectedFileUrl(doc.file_path)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
-                                >
-                                  View PDF
-                                </a>
-                              )}
-                              {isAdmin && item.allowUpload && !flag.not_applicable && (
-                                <label className="inline-flex cursor-pointer items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F8FAFC]">
-                                  <Upload className="h-3 w-3" />
-                                  {uploadingDoc === item.type ? 'Saving...' : 'Upload'}
-                                  <input
-                                    type="file"
-                                    accept=".pdf,.jpg,.jpeg,.png"
-                                    className="hidden"
-                                    onChange={(e) => {
-                                      const f = e.target.files?.[0];
-                                      if (f) void handleFileUpload(item.type, f);
-                                    }}
-                                  />
-                                </label>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
+                            </td>
+                            <td className="px-3.5 py-3 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center gap-2">
+                                {item.externalUrl && (
+                                  <a
+                                    href={item.externalUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
+                                  >
+                                    <Link2 className="h-3 w-3" />
+                                    Open Form
+                                  </a>
+                                )}
+                                {doc?.file_path && (
+                                  <a
+                                    href={getProtectedFileUrl(doc.file_path)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
+                                  >
+                                    View File
+                                  </a>
+                                )}
+                                {isAdmin && item.allowUpload && !flag.not_applicable && (
+                                  <label className="inline-flex cursor-pointer items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F8FAFC]">
+                                    {uploadingDoc === item.type ? (
+                                      <Loader2 className="h-3 w-3 animate-spin text-[#0F766E]" />
+                                    ) : (
+                                      <Upload className="h-3 w-3" />
+                                    )}
+                                    {uploadingDoc === item.type ? 'Scanning...' : 'Upload'}
+                                    <input
+                                      type="file"
+                                      accept=".pdf,.jpg,.jpeg,.png,.webp"
+                                      className="hidden"
+                                      onChange={(e) => {
+                                        const f = e.target.files?.[0];
+                                        if (f) void handleFileUpload(item.type, f);
+                                        e.target.value = '';
+                                      }}
+                                    />
+                                  </label>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+
+                          {/* Gemini AI Document Insights sub-row for uploaded academic documents */}
+                          {item.allowUpload && doc?.file_path && !flag.not_applicable && (
+                            <tr className="bg-[#F8FAFC]">
+                              <td colSpan={5} className="px-3.5 py-2.5 border-t border-[#E2E8F0]">
+                                <div className="space-y-1.5">
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                                      <span className="inline-flex items-center gap-1 font-semibold text-[#0F172A]">
+                                        <Sparkles className="h-3 w-3 text-[#0F766E]" />
+                                        Gemini AI Extraction
+                                      </span>
+                                      {ai?.document_detected && (
+                                        <>
+                                          <span className="text-[#CBD5E1]">·</span>
+                                          <span className="font-medium text-[#334155]">{ai.document_detected}</span>
+                                        </>
+                                      )}
+                                      <span className="text-[#CBD5E1]">·</span>
+                                      {isScanningThis ? (
+                                        <span className="inline-flex items-center gap-1 font-semibold text-[#0F766E]">
+                                          <Loader2 className="h-3 w-3 animate-spin" />
+                                          Analyzing document...
+                                        </span>
+                                      ) : aiStatus === 'VERIFIED_MATCH' ? (
+                                        <span className="inline-flex items-center gap-1 font-semibold text-[#15803D]">
+                                          <CheckCircle2 className="h-3 w-3" />
+                                          AI Verified · Name Matched
+                                        </span>
+                                      ) : aiStatus === 'NAME_MISMATCH' ? (
+                                        <span className="inline-flex items-center gap-1 font-semibold text-[#DC2626]">
+                                          <AlertTriangle className="h-3 w-3" />
+                                          Name Mismatch Warning
+                                        </span>
+                                      ) : aiStatus === 'AI_FAILED' ? (
+                                        <span className="inline-flex items-center gap-1 font-semibold text-[#B45309]">
+                                          <AlertTriangle className="h-3 w-3" />
+                                          AI Scan Failed — Retry Available
+                                        </span>
+                                      ) : aiStatus === 'REVIEW_NEEDED' ? (
+                                        <span className="inline-flex items-center gap-1 font-semibold text-[#B45309]">
+                                          <AlertCircle className="h-3 w-3" />
+                                          Review Needed
+                                        </span>
+                                      ) : (
+                                        <span className="text-[#64748B]">Not yet scanned by Gemini AI</span>
+                                      )}
+                                    </div>
+
+                                    {isAdmin && (
+                                      <button
+                                        type="button"
+                                        disabled={isScanningThis}
+                                        onClick={() => void handleReanalyzeDoc(doc)}
+                                        className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-0.5 text-[11px] font-semibold text-[#334155] hover:bg-[#F1F5F9] disabled:opacity-50"
+                                      >
+                                        {analyzingDocId === doc.id ? (
+                                          <Loader2 className="h-3 w-3 animate-spin text-[#0F766E]" />
+                                        ) : (
+                                          <RefreshCw className="h-3 w-3 text-[#0F766E]" />
+                                        )}
+                                        {analyzingDocId === doc.id ? 'Analyzing...' : 'Re-Analyze with Gemini AI'}
+                                      </button>
+                                    )}
+                                  </div>
+
+                                  {aiStatus === 'NAME_MISMATCH' && ai?.candidate_name_on_doc && (
+                                    <div className="rounded border border-[#FECACA] bg-[#FEF2F2] px-2.5 py-1.5 text-[11px] text-[#B91C1C]">
+                                      Printed name <strong className="font-semibold">&ldquo;{ai.candidate_name_on_doc}&rdquo;</strong> does not match candidate record <strong className="font-semibold">&ldquo;{candidate.full_name}&rdquo;</strong>. Please verify identity manually before checking HR Verified.
+                                    </div>
+                                  )}
+
+                                  {aiStatus === 'AI_FAILED' && (
+                                    <div className="rounded border border-[#FDE68A] bg-[#FFFBEB] px-2.5 py-1.5 text-[11px] text-[#92400E]">
+                                      {ai?.error ||
+                                        'The file was saved securely, but Gemini AI could not complete scanning. Click Re-Analyze with Gemini AI to try again.'}
+                                    </div>
+                                  )}
+
+                                  {extractedHighlights.length > 0 && (
+                                    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[11px] text-[#334155]">
+                                      {extractedHighlights.map((field) => (
+                                        <span key={field.label}>
+                                          <span className="text-[#64748B]">{field.label}:</span>{' '}
+                                          <span
+                                            className={`font-medium text-[#0F172A] ${
+                                              field.mono ? 'font-mono tabular-nums' : ''
+                                            }`}
+                                          >
+                                            {field.value}
+                                          </span>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  {ai?.grades_summary && (
+                                    <div className="text-[11px] text-[#334155]">
+                                      <span className="text-[#64748B]">Grades:</span>{' '}
+                                      <span className="font-mono text-[#0F172A]">{ai.grades_summary}</span>
+                                    </div>
+                                  )}
+
+                                  {ai?.verification_notes && (
+                                    <div className="text-[11px] leading-relaxed text-[#475569]">
+                                      <span className="font-semibold text-[#64748B]">AI Notes:</span>{' '}
+                                      {ai.verification_notes}
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>

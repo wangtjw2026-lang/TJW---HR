@@ -50,6 +50,51 @@ export interface StaffUser {
   created_at?: string;
 }
 
+export type AiDocumentVerificationStatus =
+  | ''
+  | 'VERIFIED_MATCH'
+  | 'NAME_MISMATCH'
+  | 'REVIEW_NEEDED'
+  | 'AI_FAILED';
+
+export interface AiDocumentExtractionPayload {
+  // Common academic & certificate fields
+  document_detected?: string;
+  candidate_name_on_doc?: string;
+  name_matches_candidate?: boolean;
+  verification_notes?: string;
+  // SPM & UEC fields
+  exam_year?: string;
+  school_name?: string;
+  grades_summary?: string;
+  total_credits?: string | number;
+  // Degree fields
+  university_name?: string;
+  degree_title?: string;
+  honours_class?: string;
+  graduation_year?: string;
+  // Transcript fields
+  program_name?: string;
+  cgpa?: string;
+  semesters_completed?: string | number;
+  // Resume fields
+  full_name?: string;
+  email?: string;
+  phone?: string;
+  location?: string;
+  years_experience?: number;
+  has_uec?: boolean;
+  skills?: string[];
+  education?: string;
+  experience?: string;
+  ai_score?: number;
+  ai_summary?: string;
+  // Metadata & error state
+  model_used?: string;
+  extracted_at?: string;
+  error?: string;
+}
+
 export interface CandidateDocument {
   id: number;
   candidate_id: number;
@@ -60,6 +105,9 @@ export interface CandidateDocument {
   file_name: string;
   file_path: string;
   uploaded_at: string;
+  ai_extracted_json: string;
+  ai_verified_status: AiDocumentVerificationStatus;
+  ai_extracted: AiDocumentExtractionPayload | null;
 }
 
 export interface InterviewBooking {

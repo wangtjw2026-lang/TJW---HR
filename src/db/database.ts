@@ -286,6 +286,8 @@ export function initializeDatabase() {
       file_name TEXT NOT NULL DEFAULT '',
       file_path TEXT NOT NULL DEFAULT '',
       uploaded_at TEXT NOT NULL DEFAULT '',
+      ai_extracted_json TEXT NOT NULL DEFAULT '',
+      ai_verified_status TEXT NOT NULL DEFAULT '',
       UNIQUE(candidate_id, doc_type),
       FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
     );
@@ -351,7 +353,21 @@ export function initializeDatabase() {
     );
   `);
 
+  ensureCandidateDocumentsAiColumns();
   ensureImmutableAuditLogsTable();
+}
+
+function ensureCandidateDocumentsAiColumns() {
+  const columns = db.prepare(`PRAGMA table_info(candidate_documents)`).all() as Array<{ name: string }>;
+  const hasJson = columns.some((c) => c.name === 'ai_extracted_json');
+  const hasStatus = columns.some((c) => c.name === 'ai_verified_status');
+
+  if (!hasJson) {
+    db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_extracted_json TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!hasStatus) {
+    db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_verified_status TEXT NOT NULL DEFAULT ''`);
+  }
 }
 
 export function generatePortalToken(): string {

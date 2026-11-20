@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   Briefcase,
   Calendar,
   Check,
@@ -12,6 +13,7 @@ import {
   Loader2,
   MapPin,
   ShieldCheck,
+  Sparkles,
   Upload,
   Video,
   XCircle,
@@ -164,7 +166,18 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
       setPortalCandidate(data.candidate);
       setAvailableSlots(data.availableSlots);
       await onRefreshWorkspace?.();
-      notify(`Uploaded ${file.name} for ${docType}.`);
+      const scannedDoc = data.candidate.documents.find((d) => d.doc_type === docType);
+      if (scannedDoc?.ai_verified_status === 'NAME_MISMATCH') {
+        notify(
+          `Uploaded ${file.name} (${docType}). Please double-check that the name on the document matches your application.`
+        );
+      } else if (scannedDoc?.ai_extracted?.document_detected) {
+        notify(
+          `Uploaded ${file.name} — detected as ${scannedDoc.ai_extracted.document_detected} and submitted for HR review.`
+        );
+      } else {
+        notify(`Uploaded ${file.name} for ${docType}.`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed.');
     } finally {
@@ -495,23 +508,58 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                             )}
                           </div>
                         )}
+                        {doc?.file_path && doc.ai_verified_status && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+                            {doc.ai_verified_status === 'VERIFIED_MATCH' ? (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#15803D]">
+                                <Sparkles className="h-3 w-3" />
+                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name matched
+                              </span>
+                            ) : doc.ai_verified_status === 'NAME_MISMATCH' ? (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#DC2626]">
+                                <AlertTriangle className="h-3 w-3 shrink-0" />
+                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name on document
+                                {doc.ai_extracted?.candidate_name_on_doc
+                                  ? ` ("${doc.ai_extracted.candidate_name_on_doc}")`
+                                  : ''}{' '}
+                                does not match your profile. Please verify or replace if incorrect.
+                              </span>
+                            ) : doc.ai_verified_status === 'AI_FAILED' ? (
+                              <span className="inline-flex items-center gap-1 text-[#64748B]">
+                                <AlertCircle className="h-3 w-3 shrink-0" />
+                                File received · Queued for manual HR verification.
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 font-medium text-[#B45309]">
+                                <Sparkles className="h-3 w-3 shrink-0" />
+                                Detected: {doc.ai_extracted?.document_detected || 'Uploaded document'} · Pending HR
+                                verification
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
 
                       {canInteract && !doc?.not_applicable && (
                         <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC]">
-                          <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
+                          {uploadingType === item.type ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />
+                          ) : (
+                            <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
+                          )}
                           {uploadingType === item.type
-                            ? 'Uploading...'
+                            ? 'Uploading & Scanning...'
                             : doc?.completed
                             ? 'Replace File'
                             : 'Upload File'}
                           <input
                             type="file"
-                            accept=".pdf,.jpg,.jpeg,.png"
+                            accept=".pdf,.jpg,.jpeg,.png,.webp"
                             className="hidden"
                             onChange={(e) => {
                               const f = e.target.files?.[0];
                               if (f) void handleUploadDoc(item.type, f);
+                              e.target.value = '';
                             }}
                           />
                         </label>

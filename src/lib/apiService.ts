@@ -266,7 +266,7 @@ export async function parseResumeWithAi(payload: {
         body: form,
       },
       true,
-      75_000
+      95_000
     );
     return unwrapResumePayload(raw);
   }
@@ -283,7 +283,7 @@ export async function parseResumeWithAi(payload: {
       }),
     },
     true,
-    75_000
+    95_000
   );
   return unwrapResumePayload(raw);
 }
@@ -335,10 +335,15 @@ export async function registerCandidate(params: {
     form.append('resumeFileName', params.resumeFileName);
   }
 
-  const data = await apiFetch<{ candidate: CandidateRecord }>('/api/candidates', {
-    method: 'POST',
-    body: form,
-  });
+  const data = await apiFetch<{ candidate: CandidateRecord }>(
+    '/api/candidates',
+    {
+      method: 'POST',
+      body: form,
+    },
+    true,
+    95_000
+  );
   return data.candidate;
 }
 
@@ -382,10 +387,27 @@ export async function uploadCandidateDocument(
   const form = new FormData();
   form.append('doc_type', docType);
   form.append('file', file);
-  const data = await apiFetch<{ candidate: CandidateRecord }>(`/api/candidates/${candidateId}/documents`, {
-    method: 'POST',
-    body: form,
-  });
+  const data = await apiFetch<{ candidate: CandidateRecord }>(
+    `/api/candidates/${candidateId}/documents`,
+    {
+      method: 'POST',
+      body: form,
+    },
+    true,
+    95_000
+  );
+  return data.candidate;
+}
+
+export async function reanalyzeDocumentWithAi(docId: number): Promise<CandidateRecord> {
+  const data = await apiFetch<{ candidate: CandidateRecord }>(
+    `/api/documents/${docId}/ai-extract`,
+    {
+      method: 'POST',
+    },
+    true,
+    95_000
+  );
   return data.candidate;
 }
 
@@ -569,13 +591,13 @@ export async function portalUploadDocument(
   file: File
 ): Promise<{ candidate: CandidateRecord; availableSlots: InterviewSlot[] }> {
   const form = new FormData();
-  form.append('action', 'upload_document');
   form.append('doc_type', docType);
   form.append('file', file);
   return apiFetch(
-    `/api/portal/${encodeURIComponent(portalToken)}`,
+    `/api/portal/${encodeURIComponent(portalToken)}/documents`,
     { method: 'POST', body: form },
-    false
+    false,
+    95_000
   );
 }
 
