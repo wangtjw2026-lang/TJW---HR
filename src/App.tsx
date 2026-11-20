@@ -9,6 +9,7 @@ import {
   Database,
   Eye,
   Globe,
+  KeyRound,
   LayoutDashboard,
   Loader2,
   Lock,
@@ -42,8 +43,10 @@ import {
   logPageVisit,
   logoutStaffSession,
   registerSessionExpiredHandler,
+  requestMyTwoFaChange,
   sendBatchDocReminders,
   setCurrentAuditPage,
+  setStoredToken,
 } from './lib/apiService';
 import { exportCandidatesToExcelCsv } from './lib/atsHelpers';
 import {
@@ -55,6 +58,7 @@ import {
   InterviewSlot,
   ROLE_META,
   StaffUser,
+  TwoFaRequestedAction,
 } from './types/ats';
 
 type NavTab = 'dashboard' | 'candidates' | 'interviews' | 'portal' | 'emails' | 'team' | 'audit';
@@ -124,6 +128,13 @@ export default function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
+  // User Profile 2FA Change Request state (for non-admin & staff users under 2FA Lock)
+  const [showTwoFaRequestForm, setShowTwoFaRequestForm] = useState(false);
+  const [twoFaReqAction, setTwoFaReqAction] = useState<TwoFaRequestedAction>('RESET_2FA');
+  const [twoFaReqReason, setTwoFaReqReason] = useState('');
+  const [submittingTwoFaReq, setSubmittingTwoFaReq] = useState(false);
+  const [twoFaReqFeedback, setTwoFaReqFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+
   // 10-minute PDPA inactivity auto-logout state
   const [idleWarningSecondsLeft, setIdleWarningSecondsLeft] = useState<number | null>(null);
   const [keepingAlive, setKeepingAlive] = useState(false);
@@ -140,7 +151,12 @@ export default function App() {
 
   const isAdmin = staffUser?.role === 'administrator';
   const pendingApprovalCount = useMemo(
-    () => (isAdmin ? staffUsers.filter((u) => u.status === 'pending').length : 0),
+    () =>
+      isAdmin
+        ? staffUsers.filter(
+            (u) => u.status === 'pending' || u.two_fa_change_status === 'pending_admin_approval'
+          ).length
+        : 0,
     [isAdmin, staffUsers]
   );
 
@@ -174,6 +190,15 @@ export default function App() {
       if (notice) {
         setSessionNotice(notice);
       }
+    },
+    [clearWorkspaceState]
+  );
+
+  const handleForceGlobalLogout = useCallback(
+    (notice: string) => {
+      setStoredToken(null);
+      clearWorkspaceState();
+      setSessionNotice(notice);
     },
     [clearWorkspaceState]
   );
@@ -333,6 +358,23 @@ export default function App() {
       setEmailLogs(emails);
       setAuditLogs(audits);
       setStaffUsers(users);
+      if (users.length > 0) {
+        const refreshedSelf = users.find((u) => u.id === staffUser.id);
+        if (refreshedSelf) {
+          setStaffUser((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  two_fa_enabled: refreshedSelf.two_fa_enabled,
+                  two_fa_method: refreshedSelf.two_fa_method,
+                  two_fa_change_status: refreshedSelf.two_fa_change_status,
+                  two_fa_requested_state: refreshedSelf.two_fa_requested_state,
+                  two_fa_approved_by: refreshedSelf.two_fa_approved_by,
+                }
+              : prev
+          );
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load workspace data.';
       if (msg.toLowerCase().includes('inactivity')) {
@@ -484,6 +526,38 @@ export default function App() {
 
   const handleLogout = () => {
     void performLogout('manual');
+  };
+
+  const handleSubmitTwoFaRequest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTwoFaReqFeedback(null);
+    if (twoFaReqReason.trim().length < 5) {
+      setTwoFaReqFeedback({
+        ok: false,
+        text: 'Please provide at least 5 characters explaining why you need a 2FA change.',
+      });
+      return;
+    }
+    setSubmittingTwoFaReq(true);
+    try {
+      const res = await requestMyTwoFaChange({
+        requested_action: twoFaReqAction,
+        reason: twoFaReqReason.trim(),
+      });
+      setStaffUser(res.user);
+      setTwoFaReqReason('');
+      setShowTwoFaRequestForm(false);
+      setTwoFaReqFeedback({ ok: true, text: res.message });
+      notify('Submitted 2FA change request for System Administrator approval.');
+      await refreshWorkspace();
+    } catch (err) {
+      setTwoFaReqFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Failed to submit 2FA change request.',
+      });
+    } finally {
+      setSubmittingTwoFaReq(false);
+    }
   };
 
   const handleBatchDocReminders = async (targets: CandidateRecord[]) => {
@@ -765,6 +839,109 @@ export default function App() {
                         </ul>
                       </div>
 
+                      {/* 2FA Authentication Lock Status & Formal Change Request */}
+                      <div className="pt-2.5 border-t border-[#E2E8F0] space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="inline-flex items-center gap-1.5 text-[11px] font-bold text-[#0F172A]">
+                            <KeyRound className="h-3.5 w-3.5 text-[#0F766E]" />
+                            <span>2FA Authentication Lock</span>
+                          </div>
+                          <span className="font-mono text-[10px] font-semibold text-[#0F766E]">
+                            {staffUser.two_fa_enabled
+                              ? `Enabled · ${staffUser.two_fa_method || 'EMAIL_OTP'}`
+                              : 'Disabled'}
+                          </span>
+                        </div>
+
+                        <div className="text-[11px] text-[#475569] leading-snug">
+                          {staffUser.two_fa_change_status === 'pending_admin_approval' ? (
+                            <span className="font-semibold text-[#B45309]">
+                              Pending System Administrator approval. Current 2FA lock remains enforced.
+                            </span>
+                          ) : (
+                            <span>
+                              Locked by security policy — cannot be disabled or modified without System Administrator approval.
+                            </span>
+                          )}
+                        </div>
+
+                        {staffUser.two_fa_approved_by && (
+                          <div className="text-[10px] text-[#64748B]">
+                            Last 2FA approval: <span className="font-medium text-[#334155]">{staffUser.two_fa_approved_by}</span>
+                          </div>
+                        )}
+
+                        {twoFaReqFeedback && (
+                          <div
+                            className={`rounded border px-2.5 py-1.5 text-[11px] ${
+                              twoFaReqFeedback.ok
+                                ? 'border-[#BBF7D0] bg-[#F0FDF4] text-[#166534]'
+                                : 'border-[#FECACA] bg-[#FEF2F2] text-[#B91C1C]'
+                            }`}
+                          >
+                            {twoFaReqFeedback.text}
+                          </div>
+                        )}
+
+                        {!showTwoFaRequestForm ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTwoFaReqFeedback(null);
+                              setShowTwoFaRequestForm(true);
+                            }}
+                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline cursor-pointer"
+                          >
+                            <Lock className="h-3 w-3" />
+                            <span>
+                              {staffUser.two_fa_change_status === 'pending_admin_approval'
+                                ? 'Update Pending 2FA Change Request'
+                                : 'Request 2FA Change / Reset'}
+                            </span>
+                          </button>
+                        ) : (
+                          <form onSubmit={handleSubmitTwoFaRequest} className="space-y-2 pt-1">
+                            <select
+                              value={twoFaReqAction}
+                              onChange={(e) => setTwoFaReqAction(e.target.value as TwoFaRequestedAction)}
+                              className="w-full rounded border border-[#CBD5E1] bg-white px-2 py-1.5 text-[11px] text-[#0F172A]"
+                            >
+                              <option value="RESET_2FA">Reset 2FA Enrollment (Email OTP)</option>
+                              <option value="SWITCH_TO_AUTHENTICATOR_APP">Switch to Authenticator App</option>
+                              <option value="SWITCH_TO_EMAIL_OTP">Switch to Email OTP</option>
+                              <option value="DISABLE_2FA">Request Temporary 2FA Disable</option>
+                              <option value="ENABLE_2FA">Enable 2FA Protection</option>
+                            </select>
+                            <textarea
+                              rows={2}
+                              required
+                              minLength={5}
+                              value={twoFaReqReason}
+                              onChange={(e) => setTwoFaReqReason(e.target.value)}
+                              placeholder="Reason for 2FA change (reviewed by System Administrator)..."
+                              className="w-full rounded border border-[#CBD5E1] bg-white px-2 py-1.5 text-[11px] text-[#0F172A]"
+                            />
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setShowTwoFaRequestForm(false)}
+                                className="rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] text-[#475569] cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="submit"
+                                disabled={submittingTwoFaReq}
+                                className="inline-flex items-center gap-1 rounded bg-[#0F766E] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#115E59] disabled:opacity-50 cursor-pointer"
+                              >
+                                {submittingTwoFaReq && <Loader2 className="h-3 w-3 animate-spin" />}
+                                <span>Submit to Admin</span>
+                              </button>
+                            </div>
+                          </form>
+                        )}
+                      </div>
+
                       <div className="pt-2 border-t border-[#F1F5F9] flex items-center gap-1.5 text-[11px] text-[#64748B]">
                         <Clock className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
                         <span>PDPA session lock: auto-logout after 10 minutes of inactivity.</span>
@@ -885,6 +1062,7 @@ export default function App() {
                 currentUser={staffUser}
                 onRefresh={refreshWorkspace}
                 onNotify={notify}
+                onForceGlobalLogout={handleForceGlobalLogout}
               />
             )}
 

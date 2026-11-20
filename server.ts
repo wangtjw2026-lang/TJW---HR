@@ -33,7 +33,46 @@ const DISC_FORM_URL =
 
 type StaffRole = 'administrator' | 'manager';
 type UserApprovalStatus = 'pending' | 'approved' | 'rejected';
+type TwoFaMethod = 'EMAIL_OTP' | 'AUTHENTICATOR_APP';
+type TwoFaChangeStatus = 'locked' | 'pending_admin_approval';
+type TwoFaRequestedAction =
+  | 'RESET_2FA'
+  | 'DISABLE_2FA'
+  | 'ENABLE_2FA'
+  | 'SWITCH_TO_AUTHENTICATOR_APP'
+  | 'SWITCH_TO_EMAIL_OTP';
 type AuditActorRole = 'administrator' | 'manager' | 'candidate_portal' | 'system';
+
+const VALID_TWO_FA_ACTIONS = new Set<TwoFaRequestedAction>([
+  'RESET_2FA',
+  'DISABLE_2FA',
+  'ENABLE_2FA',
+  'SWITCH_TO_AUTHENTICATOR_APP',
+  'SWITCH_TO_EMAIL_OTP',
+]);
+
+const PUBLIC_USER_SELECT = `id, name, email, role, department, status, approved_by, approved_at, two_fa_enabled, two_fa_method, two_fa_change_status, two_fa_requested_state, two_fa_approved_by, created_at`;
+
+function serializePublicUser(row: Record<string, unknown>) {
+  return {
+    id: Number(row.id),
+    name: String(row.name || ''),
+    email: String(row.email || ''),
+    role: (row.role === 'administrator' ? 'administrator' : 'manager') as StaffRole,
+    department: String(row.department || 'Human Resources'),
+    status: (row.status === 'pending' || row.status === 'rejected' ? row.status : 'approved') as UserApprovalStatus,
+    approved_by: String(row.approved_by || ''),
+    approved_at: String(row.approved_at || ''),
+    two_fa_enabled: Boolean(row.two_fa_enabled ?? 1),
+    two_fa_method: (row.two_fa_method === 'AUTHENTICATOR_APP' ? 'AUTHENTICATOR_APP' : 'EMAIL_OTP') as TwoFaMethod,
+    two_fa_change_status: (row.two_fa_change_status === 'pending_admin_approval'
+      ? 'pending_admin_approval'
+      : 'locked') as TwoFaChangeStatus,
+    two_fa_requested_state: String(row.two_fa_requested_state || ''),
+    two_fa_approved_by: String(row.two_fa_approved_by || ''),
+    created_at: row.created_at ? String(row.created_at) : undefined,
+  };
+}
 
 interface AuthPayload {
   id: number;
@@ -44,8 +83,14 @@ interface AuthPayload {
   status?: UserApprovalStatus;
   approved_by?: string;
   approved_at?: string;
+  two_fa_enabled?: boolean;
+  two_fa_method?: TwoFaMethod;
+  two_fa_change_status?: TwoFaChangeStatus;
+  two_fa_requested_state?: string;
+  two_fa_approved_by?: string;
   created_at?: string;
   sid?: string;
+  tv?: number;
   iat?: number;
 }
 
@@ -1497,9 +1542,20 @@ function validateSessionAndIdle(
     } {
   const dbUser = db
     .prepare(
-      'SELECT id, name, email, role, department, status, approved_by, approved_at, last_active_at, created_at FROM users WHERE id = ?'
+      `SELECT ${PUBLIC_USER_SELECT}, last_active_at, token_version FROM users WHERE id = ?`
     )
-    .get(decoded.id) as (AuthPayload & { last_active_at?: string }) | undefined;
+    .get(decoded.id) as
+    | (Record<string, unknown> & {
+        id: number;
+        name: string;
+        email: string;
+        role: StaffRole;
+        department: string;
+        status: UserApprovalStatus;
+        last_active_at?: string;
+        token_version?: number;
+      })
+    | undefined;
 
   if (!dbUser) {
     return { ok: false, statusCode: 401, error: 'Account no longer exists.' };
@@ -1523,6 +1579,17 @@ function validateSessionAndIdle(
     };
   }
 
+  const tokenTv = typeof decoded.tv === 'number' ? decoded.tv : 1;
+  const currentTv = Number(dbUser.token_version ?? 1);
+  if (tokenTv !== currentTv) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: 'All active sessions were revoked by a System Administrator. Please sign in again.',
+      code: 'SESSION_REVOKED',
+    };
+  }
+
   const now = Date.now();
   const sid = typeof decoded.sid === 'string' ? decoded.sid : '';
   const memSession = sid ? sessionActivityMap.get(sid) : undefined;
@@ -1531,7 +1598,7 @@ function validateSessionAndIdle(
     return {
       ok: false,
       statusCode: 401,
-      error: 'Session has been signed out. Please sign in again.',
+      error: 'Session has been signed out or revoked. Please sign in again.',
       code: 'SESSION_REVOKED',
     };
   }
@@ -1548,12 +1615,14 @@ function validateSessionAndIdle(
     lastActiveMs = decoded.iat * 1000;
   }
 
+  const serializedUser = serializePublicUser(dbUser);
+
   if (lastActiveMs !== null && now - lastActiveMs > IDLE_TIMEOUT_MS) {
     const idleMinutes = Math.floor((now - lastActiveMs) / 60000);
     const pageHeader = String(req.headers['x-page-visited'] || 'Workspace Session').trim();
     recordIdleAutoLogoutOnce({
       req,
-      user: dbUser,
+      user: serializedUser,
       sid: sid || undefined,
       pageVisited: pageHeader || 'Workspace Session',
       details: `Session automatically terminated after exceeding 10 minutes of inactivity (${idleMinutes} min idle).`,
@@ -1581,16 +1650,9 @@ function validateSessionAndIdle(
   return {
     ok: true,
     user: {
-      id: dbUser.id,
-      name: dbUser.name,
-      email: dbUser.email,
-      role: dbUser.role,
-      department: dbUser.department,
-      status: dbUser.status,
-      approved_by: dbUser.approved_by,
-      approved_at: dbUser.approved_at,
-      created_at: dbUser.created_at,
+      ...serializedUser,
       sid,
+      tv: currentTv,
     },
   };
 }
@@ -1920,28 +1982,17 @@ async function startServer() {
         )
         .run(name, email, hash, department, approvedAt, nowIso);
       return db
-        .prepare(
-          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-        )
-        .get(info.lastInsertRowid) as {
-        id: number;
-        name: string;
-        email: string;
-        role: StaffRole;
-        department: string;
-        status: UserApprovalStatus;
-        approved_by: string;
-        approved_at: string;
-        created_at: string;
-      };
+        .prepare(`SELECT ${PUBLIC_USER_SELECT}, token_version FROM users WHERE id = ?`)
+        .get(info.lastInsertRowid) as (Record<string, unknown> & { token_version: number }) | undefined;
     });
 
-    const createdUser = createInitialAdmin();
-    if (!createdUser) {
+    const createdUserRow = createInitialAdmin();
+    if (!createdUserRow) {
       res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
       return;
     }
 
+    const createdUser = serializePublicUser(createdUserRow);
     const sid = registerActiveSession(createdUser.id);
     const payload: AuthPayload = {
       id: createdUser.id,
@@ -1950,6 +2001,7 @@ async function startServer() {
       role: createdUser.role,
       department: createdUser.department,
       sid,
+      tv: Number(createdUserRow.token_version ?? 1),
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
@@ -1960,7 +2012,7 @@ async function startServer() {
       pageVisited: 'Login Gate',
       actionTaken: 'CREATE_USER',
       targetEntity: `${createdUser.name} (${createdUser.email})`,
-      details: `Registered initial System Administrator account (${createdUser.email}, ${createdUser.department}). Approved by: Initial System Setup.`,
+      details: `Registered initial System Administrator account (${createdUser.email}, ${createdUser.department}). Approved by: Initial System Setup. 2FA enabled & locked (${createdUser.two_fa_method}).`,
     });
 
     res.status(201).json({ token, user: createdUser });
@@ -2021,16 +2073,14 @@ async function startServer() {
       details: `Submitted new staff access request for ${name} (${email}, ${department}) requesting role "${requestedRole}". Status: pending System Administrator approval.`,
     });
 
-    const created = db
-      .prepare(
-        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-      )
-      .get(newUserId);
+    const createdRow = db
+      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+      .get(newUserId) as Record<string, unknown>;
 
     res.status(201).json({
       message:
         'Your staff access request has been submitted and is pending approval by a System Administrator.',
-      user: created,
+      user: serializePublicUser(createdRow),
     });
   });
 
@@ -2043,62 +2093,63 @@ async function startServer() {
       return;
     }
 
-    const user = db
-      .prepare(
-        'SELECT id, name, email, password_hash, role, department, status, approved_by, approved_at, created_at FROM users WHERE lower(email) = ?'
-      )
+    const userRow = db
+      .prepare(`SELECT ${PUBLIC_USER_SELECT}, password_hash, token_version FROM users WHERE lower(email) = ?`)
       .get(email) as
-      | (AuthPayload & {
+      | (Record<string, unknown> & {
+          id: number;
+          name: string;
+          email: string;
           password_hash: string;
+          role: StaffRole;
+          department: string;
           status: UserApprovalStatus;
-          approved_by: string;
-          approved_at: string;
-          created_at: string;
+          token_version: number;
         })
       | undefined;
 
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    if (!userRow || !bcrypt.compareSync(password, userRow.password_hash)) {
       logAudit({
         req,
-        actorId: user?.id ?? null,
-        actorName: user ? `${user.name} (${user.email})` : email,
-        actorRole: user ? user.role : 'system',
+        actorId: userRow?.id ?? null,
+        actorName: userRow ? `${userRow.name} (${userRow.email})` : email,
+        actorRole: userRow ? userRow.role : 'system',
         pageVisited: 'Login Gate',
         actionTaken: 'LOGIN_FAILED',
         targetEntity: email,
-        details: user
-          ? `Failed login attempt for ${user.email}: incorrect password.`
+        details: userRow
+          ? `Failed login attempt for ${userRow.email}: incorrect password.`
           : `Failed login attempt for unregistered email (${email}).`,
       });
       res.status(401).json({ error: 'Invalid email or password.' });
       return;
     }
 
-    if (user.status === 'pending') {
+    if (userRow.status === 'pending') {
       logAudit({
         req,
-        actorId: user.id,
-        actorName: `${user.name} (${user.email})`,
-        actorRole: user.role,
+        actorId: userRow.id,
+        actorName: `${userRow.name} (${userRow.email})`,
+        actorRole: userRow.role,
         pageVisited: 'Login Gate',
         actionTaken: 'LOGIN_FAILED',
-        targetEntity: `${user.name} (${user.email})`,
-        details: `Blocked login attempt for ${user.email}: account is pending approval by a System Administrator.`,
+        targetEntity: `${userRow.name} (${userRow.email})`,
+        details: `Blocked login attempt for ${userRow.email}: account is pending approval by a System Administrator.`,
       });
       res.status(403).json({ error: 'Your account is pending approval by a System Administrator.' });
       return;
     }
 
-    if (user.status !== 'approved') {
+    if (userRow.status !== 'approved') {
       logAudit({
         req,
-        actorId: user.id,
-        actorName: `${user.name} (${user.email})`,
-        actorRole: user.role,
+        actorId: userRow.id,
+        actorName: `${userRow.name} (${userRow.email})`,
+        actorRole: userRow.role,
         pageVisited: 'Login Gate',
         actionTaken: 'LOGIN_FAILED',
-        targetEntity: `${user.name} (${user.email})`,
-        details: `Blocked login attempt for ${user.email}: account status is "${user.status}".`,
+        targetEntity: `${userRow.name} (${userRow.email})`,
+        details: `Blocked login attempt for ${userRow.email}: account status is "${userRow.status}".`,
       });
       res.status(403).json({
         error: 'Your access request was not approved. Please contact a System Administrator.',
@@ -2106,6 +2157,7 @@ async function startServer() {
       return;
     }
 
+    const user = serializePublicUser(userRow);
     const sid = registerActiveSession(user.id);
     const payload: AuthPayload = {
       id: user.id,
@@ -2114,6 +2166,7 @@ async function startServer() {
       role: user.role,
       department: user.department,
       sid,
+      tv: Number(userRow.token_version ?? 1),
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
@@ -2124,22 +2177,12 @@ async function startServer() {
       pageVisited: 'Login Gate',
       actionTaken: 'LOGIN_SUCCESS',
       targetEntity: `${user.name} (${user.email})`,
-      details: `${user.name} (${user.email}) signed in as ${user.role}.`,
+      details: `${user.name} (${user.email}) signed in as ${user.role} (2FA: ${user.two_fa_enabled ? `Enabled · ${user.two_fa_method}` : 'Disabled'}).`,
     });
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        department: user.department,
-        status: user.status,
-        approved_by: user.approved_by,
-        approved_at: user.approved_at,
-        created_at: user.created_at,
-      },
+      user,
     });
   });
 
@@ -2203,14 +2246,14 @@ async function startServer() {
   });
 
   app.get('/api/users', requireAuth, requireRole('administrator'), (_req: AuthedRequest, res: Response) => {
-    const users = db
+    const rows = db
       .prepare(
-        `SELECT id, name, email, role, department, status, approved_by, approved_at, created_at
+        `SELECT ${PUBLIC_USER_SELECT}
          FROM users
          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, id ASC`
       )
-      .all();
-    res.json({ users });
+      .all() as Array<Record<string, unknown>>;
+    res.json({ users: rows.map(serializePublicUser) });
   });
 
   app.post('/api/users', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
@@ -2248,15 +2291,13 @@ async function startServer() {
       pageVisited: 'Team & Access Management',
       actionTaken: 'CREATE_USER',
       targetEntity: `${name} (${email})`,
-      details: `Created & approved ${role} account for ${name} (${email}, ${department}). Approved by ${approvedBy}.`,
+      details: `Created & approved ${role} account for ${name} (${email}, ${department}). Approved by ${approvedBy}. 2FA enabled & locked (EMAIL_OTP).`,
     });
 
-    const created = db
-      .prepare(
-        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-      )
-      .get(info.lastInsertRowid);
-    res.status(201).json({ user: created });
+    const createdRow = db
+      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+      .get(info.lastInsertRowid) as Record<string, unknown>;
+    res.status(201).json({ user: serializePublicUser(createdRow) });
   });
 
   app.patch(
@@ -2310,12 +2351,10 @@ async function startServer() {
         details: `Approved staff account for ${target.name} (${target.email}) from status "${target.status}" to "approved" with assigned role "${assignedRole}" (${assignedDepartment}). Approved by ${approvedBy}.`,
       });
 
-      const updated = db
-        .prepare(
-          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-        )
-        .get(targetId);
-      res.json({ user: updated });
+      const updatedRow = db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get(targetId) as Record<string, unknown>;
+      res.json({ user: serializePublicUser(updatedRow) });
     }
   );
 
@@ -2366,7 +2405,7 @@ async function startServer() {
 
       db.prepare(
         `UPDATE users
-         SET status = 'rejected', approved_by = ?, approved_at = ?, last_active_at = ''
+         SET status = 'rejected', approved_by = ?, approved_at = ?, last_active_at = '', token_version = COALESCE(token_version, 1) + 1
          WHERE id = ?`
       ).run(`Rejected by ${reviewedBy}`, reviewedAt, targetId);
 
@@ -2386,16 +2425,27 @@ async function startServer() {
         details: `Rejected/suspended ${target.role} account ${target.name} (${target.email}) (previous status: "${target.status}")${reason ? `. Reason: ${reason}` : ''}.`,
       });
 
-      const updated = db
-        .prepare(
-          'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-        )
-        .get(targetId);
-      res.json({ user: updated });
+      const updatedRow = db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get(targetId) as Record<string, unknown>;
+      res.json({ user: serializePublicUser(updatedRow) });
     }
   );
 
   app.patch('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
+    if (
+      req.body &&
+      ('two_fa_enabled' in req.body ||
+        'two_fa_method' in req.body ||
+        'two_fa_change_status' in req.body)
+    ) {
+      res.status(403).json({
+        error:
+          '2FA authentication settings are locked and cannot be changed without System Administrator approval via password re-verification.',
+      });
+      return;
+    }
+
     const targetId = Number(req.params.id);
     const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
     const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
@@ -2430,13 +2480,643 @@ async function startServer() {
       details: `Updated access role for ${target.email} from ${target.role} to ${role} (${department}).`,
     });
 
-    const updated = db
-      .prepare(
-        'SELECT id, name, email, role, department, status, approved_by, approved_at, created_at FROM users WHERE id = ?'
-      )
-      .get(targetId);
-    res.json({ user: updated });
+    const updatedRow = db
+      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+      .get(targetId) as Record<string, unknown>;
+    res.json({ user: serializePublicUser(updatedRow) });
   });
+
+  // ===========================================================================
+  // 1B. 2FA AUTHENTICATION LOCK & ADMINISTRATOR DANGER ZONE GOVERNANCE
+  // ===========================================================================
+  function verifyAdminPassword(adminId: number, suppliedPassword: string): boolean {
+    if (!suppliedPassword) return false;
+    const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(adminId) as
+      | { password_hash: string }
+      | undefined;
+    if (!row || !row.password_hash) return false;
+    return bcrypt.compareSync(suppliedPassword, row.password_hash);
+  }
+
+  const REJECTED_CANDIDATE_STATUS_SQL = `LOWER(status) IN ('rejected', 'withdrawn', 'rejected_screening', 'rejected_post_interview', 'offer_rejected', 'not_qualified')`;
+
+  function computeDangerZoneStats() {
+    const totalCandidates = (
+      db.prepare('SELECT COUNT(*) as count FROM candidates').get() as { count: number }
+    ).count;
+    const rejectedOrWithdrawn = (
+      db
+        .prepare(`SELECT COUNT(*) as count FROM candidates WHERE ${REJECTED_CANDIDATE_STATUS_SQL}`)
+        .get() as { count: number }
+    ).count;
+
+    const dbDocumentRecords = (
+      db
+        .prepare(`SELECT COUNT(*) as count FROM candidate_documents WHERE file_path != ''`)
+        .get() as { count: number }
+    ).count;
+
+    let filesOnDisk = 0;
+    let totalDiskBytes = 0;
+    try {
+      const entries = fs.readdirSync(UPLOADS_ROOT);
+      for (const entry of entries) {
+        if (entry.startsWith('.')) continue;
+        const full = path.join(UPLOADS_ROOT, entry);
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isFile()) {
+            filesOnDisk += 1;
+            totalDiskBytes += stat.size;
+          }
+        } catch {
+          // ignore transient stat errors
+        }
+      }
+    } catch {
+      filesOnDisk = 0;
+      totalDiskBytes = 0;
+    }
+
+    const rejectedDocFiles = db
+      .prepare(`
+        SELECT DISTINCT cd.file_path AS fp
+        FROM candidate_documents cd
+        JOIN candidates c ON c.id = cd.candidate_id
+        WHERE cd.file_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
+        UNION
+        SELECT DISTINCT o.offer_letter_path AS fp
+        FROM offers o
+        JOIN candidates c ON c.id = o.candidate_id
+        WHERE o.offer_letter_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
+      `)
+      .all() as Array<{ fp: string }>;
+
+    const todayMyt = getMalaysiaDateStamp(new Date());
+    const totalSlots = (
+      db.prepare('SELECT COUNT(*) as count FROM interview_slots').get() as { count: number }
+    ).count;
+    const activeSlots = (
+      db.prepare(`SELECT COUNT(*) as count FROM interview_slots WHERE status = 'ACTIVE'`).get() as {
+        count: number;
+      }
+    ).count;
+    const bookedSlots = (
+      db
+        .prepare(
+          `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+        )
+        .get() as { count: number }
+    ).count;
+    const unbookedFutureSlots = (
+      db
+        .prepare(
+          `SELECT COUNT(*) as count FROM interview_slots WHERE date >= ? AND booked_count = 0 AND id NOT IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+        )
+        .get(todayMyt) as { count: number }
+    ).count;
+    const totalBookings = (
+      db.prepare('SELECT COUNT(*) as count FROM interview_bookings').get() as { count: number }
+    ).count;
+    const confirmedBookings = (
+      db
+        .prepare(`SELECT COUNT(*) as count FROM interview_bookings WHERE status = 'CONFIRMED'`)
+        .get() as { count: number }
+    ).count;
+
+    const totalUsers = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+    const approvedUsers = (
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'approved'`).get() as { count: number }
+    ).count;
+    const pendingUsers = (
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'pending'`).get() as { count: number }
+    ).count;
+    const rejectedOrLockedUsers = (
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'rejected'`).get() as { count: number }
+    ).count;
+    const twoFaLockedUsers = (
+      db
+        .prepare(`SELECT COUNT(*) as count FROM users WHERE two_fa_change_status = 'locked' AND two_fa_enabled = 1`)
+        .get() as { count: number }
+    ).count;
+    const pendingTwoFaRows = db
+      .prepare(
+        `SELECT ${PUBLIC_USER_SELECT} FROM users WHERE two_fa_change_status = 'pending_admin_approval' ORDER BY id ASC`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    const totalAuditEntries = (
+      db.prepare('SELECT COUNT(*) as count FROM audit_logs').get() as { count: number }
+    ).count;
+    const triggerRows = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_logs' ORDER BY name ASC`)
+      .all() as Array<{ name: string }>;
+    const triggers = triggerRows.map((t) => t.name);
+
+    return {
+      candidates: {
+        total: totalCandidates,
+        active: Math.max(0, totalCandidates - rejectedOrWithdrawn),
+        rejectedOrWithdrawn,
+      },
+      files: {
+        dbDocumentRecords,
+        filesOnDisk,
+        totalDiskBytes,
+        rejectedCandidateFiles: rejectedDocFiles.length,
+      },
+      interviews: {
+        totalSlots,
+        activeSlots,
+        bookedSlots,
+        unbookedFutureSlots,
+        totalBookings,
+        confirmedBookings,
+      },
+      users: {
+        totalUsers,
+        approvedUsers,
+        pendingUsers,
+        rejectedOrLockedUsers,
+        twoFaLockedUsers,
+        pendingTwoFaRequests: pendingTwoFaRows.length,
+      },
+      auditLogs: {
+        totalEntries: totalAuditEntries,
+        immutableProtected:
+          triggers.includes('prevent_audit_log_delete') && triggers.includes('prevent_audit_log_update'),
+        triggers,
+      },
+      pendingTwoFaUsers: pendingTwoFaRows.map(serializePublicUser),
+    };
+  }
+
+  // Strictly block ANY direct self-service 2FA modification/disable/reset without System Administrator approval
+  const blockDirectTwoFaChange = (req: AuthedRequest, res: Response) => {
+    const pageVisited = String(req.headers['x-page-visited'] || 'User Profile & 2FA Settings').trim();
+    logAudit({
+      req,
+      actor: req.user,
+      pageVisited,
+      actionTaken: '2FA_CHANGE_BLOCKED',
+      targetEntity: req.user ? `${req.user.name} (${req.user.email})` : 'Unknown User',
+      details: `Blocked direct ${req.method} attempt to modify/disable 2FA settings without System Administrator approval.`,
+    });
+    res.status(403).json({
+      error: '2FA authentication settings are locked and cannot be changed without System Administrator approval',
+    });
+  };
+  app.patch('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
+  app.put('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
+  app.post('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
+  app.delete('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
+
+  // Formal 2FA change/reset request submitted by a logged-in user for System Administrator review
+  app.post('/api/users/me/request-2fa-change', requireAuth, (req: AuthedRequest, res: Response) => {
+    const requestedAction = String(req.body?.requested_action || '').trim().toUpperCase() as TwoFaRequestedAction;
+    const reason = String(req.body?.reason || '').trim();
+
+    if (!VALID_TWO_FA_ACTIONS.has(requestedAction)) {
+      res.status(400).json({
+        error:
+          'Invalid 2FA requested action. Choose RESET_2FA, DISABLE_2FA, ENABLE_2FA, SWITCH_TO_AUTHENTICATOR_APP, or SWITCH_TO_EMAIL_OTP.',
+      });
+      return;
+    }
+
+    if (reason.length < 5) {
+      res.status(400).json({
+        error: 'Please provide a brief reason (at least 5 characters) for your 2FA change request.',
+      });
+      return;
+    }
+
+    const requestPayload = JSON.stringify({
+      action: requestedAction,
+      reason: reason.slice(0, 400),
+      requested_at: formatAuditTimestamp(new Date()),
+    });
+
+    db.prepare(
+      `UPDATE users
+       SET two_fa_change_status = 'pending_admin_approval', two_fa_requested_state = ?
+       WHERE id = ?`
+    ).run(requestPayload, req.user!.id);
+
+    const pageVisited = String(req.headers['x-page-visited'] || 'User Profile & 2FA Settings').trim();
+    logAudit({
+      req,
+      actor: req.user,
+      pageVisited,
+      actionTaken: 'REQUEST_2FA_CHANGE',
+      targetEntity: `${req.user!.name} (${req.user!.email})`,
+      details: `Submitted formal 2FA change request (${requestedAction}) pending System Administrator approval. Reason: ${reason.slice(0, 300)}`,
+    });
+
+    const updatedRow = db
+      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+      .get(req.user!.id) as Record<string, unknown>;
+    res.status(200).json({
+      message:
+        'Your 2FA change request has been queued for System Administrator approval. Your current 2FA lock remains active until approved.',
+      user: serializePublicUser(updatedRow),
+    });
+  });
+
+  // Administrator-only 2FA approval/denial endpoint (requires Administrator role + current admin password re-verification)
+  app.patch(
+    '/api/admin/users/:id/2fa-approval',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const targetId = Number(req.params.id);
+      const decision = String(req.body?.decision || '').trim().toLowerCase();
+      const adminPassword = String(req.body?.admin_password || '');
+      const notes = String(req.body?.notes || '').trim().slice(0, 300);
+      const explicitAction = String(req.body?.requested_action || '').trim().toUpperCase();
+
+      if (decision !== 'approve' && decision !== 'deny') {
+        res.status(400).json({ error: 'Decision must be either "approve" or "deny".' });
+        return;
+      }
+
+      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+        logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Team & Access Management',
+          actionTaken: '2FA_APPROVAL_AUTH_FAILED',
+          targetEntity: `User #${targetId}`,
+          details: `Failed System Administrator password re-verification while attempting 2FA governance action ("${decision}") for user #${targetId}.`,
+        });
+        res.status(403).json({
+          error: 'Administrator password verification failed. Please re-enter your current password.',
+        });
+        return;
+      }
+
+      const targetRow = db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get(targetId) as Record<string, unknown> | undefined;
+
+      if (!targetRow) {
+        res.status(404).json({ error: 'Target user account not found.' });
+        return;
+      }
+
+      const target = serializePublicUser(targetRow);
+      const approverLabel = `${req.user!.name} (${req.user!.email})`;
+
+      // Parse pending requested action if present
+      let pendingAction: TwoFaRequestedAction | '' = '';
+      let pendingReason = '';
+      if (target.two_fa_requested_state) {
+        try {
+          const parsed = JSON.parse(target.two_fa_requested_state) as { action?: string; reason?: string };
+          if (parsed.action && VALID_TWO_FA_ACTIONS.has(parsed.action as TwoFaRequestedAction)) {
+            pendingAction = parsed.action as TwoFaRequestedAction;
+          }
+          pendingReason = String(parsed.reason || '');
+        } catch {
+          if (VALID_TWO_FA_ACTIONS.has(target.two_fa_requested_state as TwoFaRequestedAction)) {
+            pendingAction = target.two_fa_requested_state as TwoFaRequestedAction;
+          }
+        }
+      }
+
+      if (decision === 'deny') {
+        db.prepare(
+          `UPDATE users
+           SET two_fa_change_status = 'locked', two_fa_requested_state = ''
+           WHERE id = ?`
+        ).run(targetId);
+
+        logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Team & Access Management',
+          actionTaken: 'DENY_2FA_CHANGE',
+          targetEntity: `${target.name} (${target.email})`,
+          details: `Denied 2FA change request (${pendingAction || 'unspecified'}) for ${target.email}. Account remains locked on ${target.two_fa_enabled ? `Enabled (${target.two_fa_method})` : 'Disabled'}.${notes ? ` Admin notes: ${notes}` : ''}`,
+        });
+
+        const refreshed = db
+          .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+          .get(targetId) as Record<string, unknown>;
+        res.json({ user: serializePublicUser(refreshed), stats: computeDangerZoneStats() });
+        return;
+      }
+
+      // Approve and execute the 2FA state transition
+      const actionToApply = (
+        VALID_TWO_FA_ACTIONS.has(explicitAction as TwoFaRequestedAction) ? explicitAction : pendingAction
+      ) as TwoFaRequestedAction | '';
+
+      if (!actionToApply) {
+        res.status(400).json({
+          error: 'No valid pending 2FA request or requested_action provided for approval.',
+        });
+        return;
+      }
+
+      let nextEnabled = target.two_fa_enabled ? 1 : 0;
+      let nextMethod: TwoFaMethod = target.two_fa_method;
+      if (actionToApply === 'DISABLE_2FA') {
+        nextEnabled = 0;
+      } else if (actionToApply === 'ENABLE_2FA') {
+        nextEnabled = 1;
+      } else if (actionToApply === 'RESET_2FA') {
+        nextEnabled = 1;
+        nextMethod = 'EMAIL_OTP';
+      } else if (actionToApply === 'SWITCH_TO_AUTHENTICATOR_APP') {
+        nextEnabled = 1;
+        nextMethod = 'AUTHENTICATOR_APP';
+      } else if (actionToApply === 'SWITCH_TO_EMAIL_OTP') {
+        nextEnabled = 1;
+        nextMethod = 'EMAIL_OTP';
+      }
+
+      db.prepare(
+        `UPDATE users
+         SET two_fa_enabled = ?,
+             two_fa_method = ?,
+             two_fa_change_status = 'locked',
+             two_fa_requested_state = '',
+             two_fa_approved_by = ?
+         WHERE id = ?`
+      ).run(nextEnabled, nextMethod, approverLabel, targetId);
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'APPROVE_2FA_CHANGE',
+        targetEntity: `${target.name} (${target.email})`,
+        details: `Approved & executed 2FA change (${actionToApply}) for ${target.email} by ${approverLabel}. Previous: ${target.two_fa_enabled ? `Enabled (${target.two_fa_method})` : 'Disabled'} -> New: ${nextEnabled ? `Enabled (${nextMethod})` : 'Disabled'} (re-locked).${pendingReason ? ` Request reason: "${pendingReason}".` : ''}${notes ? ` Admin notes: ${notes}` : ''}`,
+      });
+
+      const refreshed = db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get(targetId) as Record<string, unknown>;
+      res.json({ user: serializePublicUser(refreshed), stats: computeDangerZoneStats() });
+    }
+  );
+
+  // ===========================================================================
+  // 1C. REAL-DATA DANGER ZONE ROUTES (SYSTEM ADMINISTRATOR ONLY)
+  // ===========================================================================
+  app.get(
+    '/api/admin/danger-zone/stats',
+    requireAuth,
+    requireRole('administrator'),
+    (_req: AuthedRequest, res: Response) => {
+      res.json({ stats: computeDangerZoneStats() });
+    }
+  );
+
+  // Explicit guard confirming audit_logs can never be purged even from the Danger Zone
+  const rejectDangerZoneAuditPurge = (req: AuthedRequest, res: Response) => {
+    logAudit({
+      req,
+      actor: req.user,
+      pageVisited: 'Team & Access Management',
+      actionTaken: 'DANGER_AUDIT_PURGE_BLOCKED',
+      targetEntity: 'audit_logs',
+      details:
+        'Blocked attempt to purge audit_logs from Danger Zone. Protected by SQLite triggers prevent_audit_log_delete and prevent_audit_log_update.',
+    });
+    res.status(403).json({
+      error:
+        'Audit logs are protected by SQLite immutability triggers (prevent_audit_log_delete, prevent_audit_log_update) and can never be purged.',
+    });
+  };
+  app.delete('/api/admin/danger-zone/audit-logs', requireAuth, requireRole('administrator'), rejectDangerZoneAuditPurge);
+  app.post('/api/admin/danger-zone/purge-audit-logs', requireAuth, requireRole('administrator'), rejectDangerZoneAuditPurge);
+
+  // Danger Zone Action 1: Purge Rejected / Withdrawn Candidate Data (PDPA Retention Cleanup)
+  app.post(
+    '/api/admin/danger-zone/purge-rejected-candidates',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const adminPassword = String(req.body?.admin_password || '');
+      const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
+
+      if (confirmationPhrase !== 'PURGE REJECTED CANDIDATES') {
+        res.status(400).json({
+          error: 'Confirmation phrase mismatch. Type exactly: PURGE REJECTED CANDIDATES',
+        });
+        return;
+      }
+
+      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+        res.status(403).json({
+          error: 'Administrator password verification failed. Action aborted.',
+        });
+        return;
+      }
+
+      const txResult = db.transaction(() => {
+        const targets = db
+          .prepare(`SELECT id, candidate_code, full_name, status FROM candidates WHERE ${REJECTED_CANDIDATE_STATUS_SQL}`)
+          .all() as Array<{ id: number; candidate_code: string; full_name: string; status: string }>;
+
+        if (targets.length === 0) {
+          return {
+            purgedCandidates: 0,
+            candidateCodes: [] as string[],
+            candidateFiles: [] as string[],
+          };
+        }
+
+        const ids = targets.map((t) => t.id);
+        const placeholders = ids.map(() => '?').join(', ');
+
+        const docPaths = db
+          .prepare(`SELECT file_path FROM candidate_documents WHERE candidate_id IN (${placeholders}) AND file_path != ''`)
+          .all(...ids) as Array<{ file_path: string }>;
+        const offerPaths = db
+          .prepare(`SELECT offer_letter_path FROM offers WHERE candidate_id IN (${placeholders}) AND offer_letter_path != ''`)
+          .all(...ids) as Array<{ offer_letter_path: string }>;
+
+        // Release any active confirmed slot counts if a rejected candidate somehow still held one
+        const activeBookings = db
+          .prepare(`SELECT slot_id FROM interview_bookings WHERE candidate_id IN (${placeholders}) AND status = 'CONFIRMED'`)
+          .all(...ids) as Array<{ slot_id: number }>;
+        for (const b of activeBookings) {
+          db.prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?').run(b.slot_id);
+        }
+
+        db.prepare(`DELETE FROM candidates WHERE id IN (${placeholders})`).run(...ids);
+
+        const candidateFiles = Array.from(
+          new Set([
+            ...docPaths.map((d) => path.basename(d.file_path)),
+            ...offerPaths.map((o) => path.basename(o.offer_letter_path)),
+          ].filter(Boolean))
+        );
+
+        return {
+          purgedCandidates: targets.length,
+          candidateCodes: targets.map((t) => `${t.full_name} (${t.candidate_code})`),
+          candidateFiles,
+        };
+      })();
+
+      // Remove physical files from uploads/ only if no remaining record references them
+      let removedFiles = 0;
+      for (const fileName of txResult.candidateFiles) {
+        const stillReferencedDoc = db
+          .prepare('SELECT id FROM candidate_documents WHERE file_path = ? LIMIT 1')
+          .get(fileName);
+        const stillReferencedOffer = db
+          .prepare('SELECT id FROM offers WHERE offer_letter_path = ? LIMIT 1')
+          .get(fileName);
+        if (stillReferencedDoc || stillReferencedOffer) continue;
+
+        const diskPath = path.join(UPLOADS_ROOT, fileName);
+        try {
+          if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
+            fs.unlinkSync(diskPath);
+            removedFiles += 1;
+          }
+        } catch {
+          // continue removing remaining files
+        }
+      }
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'DANGER_PURGE_REJECTED_CANDIDATES',
+        targetEntity: `${txResult.purgedCandidates} rejected/withdrawn candidate(s)`,
+        details: `PDPA Retention Cleanup executed via Danger Zone: purged ${txResult.purgedCandidates} rejected/withdrawn candidate record(s) and deleted ${removedFiles} physical file(s) from uploads/. Active pipeline candidates and immutable audit_logs preserved.${
+          txResult.candidateCodes.length > 0
+            ? ` Purged: ${txResult.candidateCodes.slice(0, 15).join(', ')}${txResult.candidateCodes.length > 15 ? ' ...' : ''}.`
+            : ''
+        }`,
+      });
+
+      res.json({
+        purgedCandidates: txResult.purgedCandidates,
+        removedFiles,
+        stats: computeDangerZoneStats(),
+      });
+    }
+  );
+
+  // Danger Zone Action 2: Revoke All Active User Sessions (Force Global Logout via token_version increment)
+  app.post(
+    '/api/admin/danger-zone/revoke-all-sessions',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const adminPassword = String(req.body?.admin_password || '');
+      const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
+
+      if (confirmationPhrase !== 'REVOKE ALL SESSIONS') {
+        res.status(400).json({
+          error: 'Confirmation phrase mismatch. Type exactly: REVOKE ALL SESSIONS',
+        });
+        return;
+      }
+
+      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+        res.status(403).json({
+          error: 'Administrator password verification failed. Action aborted.',
+        });
+        return;
+      }
+
+      const info = db
+        .prepare(`UPDATE users SET token_version = COALESCE(token_version, 1) + 1, last_active_at = ''`)
+        .run();
+
+      for (const [sid, session] of sessionActivityMap.entries()) {
+        sessionActivityMap.set(sid, { ...session, revoked: true });
+      }
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'DANGER_REVOKE_ALL_SESSIONS',
+        targetEntity: `All Staff Sessions (${info.changes} account(s))`,
+        details: `Forced global logout executed via Danger Zone: incremented token_version across ${info.changes} user account(s) and revoked all active JWT sessions.`,
+      });
+
+      res.json({
+        revokedAccounts: info.changes,
+        forceReauth: true,
+      });
+    }
+  );
+
+  // Danger Zone Action 4: Reset Unbooked Future Interview Slots (Preserves Booked Candidate Interviews)
+  app.post(
+    '/api/admin/danger-zone/reset-interview-slots',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const adminPassword = String(req.body?.admin_password || '');
+      const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
+
+      if (confirmationPhrase !== 'RESET INTERVIEW SLOTS') {
+        res.status(400).json({
+          error: 'Confirmation phrase mismatch. Type exactly: RESET INTERVIEW SLOTS',
+        });
+        return;
+      }
+
+      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+        res.status(403).json({
+          error: 'Administrator password verification failed. Action aborted.',
+        });
+        return;
+      }
+
+      const todayMyt = getMalaysiaDateStamp(new Date());
+      const txResult = db.transaction(() => {
+        const deleteInfo = db
+          .prepare(
+            `DELETE FROM interview_slots
+             WHERE date >= ?
+               AND booked_count = 0
+               AND id NOT IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+          )
+          .run(todayMyt);
+
+        const preservedBookedSlots = (
+          db
+            .prepare(
+              `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+            )
+            .get() as { count: number }
+        ).count;
+
+        return {
+          deletedSlots: deleteInfo.changes,
+          preservedBookedSlots,
+        };
+      })();
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'DANGER_RESET_INTERVIEW_SLOTS',
+        targetEntity: `${txResult.deletedSlots} unbooked future slot(s)`,
+        details: `Reset unbooked future interview slots (from ${todayMyt} MYT onward) via Danger Zone: deleted ${txResult.deletedSlots} unbooked slot(s) while preserving ${txResult.preservedBookedSlots} booked candidate interview slot(s).`,
+      });
+
+      res.json({
+        deletedSlots: txResult.deletedSlots,
+        preservedBookedSlots: txResult.preservedBookedSlots,
+        stats: computeDangerZoneStats(),
+      });
+    }
+  );
 
   app.delete('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const targetId = Number(req.params.id);

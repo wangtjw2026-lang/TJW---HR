@@ -22,6 +22,7 @@ import {
   Users,
   XCircle,
 } from 'lucide-react';
+import { DangerZoneGovernancePanel } from './DangerZoneGovernancePanel';
 import {
   approveStaffUser,
   createStaffUser,
@@ -96,7 +97,10 @@ function getActionToneClass(action: string): string {
     upper.includes('DELETE') ||
     upper.includes('CANCEL') ||
     upper.includes('REJECT') ||
-    upper.includes('AUTO_LOGOUT_IDLE')
+    upper.includes('AUTO_LOGOUT_IDLE') ||
+    upper.includes('BLOCKED') ||
+    upper.includes('DENY_') ||
+    upper.startsWith('DANGER_')
   ) {
     return 'text-[#B91C1C]';
   }
@@ -104,6 +108,7 @@ function getActionToneClass(action: string): string {
     upper.includes('CREATE') ||
     upper.includes('APPROVE') ||
     upper.includes('REGISTER_ACCESS') ||
+    upper.includes('REQUEST_2FA') ||
     upper.includes('ISSUE_OFFER') ||
     upper.includes('AI_RESUME') ||
     upper.includes('EXPORT')
@@ -139,6 +144,7 @@ interface CommunicationsAndAuditViewProps {
   currentUser: StaffUser;
   onRefresh: () => Promise<void> | void;
   onNotify: (message: string) => void;
+  onForceGlobalLogout?: (notice: string) => void;
 }
 
 export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProps> = ({
@@ -150,6 +156,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   currentUser,
   onRefresh,
   onNotify,
+  onForceGlobalLogout,
 }) => {
   const isAdmin = currentUser.role === 'administrator';
 
@@ -959,23 +966,36 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                         {ROLE_META[effectiveRole].accessLimits}
                       </td>
 
-                      <td className="px-4 py-3 align-top whitespace-nowrap">
-                        {u.status === 'approved' ? (
-                          <span className="inline-flex items-center gap-1 font-semibold text-[#15803D]">
-                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                            <span>Approved</span>
-                          </span>
-                        ) : u.status === 'pending' ? (
-                          <span className="inline-flex items-center gap-1 font-semibold text-[#B45309]">
-                            <Clock className="h-3.5 w-3.5 shrink-0" />
-                            <span>Pending</span>
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 font-semibold text-[#DC2626]">
-                            <XCircle className="h-3.5 w-3.5 shrink-0" />
-                            <span>Rejected</span>
-                          </span>
-                        )}
+                      <td className="px-4 py-3 align-top whitespace-nowrap space-y-1">
+                        <div>
+                          {u.status === 'approved' ? (
+                            <span className="inline-flex items-center gap-1 font-semibold text-[#15803D]">
+                              <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                              <span>Approved</span>
+                            </span>
+                          ) : u.status === 'pending' ? (
+                            <span className="inline-flex items-center gap-1 font-semibold text-[#B45309]">
+                              <Clock className="h-3.5 w-3.5 shrink-0" />
+                              <span>Pending</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 font-semibold text-[#DC2626]">
+                              <XCircle className="h-3.5 w-3.5 shrink-0" />
+                              <span>Rejected</span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="font-mono text-[10px]">
+                          {u.two_fa_change_status === 'pending_admin_approval' ? (
+                            <span className="text-[#B45309] font-semibold">
+                              2FA Change Pending
+                            </span>
+                          ) : (
+                            <span className="text-[#64748B]">
+                              2FA {u.two_fa_enabled ? `Locked · ${u.two_fa_method}` : 'Disabled (Locked)'}
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       <td className="px-4 py-3 align-top text-[11px] text-[#334155]">
@@ -983,6 +1003,11 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                           <span className="text-[#94A3B8]">Awaiting Admin</span>
                         ) : (
                           <span className="font-medium">{u.approved_by || 'Initial System Setup'}</span>
+                        )}
+                        {u.two_fa_approved_by && (
+                          <div className="text-[10px] text-[#64748B] mt-0.5">
+                            2FA: {u.two_fa_approved_by}
+                          </div>
                         )}
                       </td>
 
@@ -1082,6 +1107,19 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
             </table>
           </div>
         </div>
+
+        {/* Dedicated High-Security Danger Zone & 2FA Governance (Administrator ONLY) */}
+        {isAdmin && (
+          <DangerZoneGovernancePanel
+            currentUser={currentUser}
+            staffUsers={staffUsers}
+            onRefreshWorkspace={onRefresh}
+            onNotify={onNotify}
+            onForceGlobalLogout={(notice) => {
+              onForceGlobalLogout?.(notice);
+            }}
+          />
+        )}
       </div>
     );
   }

@@ -43,6 +43,21 @@ export type InterviewMode =
 
 export type UserApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+export type TwoFaMethod = 'EMAIL_OTP' | 'AUTHENTICATOR_APP';
+export type TwoFaChangeStatus = 'locked' | 'pending_admin_approval';
+export type TwoFaRequestedAction =
+  | 'RESET_2FA'
+  | 'DISABLE_2FA'
+  | 'ENABLE_2FA'
+  | 'SWITCH_TO_AUTHENTICATOR_APP'
+  | 'SWITCH_TO_EMAIL_OTP';
+
+export interface TwoFaRequestedPayload {
+  action: TwoFaRequestedAction;
+  reason: string;
+  requested_at: string;
+}
+
 export interface StaffUser {
   id: number;
   name: string;
@@ -52,7 +67,48 @@ export interface StaffUser {
   status: UserApprovalStatus;
   approved_by: string;
   approved_at: string;
+  two_fa_enabled: boolean;
+  two_fa_method: TwoFaMethod;
+  two_fa_change_status: TwoFaChangeStatus;
+  two_fa_requested_state: string;
+  two_fa_approved_by: string;
   created_at?: string;
+}
+
+export interface DangerZoneStats {
+  candidates: {
+    total: number;
+    active: number;
+    rejectedOrWithdrawn: number;
+  };
+  files: {
+    dbDocumentRecords: number;
+    filesOnDisk: number;
+    totalDiskBytes: number;
+    rejectedCandidateFiles: number;
+  };
+  interviews: {
+    totalSlots: number;
+    activeSlots: number;
+    bookedSlots: number;
+    unbookedFutureSlots: number;
+    totalBookings: number;
+    confirmedBookings: number;
+  };
+  users: {
+    totalUsers: number;
+    approvedUsers: number;
+    pendingUsers: number;
+    rejectedOrLockedUsers: number;
+    twoFaLockedUsers: number;
+    pendingTwoFaRequests: number;
+  };
+  auditLogs: {
+    totalEntries: number;
+    immutableProtected: boolean;
+    triggers: string[];
+  };
+  pendingTwoFaUsers: StaffUser[];
 }
 
 export type AiDocumentVerificationStatus =

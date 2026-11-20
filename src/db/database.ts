@@ -243,6 +243,12 @@ export function initializeDatabase() {
       approved_by TEXT NOT NULL DEFAULT '',
       approved_at TEXT NOT NULL DEFAULT '',
       last_active_at TEXT NOT NULL DEFAULT '',
+      two_fa_enabled INTEGER NOT NULL DEFAULT 1,
+      two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP',
+      two_fa_change_status TEXT NOT NULL DEFAULT 'locked' CHECK(two_fa_change_status IN ('locked', 'pending_admin_approval')),
+      two_fa_requested_state TEXT NOT NULL DEFAULT '',
+      two_fa_approved_by TEXT NOT NULL DEFAULT '',
+      token_version INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -367,22 +373,37 @@ export function initializeDatabase() {
 
 function ensureUsersSecurityColumns() {
   const columns = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
-  const hasStatus = columns.some((c) => c.name === 'status');
-  const hasApprovedBy = columns.some((c) => c.name === 'approved_by');
-  const hasApprovedAt = columns.some((c) => c.name === 'approved_at');
-  const hasLastActiveAt = columns.some((c) => c.name === 'last_active_at');
+  const colNames = new Set(columns.map((c) => c.name));
 
-  if (!hasStatus) {
+  if (!colNames.has('status')) {
     db.exec(`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'`);
   }
-  if (!hasApprovedBy) {
+  if (!colNames.has('approved_by')) {
     db.exec(`ALTER TABLE users ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`);
   }
-  if (!hasApprovedAt) {
+  if (!colNames.has('approved_at')) {
     db.exec(`ALTER TABLE users ADD COLUMN approved_at TEXT NOT NULL DEFAULT ''`);
   }
-  if (!hasLastActiveAt) {
+  if (!colNames.has('last_active_at')) {
     db.exec(`ALTER TABLE users ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!colNames.has('two_fa_enabled')) {
+    db.exec(`ALTER TABLE users ADD COLUMN two_fa_enabled INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!colNames.has('two_fa_method')) {
+    db.exec(`ALTER TABLE users ADD COLUMN two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP'`);
+  }
+  if (!colNames.has('two_fa_change_status')) {
+    db.exec(`ALTER TABLE users ADD COLUMN two_fa_change_status TEXT NOT NULL DEFAULT 'locked'`);
+  }
+  if (!colNames.has('two_fa_requested_state')) {
+    db.exec(`ALTER TABLE users ADD COLUMN two_fa_requested_state TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!colNames.has('two_fa_approved_by')) {
+    db.exec(`ALTER TABLE users ADD COLUMN two_fa_approved_by TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!colNames.has('token_version')) {
+    db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1`);
   }
 
   // Backfill approval metadata for pre-existing initial admin/approved accounts only (zero dummy data)

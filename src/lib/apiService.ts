@@ -4,6 +4,7 @@ import {
   AuditLogsQueryResult,
   BookingStatus,
   CandidateRecord,
+  DangerZoneStats,
   DocType,
   EmailDeliveryResult,
   EmailLogRecord,
@@ -17,6 +18,7 @@ import {
   SmtpConfigStatus,
   StaffRole,
   StaffUser,
+  TwoFaRequestedAction,
 } from '../types/ats';
 
 const TOKEN_STORAGE_KEY = 'talentflow_my_jwt';
@@ -268,6 +270,81 @@ export async function updateStaffUser(id: number, role: StaffRole, department: s
 
 export async function deleteStaffUser(id: number): Promise<void> {
   await apiFetch(`/api/users/${id}`, { method: 'DELETE' });
+}
+
+// =============================================================================
+// 2FA GOVERNANCE & SYSTEM ADMINISTRATOR DANGER ZONE
+// =============================================================================
+export async function requestMyTwoFaChange(params: {
+  requested_action: TwoFaRequestedAction;
+  reason: string;
+}): Promise<{ message: string; user: StaffUser }> {
+  return apiFetch<{ message: string; user: StaffUser }>('/api/users/me/request-2fa-change', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function reviewUserTwoFaChange(
+  userId: number,
+  params: {
+    decision: 'approve' | 'deny';
+    admin_password: string;
+    requested_action?: TwoFaRequestedAction;
+    notes?: string;
+  }
+): Promise<{ user: StaffUser; stats: DangerZoneStats }> {
+  return apiFetch<{ user: StaffUser; stats: DangerZoneStats }>(
+    `/api/admin/users/${userId}/2fa-approval`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(params),
+    }
+  );
+}
+
+export async function fetchDangerZoneStats(): Promise<DangerZoneStats> {
+  const data = await apiFetch<{ stats: DangerZoneStats }>('/api/admin/danger-zone/stats');
+  return data.stats;
+}
+
+export async function purgeRejectedCandidates(params: {
+  admin_password: string;
+  confirmation_phrase: string;
+}): Promise<{ purgedCandidates: number; removedFiles: number; stats: DangerZoneStats }> {
+  return apiFetch<{ purgedCandidates: number; removedFiles: number; stats: DangerZoneStats }>(
+    '/api/admin/danger-zone/purge-rejected-candidates',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }
+  );
+}
+
+export async function revokeAllUserSessions(params: {
+  admin_password: string;
+  confirmation_phrase: string;
+}): Promise<{ revokedAccounts: number; forceReauth: boolean }> {
+  return apiFetch<{ revokedAccounts: number; forceReauth: boolean }>(
+    '/api/admin/danger-zone/revoke-all-sessions',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }
+  );
+}
+
+export async function resetUnbookedInterviewSlots(params: {
+  admin_password: string;
+  confirmation_phrase: string;
+}): Promise<{ deletedSlots: number; preservedBookedSlots: number; stats: DangerZoneStats }> {
+  return apiFetch<{ deletedSlots: number; preservedBookedSlots: number; stats: DangerZoneStats }>(
+    '/api/admin/danger-zone/reset-interview-slots',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }
+  );
 }
 
 // =============================================================================

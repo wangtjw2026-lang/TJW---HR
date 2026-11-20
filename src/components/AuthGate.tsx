@@ -7,6 +7,7 @@ import {
   Clock,
   FileCheck2,
   Loader2,
+  Lock,
   ShieldCheck,
   Sparkles,
   UserCheck,
@@ -212,10 +213,10 @@ export const AuthGate: React.FC<AuthGateProps> = ({
             <div className="space-y-1.5">
               <div className="flex items-center gap-2 text-sm font-semibold text-white">
                 <ShieldCheck className="w-4 h-4 text-teal-400 shrink-0" />
-                <span>Admin-Approved RBAC &amp; PDPA Session Lock</span>
+                <span>Admin-Approved RBAC, 2FA Lock &amp; PDPA Session Timeout</span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Administrator-approved staff onboarding, strict System Administrator vs Hiring Manager permissions, 10-minute idle auto-logout, and immutable audit trails.
+                Administrator-approved staff onboarding, locked 2FA governance (admin approval required to change), 10-minute idle auto-logout, and immutable SQLite audit trails.
               </p>
             </div>
           </div>
@@ -223,6 +224,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
 
         <div className="pt-10 mt-10 border-t border-slate-800 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-slate-400">
           <span>SQLite WAL Persistence</span>
+          <span aria-hidden="true">·</span>
+          <span>2FA Governance Lock</span>
           <span aria-hidden="true">·</span>
           <span>10-Min Idle PDPA Timeout</span>
           <span aria-hidden="true">·</span>
@@ -471,9 +474,15 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                   </div>
                 </div>
 
-                <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600 leading-relaxed">
-                  <span className="font-semibold text-slate-800">{ROLE_META[requestedRole].title}:</span>{' '}
-                  {ROLE_META[requestedRole].accessLimits}.
+                <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600 leading-relaxed space-y-1">
+                  <div>
+                    <span className="font-semibold text-slate-800">{ROLE_META[requestedRole].title}:</span>{' '}
+                    {ROLE_META[requestedRole].accessLimits}.
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-500 pt-1 border-t border-slate-100">
+                    <Lock className="w-3 h-3 text-teal-700 shrink-0" />
+                    <span>2FA (EMAIL_OTP) is enabled &amp; locked by default; only a System Administrator can approve changes.</span>
+                  </div>
                 </div>
 
                 <div>
@@ -587,16 +596,24 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                 </button>
               </form>
 
-              <div className="pt-4 border-t border-slate-200 flex items-center justify-between gap-2 text-xs">
-                <span className="text-slate-500">New HR or Hiring Manager staff?</span>
-                <button
-                  type="button"
-                  onClick={() => switchMode('request')}
-                  className="inline-flex items-center gap-1 font-semibold text-teal-700 hover:text-teal-800 cursor-pointer whitespace-nowrap"
-                >
-                  <UserPlus className="w-3.5 h-3.5" />
-                  <span>Request Staff Access</span>
-                </button>
+              <div className="pt-4 border-t border-slate-200 space-y-3 text-xs">
+                <div className="flex items-start gap-2 text-[11px] text-slate-500 leading-relaxed">
+                  <Lock className="w-3.5 h-3.5 text-teal-700 shrink-0 mt-0.5" />
+                  <span>
+                    All staff accounts have 2FA locked by policy. Any 2FA reset or change requires formal System Administrator approval.
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-500">New HR or Hiring Manager staff?</span>
+                  <button
+                    type="button"
+                    onClick={() => switchMode('request')}
+                    className="inline-flex items-center gap-1 font-semibold text-teal-700 hover:text-teal-800 cursor-pointer whitespace-nowrap"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>Request Staff Access</span>
+                  </button>
+                </div>
               </div>
             </>
           )}
