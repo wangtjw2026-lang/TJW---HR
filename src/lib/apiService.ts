@@ -1,5 +1,7 @@
 import {
+  AuditLogFilters,
   AuditLogRecord,
+  AuditLogsQueryResult,
   BookingStatus,
   CandidateRecord,
   DocType,
@@ -633,21 +635,112 @@ export async function portalRespondToOffer(
 }
 
 // =============================================================================
-// EMAIL LOGS & AUDIT LOGS
+// EMAIL LOGS & TAMPER-EVIDENT AUDIT LOGS
 // =============================================================================
 export async function fetchEmailLogs(): Promise<EmailLogRecord[]> {
   const data = await apiFetch<{ emailLogs: EmailLogRecord[] }>('/api/email-logs');
   return data.emailLogs;
 }
 
-export async function fetchAuditLogs(): Promise<AuditLogRecord[]> {
-  const data = await apiFetch<{ auditLogs: AuditLogRecord[] }>('/api/audit-logs');
-  return data.auditLogs;
+function buildAuditQueryString(filters?: Partial<AuditLogFilters>, limit?: number): string {
+  const params = new URLSearchParams();
+  if (filters?.search?.trim()) params.set('search', filters.search.trim());
+  if (filters?.actor?.trim()) params.set('actor', filters.actor.trim());
+  if (filters?.role?.trim()) params.set('role', filters.role.trim());
+  if (filters?.page_visited?.trim()) params.set('page_visited', filters.page_visited.trim());
+  if (filters?.action_taken?.trim()) params.set('action_taken', filters.action_taken.trim());
+  if (filters?.date_from?.trim()) params.set('date_from', filters.date_from.trim());
+  if (filters?.date_to?.trim()) params.set('date_to', filters.date_to.trim());
+  if (limit && Number.isFinite(limit)) params.set('limit', String(limit));
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
 }
 
-export async function logCsvExport(count: number): Promise<void> {
+export async function fetchAuditLogsWithMeta(
+  filters?: Partial<AuditLogFilters>,
+  limit = 500
+): Promise<AuditLogsQueryResult> {
+  const qs = buildAuditQueryString(filters, limit);
+  const data = await apiFetch<AuditLogsQueryResult>(`/api/audit-logs${qs}`);
+  return {
+    auditLogs: Array.isArray(data.auditLogs) ? data.auditLogs : [],
+    totalCount: Number(data.totalCount) || 0,
+    facets: {
+      actors: Array.isArray(data.facets?.actors) ? data.facets.actors : [],
+      pages: Array.isArray(data.facets?.pages) ? data.facets.pages : [],
+      actions: Array.isArray(data.facets?.actions) ? data.facets.actions : [],
+    },
+  };
+}
+
+export async function fetchAuditLogs(filters?: Partial<AuditLogFilters>): Promise<AuditLogRecord[]> {
+  const result = await fetchAuditLogsWithMeta(filters);
+  return result.auditLogs;
+}
+
+export async function logPageVisit(params: {
+  page_visited: string;
+  target_entity?: string;
+  details?: string;
+}): Promise<void> {
+  try {
+    await apiFetch('/api/audit-logs/page-visit', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  } catch {
+    // Non-blocking audit telemetry: never interrupt user navigation
+  }
+}
+
+export async function logCsvExport(count: number, filterSummary?: string): Promise<void> {
   await apiFetch('/api/audit-logs/export', {
     method: 'POST',
-    body: JSON.stringify({ count }),
+    body: JSON.stringify({
+      count,
+      filter_summary: filterSummary || '',
+    }),
   });
+}
+
+export async function downloadAuditLogCsv(filters?: Partial<AuditLogFilters>): Promise<string> {
+  const qs = buildAuditQueryString(filters);
+  const headers = new Headers();
+  const token = getStoredToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const res = await fetch(`/api/audit-logs/export${qs}`, {
+    method: 'GET',
+    headers,
+  });
+
+  if (!res.ok) {
+    let errMsg = `Export failed with status ${res.status}`;
+    try {
+      const text = await res.text();
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed?.error) errMsg = parsed.error;
+    } catch {
+      // use fallback status message
+    }
+    throw new Error(errMsg);
+  }
+
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const filename = match?.[1] || `TJW_HR_Audit_Trail_${new Date().toISOString().slice(0, 10)}.csv`;
+
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(objectUrl);
+
+  return filename;
 }

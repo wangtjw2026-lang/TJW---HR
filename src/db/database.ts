@@ -24,6 +24,212 @@ db.pragma('foreign_keys = ON');
 
 export const UPLOADS_ROOT = UPLOADS_DIR;
 
+export function formatAuditTimestamp(date: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || '00';
+  const myt = `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')} MYT`;
+  return `${myt} (${date.toISOString()})`;
+}
+
+export function getMalaysiaDateStamp(date: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || '00';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+function mapLegacyAuditRow(row: Record<string, unknown>) {
+  const legacyAction = String(row.action || 'SYSTEM_EVENT');
+  const legacyRole = String(row.actor_role || 'system');
+  const legacyTargetType = String(row.target_type || '');
+  const legacyCreated = String(row.created_at || '');
+
+  let parsedDate = new Date();
+  if (legacyCreated) {
+    const isoCandidate = legacyCreated.includes('T')
+      ? legacyCreated
+      : `${legacyCreated.replace(' ', 'T')}Z`;
+    const d = new Date(isoCandidate);
+    if (!Number.isNaN(d.getTime())) parsedDate = d;
+  }
+
+  const actorRole =
+    legacyRole === 'administrator' || legacyRole === 'manager'
+      ? legacyRole
+      : legacyRole.toUpperCase() === 'CANDIDATE' || legacyRole === 'candidate_portal'
+        ? 'candidate_portal'
+        : 'system';
+
+  const actionMap: Record<string, string> = {
+    INITIAL_ADMIN_CREATED: 'CREATE_USER',
+    STAFF_LOGIN: 'LOGIN_SUCCESS',
+    STAFF_USER_CREATED: 'CREATE_USER',
+    STAFF_USER_DELETED: 'DELETE_USER',
+    RBAC_ROLE_UPDATED: 'UPDATE_USER_ROLE',
+    CANDIDATE_REGISTERED: 'CREATE_CANDIDATE',
+    SCREENING_PROCEED: 'UPDATE_SCREENING_DECISION',
+    SCREENING_REJECT: 'UPDATE_SCREENING_DECISION',
+    SCREENING_PENDING: 'UPDATE_SCREENING_DECISION',
+    DOCS_CHECKLIST_UPDATED: 'VERIFY_DOCUMENT',
+    DOCUMENT_UPLOADED: 'UPLOAD_DOCUMENT',
+    PORTAL_DOCUMENT_UPLOADED: 'UPLOAD_DOCUMENT',
+    PORTAL_FORMS_COMPLETED: 'VERIFY_DOCUMENT',
+    QUALIFICATION_QUALIFIED: 'UPDATE_QUALIFICATION',
+    QUALIFICATION_NOT_QUALIFIED: 'UPDATE_QUALIFICATION',
+    QUALIFICATION_PENDING: 'UPDATE_QUALIFICATION',
+    INTERVIEW_SLOT_CREATED: 'CREATE_INTERVIEW_SLOT',
+    INTERVIEW_SLOT_BOOKED_ATOMIC: 'BOOK_INTERVIEW_SLOT',
+    PORTAL_SLOT_BOOKED_ATOMIC: 'BOOK_INTERVIEW_SLOT',
+    INTERVIEW_SLOT_CANCELLED: 'CANCEL_INTERVIEW',
+    INTERVIEW_SLOT_DELETED: 'CANCEL_INTERVIEW',
+    INTERVIEW_BOOKING_CANCELLED: 'CANCEL_INTERVIEW',
+    INTERVIEW_BOOKING_RESCHEDULED: 'RESCHEDULE_INTERVIEW',
+    INTERVIEW_BOOKING_COMPLETED: 'RECORD_INTERVIEW_FEEDBACK',
+    POST_INTERVIEW_OFFER: 'RECORD_INTERVIEW_FEEDBACK',
+    POST_INTERVIEW_REJECT: 'RECORD_INTERVIEW_FEEDBACK',
+    EMPLOYMENT_OFFER_SENT: 'ISSUE_OFFER',
+    DOCS_REMINDER_DISPATCHED: 'SEND_EMAIL',
+    BATCH_DOCS_REMINDER: 'SEND_EMAIL',
+    EXCEL_CSV_EXPORTED: 'EXPORT_REPORT',
+  };
+
+  const pageMap: Record<string, string> = {
+    auth: 'Login Gate',
+    rbac: 'Team & Access Management',
+    candidate: 'Candidate Detail Drawer',
+    document: actorRole === 'candidate_portal' ? 'Candidate Self-Service Portal' : 'Candidate Detail Drawer',
+    interview_slot: actorRole === 'candidate_portal' ? 'Candidate Self-Service Portal' : 'Interview Calendar',
+    offer: actorRole === 'candidate_portal' ? 'Candidate Self-Service Portal' : 'Candidate Detail Drawer',
+    export: 'Candidate Database',
+  };
+
+  return {
+    timestamp: formatAuditTimestamp(parsedDate),
+    actor_id: row.actor_id !== null && row.actor_id !== undefined ? Number(row.actor_id) : null,
+    actor_name: String(row.actor_email || 'System'),
+    actor_role: actorRole,
+    page_visited: pageMap[legacyTargetType] || 'Pipeline Dashboard',
+    action_taken: actionMap[legacyAction] || legacyAction,
+    target_entity: String(row.target_id || ''),
+    details: String(row.details || ''),
+    ip_address: '',
+    user_agent: '',
+  };
+}
+
+function ensureImmutableAuditLogsTable() {
+  const columns = db.prepare(`PRAGMA table_info(audit_logs)`).all() as Array<{ name: string }>;
+  const hasNewSchema =
+    columns.some((c) => c.name === 'timestamp') &&
+    columns.some((c) => c.name === 'page_visited') &&
+    columns.some((c) => c.name === 'action_taken') &&
+    columns.some((c) => c.name === 'ip_address');
+
+  if (columns.length > 0 && !hasNewSchema) {
+    // One-time atomic migration from legacy audit_logs schema preserving existing real records
+    const migrate = db.transaction(() => {
+      db.exec(`
+        DROP TRIGGER IF EXISTS prevent_audit_log_delete;
+        DROP TRIGGER IF EXISTS prevent_audit_log_update;
+        ALTER TABLE audit_logs RENAME TO audit_logs_legacy;
+
+        CREATE TABLE audit_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp TEXT NOT NULL,
+          actor_id INTEGER,
+          actor_name TEXT NOT NULL,
+          actor_role TEXT NOT NULL CHECK(actor_role IN ('administrator', 'manager', 'candidate_portal', 'system')),
+          page_visited TEXT NOT NULL,
+          action_taken TEXT NOT NULL,
+          target_entity TEXT NOT NULL DEFAULT '',
+          details TEXT NOT NULL,
+          ip_address TEXT NOT NULL DEFAULT '',
+          user_agent TEXT NOT NULL DEFAULT ''
+        );
+      `);
+
+      const legacyRows = db
+        .prepare('SELECT * FROM audit_logs_legacy ORDER BY id ASC')
+        .all() as Array<Record<string, unknown>>;
+
+      const insertStmt = db.prepare(`
+        INSERT INTO audit_logs (
+          timestamp, actor_id, actor_name, actor_role, page_visited,
+          action_taken, target_entity, details, ip_address, user_agent
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const r of legacyRows) {
+        const mapped = mapLegacyAuditRow(r);
+        insertStmt.run(
+          mapped.timestamp,
+          mapped.actor_id,
+          mapped.actor_name,
+          mapped.actor_role,
+          mapped.page_visited,
+          mapped.action_taken,
+          mapped.target_entity,
+          mapped.details,
+          mapped.ip_address,
+          mapped.user_agent
+        );
+      }
+
+      db.exec('DROP TABLE audit_logs_legacy;');
+    });
+    migrate();
+  } else if (columns.length === 0) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        actor_id INTEGER,
+        actor_name TEXT NOT NULL,
+        actor_role TEXT NOT NULL CHECK(actor_role IN ('administrator', 'manager', 'candidate_portal', 'system')),
+        page_visited TEXT NOT NULL,
+        action_taken TEXT NOT NULL,
+        target_entity TEXT NOT NULL DEFAULT '',
+        details TEXT NOT NULL,
+        ip_address TEXT NOT NULL DEFAULT '',
+        user_agent TEXT NOT NULL DEFAULT ''
+      );
+    `);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_role ON audit_logs(actor_role);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action_taken);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_page ON audit_logs(page_visited);
+
+    CREATE TRIGGER IF NOT EXISTS prevent_audit_log_delete
+    BEFORE DELETE ON audit_logs
+    BEGIN
+      SELECT RAISE(ABORT, 'Audit logs cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS prevent_audit_log_update
+    BEFORE UPDATE ON audit_logs
+    BEGIN
+      SELECT RAISE(ABORT, 'Audit logs cannot be modified');
+    END;
+  `);
+}
+
 export function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -143,19 +349,9 @@ export function initializeDatabase() {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE SET NULL
     );
-
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      actor_id INTEGER,
-      actor_email TEXT NOT NULL,
-      actor_role TEXT NOT NULL,
-      action TEXT NOT NULL,
-      target_type TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      details TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
   `);
+
+  ensureImmutableAuditLogsTable();
 }
 
 export function generatePortalToken(): string {

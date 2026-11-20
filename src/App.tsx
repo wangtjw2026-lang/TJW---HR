@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   CheckCircle2,
@@ -32,6 +32,7 @@ import {
   fetchStaffUsers,
   getStoredToken,
   logCsvExport,
+  logPageVisit,
   logoutStaff,
   sendBatchDocReminders,
 } from './lib/apiService';
@@ -48,6 +49,16 @@ import {
 } from './types/ats';
 
 type NavTab = 'dashboard' | 'candidates' | 'interviews' | 'portal' | 'emails' | 'team' | 'audit';
+
+const TAB_PAGE_NAMES: Record<NavTab, string> = {
+  dashboard: 'Pipeline Dashboard',
+  candidates: 'Candidate Database',
+  interviews: 'Interview Calendar',
+  portal: 'Candidate Self-Service Portal',
+  emails: 'Email Automation & Audit Trail',
+  team: 'Team & Access Management',
+  audit: 'Email Automation & Audit Trail',
+};
 
 const EMPTY_FILTERS: CandidateFilters = {
   search: '',
@@ -90,6 +101,10 @@ export default function App() {
   const [selectedCandidateId, setSelectedCandidateId] = useState<number | null>(null);
   const [portalPreviewCandidateId, setPortalPreviewCandidateId] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  const lastTabVisitKeyRef = useRef<string>('');
+  const lastModalVisitKeyRef = useRef<string>('');
+  const lastDrawerVisitKeyRef = useRef<string>('');
 
   const isAdmin = staffUser?.role === 'administrator';
 
@@ -160,6 +175,70 @@ export default function App() {
     }
   }, [staffUser, publicPortalToken, refreshWorkspace, activeTab]);
 
+  // Automatic page-view audit logging when authenticated staff navigates views
+  useEffect(() => {
+    if (!staffUser || publicPortalToken) {
+      lastTabVisitKeyRef.current = '';
+      return;
+    }
+    if (staffUser.role !== 'administrator' && activeTab === 'team') return;
+
+    const visitKey = `${staffUser.id}:${activeTab}`;
+    if (lastTabVisitKeyRef.current === visitKey) return;
+    lastTabVisitKeyRef.current = visitKey;
+
+    const pageVisited = TAB_PAGE_NAMES[activeTab];
+    const subView =
+      activeTab === 'emails'
+        ? 'Email Automation Log'
+        : activeTab === 'audit'
+          ? 'User Activity Audit Trail'
+          : pageVisited;
+
+    void logPageVisit({
+      page_visited: pageVisited,
+      target_entity: subView,
+      details: `Navigated to ${subView}.`,
+    });
+  }, [staffUser, publicPortalToken, activeTab]);
+
+  // Automatic audit logging when Candidate Intake Modal is opened
+  useEffect(() => {
+    if (!staffUser || !showIntakeModal) {
+      lastModalVisitKeyRef.current = '';
+      return;
+    }
+    const key = `${staffUser.id}:intake-open`;
+    if (lastModalVisitKeyRef.current === key) return;
+    lastModalVisitKeyRef.current = key;
+
+    void logPageVisit({
+      page_visited: 'Candidate Intake Modal',
+      target_entity: 'New Candidate Intake',
+      details: 'Opened Candidate Intake Modal for resume screening and registration.',
+    });
+  }, [staffUser, showIntakeModal]);
+
+  // Automatic audit logging when a Candidate Detail Drawer is opened
+  useEffect(() => {
+    if (!staffUser || selectedCandidateId === null) {
+      lastDrawerVisitKeyRef.current = '';
+      return;
+    }
+    const cand = candidates.find((c) => c.id === selectedCandidateId);
+    if (!cand) return;
+
+    const key = `${staffUser.id}:candidate:${cand.id}`;
+    if (lastDrawerVisitKeyRef.current === key) return;
+    lastDrawerVisitKeyRef.current = key;
+
+    void logPageVisit({
+      page_visited: 'Candidate Detail Drawer',
+      target_entity: `${cand.full_name} (${cand.candidate_code})`,
+      details: `Viewed candidate profile for ${cand.full_name} (${cand.candidate_code}, Stage ${cand.stage}).`,
+    });
+  }, [staffUser, selectedCandidateId, candidates]);
+
   // Public self-service candidate portal (no HR login required)
   if (publicPortalToken) {
     return (
@@ -221,7 +300,18 @@ export default function App() {
     setExportingCsv(true);
     try {
       exportCandidatesToExcelCsv(filtered, staffUser.role);
-      await logCsvExport(filtered.length);
+      const activeFilters = [
+        filters.search ? `search="${filters.search}"` : '',
+        filters.department ? `dept=${filters.department}` : '',
+        filters.position ? `position=${filters.position}` : '',
+        filters.source ? `source=${filters.source}` : '',
+        filters.stage ? `stage=${filters.stage}` : '',
+        filters.status ? `status=${filters.status}` : '',
+        filters.offerStatus ? `offer=${filters.offerStatus}` : '',
+        filters.dateFrom ? `from=${filters.dateFrom}` : '',
+        filters.dateTo ? `to=${filters.dateTo}` : '',
+      ].filter(Boolean);
+      await logCsvExport(filtered.length, activeFilters.join(', '));
       await refreshWorkspace();
       notify(`Exported ${filtered.length} candidate record(s) to Excel CSV.`);
     } catch (err) {

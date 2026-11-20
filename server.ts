@@ -11,8 +11,10 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   db,
   ensureCandidateDocumentRows,
+  formatAuditTimestamp,
   generateCandidateCode,
   generatePortalToken,
+  getMalaysiaDateStamp,
   UPLOADS_ROOT,
 } from './src/db/database.ts';
 
@@ -28,6 +30,7 @@ const DISC_FORM_URL =
   'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec';
 
 type StaffRole = 'administrator' | 'manager';
+type AuditActorRole = 'administrator' | 'manager' | 'candidate_portal' | 'system';
 
 interface AuthPayload {
   id: number;
@@ -87,6 +90,128 @@ function createMailTransporter() {
 
 const mailTransporter = createMailTransporter();
 
+function extractClientContext(req?: Request): { ipAddress: string; userAgent: string } {
+  if (!req) {
+    return { ipAddress: '', userAgent: '' };
+  }
+  const forwarded = req.headers['x-forwarded-for'];
+  const rawIp = Array.isArray(forwarded)
+    ? forwarded[0]
+    : typeof forwarded === 'string' && forwarded.trim()
+      ? forwarded.split(',')[0].trim()
+      : req.socket?.remoteAddress || req.ip || '';
+  const ipAddress = String(rawIp || '').replace(/^::ffff:/, '').trim().slice(0, 100);
+  const userAgent = String(req.headers['user-agent'] || '').trim().slice(0, 300);
+  return { ipAddress, userAgent };
+}
+
+function formatActorDisplay(actor?: AuthPayload | null, fallbackName?: string): string {
+  if (actor) {
+    const name = String(actor.name || '').trim();
+    const email = String(actor.email || '').trim();
+    if (name && email) return `${name} (${email})`;
+    return name || email || 'Staff User';
+  }
+  return String(fallbackName || 'System').trim() || 'System';
+}
+
+function logAudit(params: {
+  req?: Request;
+  actor?: AuthPayload | null;
+  actorId?: number | null;
+  actorName?: string;
+  actorRole?: AuditActorRole;
+  pageVisited: string;
+  actionTaken: string;
+  targetEntity?: string;
+  details: string;
+}) {
+  const { ipAddress, userAgent } = extractClientContext(params.req);
+  const timestamp = formatAuditTimestamp(new Date());
+  const actorId = params.actor?.id ?? params.actorId ?? null;
+  const actorName = formatActorDisplay(params.actor, params.actorName);
+  const actorRole: AuditActorRole = params.actor?.role ?? params.actorRole ?? 'system';
+
+  db.prepare(`
+    INSERT INTO audit_logs (
+      timestamp, actor_id, actor_name, actor_role, page_visited,
+      action_taken, target_entity, details, ip_address, user_agent
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    timestamp,
+    actorId,
+    actorName,
+    actorRole,
+    String(params.pageVisited || 'Pipeline Dashboard').trim().slice(0, 140),
+    String(params.actionTaken || 'SYSTEM_EVENT').trim().slice(0, 100),
+    String(params.targetEntity || '').trim().slice(0, 200),
+    String(params.details || '').trim().slice(0, 1000),
+    ipAddress,
+    userAgent
+  );
+}
+
+function escapeCsvCell(value: unknown): string {
+  const str = String(value ?? '');
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function buildAuditLogFilterSql(query: Record<string, unknown>) {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  const search = String(query.search || '').trim();
+  if (search) {
+    const pattern = `%${search}%`;
+    conditions.push(
+      `(actor_name LIKE ? OR page_visited LIKE ? OR action_taken LIKE ? OR target_entity LIKE ? OR details LIKE ? OR ip_address LIKE ? OR user_agent LIKE ?)`
+    );
+    params.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern);
+  }
+
+  const actor = String(query.actor || '').trim();
+  if (actor) {
+    conditions.push(`actor_name LIKE ?`);
+    params.push(`%${actor}%`);
+  }
+
+  const role = String(query.role || '').trim();
+  if (role && ['administrator', 'manager', 'candidate_portal', 'system'].includes(role)) {
+    conditions.push(`actor_role = ?`);
+    params.push(role);
+  }
+
+  const pageVisited = String(query.page_visited || '').trim();
+  if (pageVisited) {
+    conditions.push(`page_visited = ?`);
+    params.push(pageVisited);
+  }
+
+  const actionTaken = String(query.action_taken || '').trim();
+  if (actionTaken) {
+    conditions.push(`action_taken = ?`);
+    params.push(actionTaken);
+  }
+
+  const dateFrom = String(query.date_from || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) {
+    conditions.push(`substr(timestamp, 1, 10) >= ?`);
+    params.push(dateFrom);
+  }
+
+  const dateTo = String(query.date_to || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
+    conditions.push(`substr(timestamp, 1, 10) <= ?`);
+    params.push(dateTo);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  return { whereClause, params };
+}
+
 async function dispatchEmail(params: {
   candidateId: number | null;
   candidateName: string;
@@ -96,6 +221,12 @@ async function dispatchEmail(params: {
   bodyText: string;
   stageTriggered: number;
   triggeredBy: string;
+  req?: Request;
+  actor?: AuthPayload | null;
+  actorName?: string;
+  actorRole?: AuditActorRole;
+  pageVisited?: string;
+  skipAuditLog?: boolean;
 }) {
   let deliveryStatus = 'LOGGED_LOCAL';
   if (mailTransporter) {
@@ -133,29 +264,21 @@ async function dispatchEmail(params: {
     deliveryStatus,
     params.triggeredBy
   );
-}
 
-function logAudit(params: {
-  actor?: AuthPayload | null;
-  actorEmail?: string;
-  actorRole?: string;
-  action: string;
-  targetType: string;
-  targetId: string | number;
-  details: string;
-}) {
-  db.prepare(`
-    INSERT INTO audit_logs (actor_id, actor_email, actor_role, action, target_type, target_id, details)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    params.actor?.id ?? null,
-    params.actor?.email || params.actorEmail || 'candidate-portal',
-    params.actor?.role || params.actorRole || 'CANDIDATE',
-    params.action,
-    params.targetType,
-    String(params.targetId),
-    params.details
-  );
+  if (!params.skipAuditLog) {
+    logAudit({
+      req: params.req,
+      actor: params.actor,
+      actorName: params.actorName || params.triggeredBy,
+      actorRole: params.actorRole || (params.actor ? params.actor.role : 'system'),
+      pageVisited: params.pageVisited || 'Email Automation & Audit Trail',
+      actionTaken: 'SEND_EMAIL',
+      targetEntity: params.candidateName
+        ? `${params.candidateName} <${params.recipientEmail}>`
+        : params.recipientEmail,
+      details: `Dispatched "${params.templateType}" email (${deliveryStatus}) — Subject: ${params.subject}`,
+    });
+  }
 }
 
 function getAppBaseUrl(req: Request): string {
@@ -559,11 +682,12 @@ async function startServer() {
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
 
     logAudit({
+      req,
       actor: payload,
-      action: 'INITIAL_ADMIN_CREATED',
-      targetType: 'auth',
-      targetId: createdUser.id,
-      details: `Registered initial Administrator account (${createdUser.email}).`,
+      pageVisited: 'Login Gate',
+      actionTaken: 'CREATE_USER',
+      targetEntity: `${createdUser.name} (${createdUser.email})`,
+      details: `Registered initial Administrator account (${createdUser.email}, ${createdUser.department}).`,
     });
 
     res.status(201).json({ token, user: createdUser });
@@ -585,6 +709,18 @@ async function startServer() {
       | undefined;
 
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+      logAudit({
+        req,
+        actorId: user?.id ?? null,
+        actorName: user ? `${user.name} (${user.email})` : email,
+        actorRole: user ? user.role : 'system',
+        pageVisited: 'Login Gate',
+        actionTaken: 'LOGIN_FAILED',
+        targetEntity: email,
+        details: user
+          ? `Failed login attempt for ${user.email}: incorrect password.`
+          : `Failed login attempt for unregistered email (${email}).`,
+      });
       res.status(401).json({ error: 'Invalid email or password.' });
       return;
     }
@@ -600,11 +736,12 @@ async function startServer() {
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
 
     logAudit({
+      req,
       actor: payload,
-      action: 'STAFF_LOGIN',
-      targetType: 'auth',
-      targetId: user.id,
-      details: `${user.email} signed in (${user.role}).`,
+      pageVisited: 'Login Gate',
+      actionTaken: 'LOGIN_SUCCESS',
+      targetEntity: `${user.name} (${user.email})`,
+      details: `${user.name} (${user.email}) signed in as ${user.role}.`,
     });
 
     res.json({
@@ -655,11 +792,12 @@ async function startServer() {
       .run(name, email, hash, role, department);
 
     logAudit({
+      req,
       actor: req.user,
-      action: 'STAFF_USER_CREATED',
-      targetType: 'rbac',
-      targetId: Number(info.lastInsertRowid),
-      details: `Created ${role} account for ${email}.`,
+      pageVisited: 'Team & Access Management',
+      actionTaken: 'CREATE_USER',
+      targetEntity: `${name} (${email})`,
+      details: `Created ${role} account for ${name} (${email}, ${department}).`,
     });
 
     const created = db
@@ -673,8 +811,8 @@ async function startServer() {
     const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
     const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
 
-    const target = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(targetId) as
-      | { id: number; email: string; role: StaffRole }
+    const target = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(targetId) as
+      | { id: number; name: string; email: string; role: StaffRole }
       | undefined;
     if (!target) {
       res.status(404).json({ error: 'User account not found.' });
@@ -693,11 +831,12 @@ async function startServer() {
 
     db.prepare('UPDATE users SET role = ?, department = ? WHERE id = ?').run(role, department, targetId);
     logAudit({
+      req,
       actor: req.user,
-      action: 'RBAC_ROLE_UPDATED',
-      targetType: 'rbac',
-      targetId,
-      details: `Updated role for ${target.email} to ${role} (${department}).`,
+      pageVisited: 'Team & Access Management',
+      actionTaken: 'UPDATE_USER_ROLE',
+      targetEntity: `${target.name} (${target.email})`,
+      details: `Updated access role for ${target.email} from ${target.role} to ${role} (${department}).`,
     });
 
     const updated = db
@@ -713,8 +852,8 @@ async function startServer() {
       return;
     }
 
-    const target = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(targetId) as
-      | { id: number; email: string; role: StaffRole }
+    const target = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(targetId) as
+      | { id: number; name: string; email: string; role: StaffRole }
       | undefined;
     if (!target) {
       res.status(404).json({ error: 'User account not found.' });
@@ -733,10 +872,11 @@ async function startServer() {
 
     db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
     logAudit({
+      req,
       actor: req.user,
-      action: 'STAFF_USER_DELETED',
-      targetType: 'rbac',
-      targetId,
+      pageVisited: 'Team & Access Management',
+      actionTaken: 'DELETE_USER',
+      targetEntity: `${target.name} (${target.email})`,
       details: `Removed ${target.role} account (${target.email}).`,
     });
 
@@ -1108,6 +1248,15 @@ async function startServer() {
           return;
         }
 
+        logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Intake Modal',
+          actionTaken: 'AI_RESUME_SCREENING',
+          targetEntity: fullName || fileName || position,
+          details: `Ran Gemini AI resume screening (${inlineFile ? fileName || inlineFile.mimeType : 'pasted text'}) for ${position} — extracted ${extractedFieldCount} field(s), Job-Fit Score: ${aiScore}%.`,
+        });
+
         res.json({
           full_name: fullName,
           email,
@@ -1276,11 +1425,12 @@ async function startServer() {
     }
 
     logAudit({
+      req,
       actor: req.user,
-      action: 'CANDIDATE_REGISTERED',
-      targetType: 'candidate',
-      targetId: candidateId,
-      details: `Registered ${fullName} (${candidateCode}) via ${source} for ${position} (AI Score: ${aiScore}%).`,
+      pageVisited: 'Candidate Intake Modal',
+      actionTaken: 'CREATE_CANDIDATE',
+      targetEntity: `${fullName} (${candidateCode})`,
+      details: `Registered ${fullName} (${candidateCode}) via ${source} for ${position} (${department}), AI Job-Fit Score: ${aiScore}%.`,
     });
 
     const row = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
@@ -1354,6 +1504,9 @@ async function startServer() {
           ].join('\n'),
           stageTriggered: 5,
           triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
         });
       } else if (decision === 'reject') {
         await dispatchEmail({
@@ -1365,18 +1518,22 @@ async function startServer() {
           bodyText: `Dear ${existing.full_name},\n\nThank you for applying for the ${existing.position} position (${existing.department}). After careful review, we will not be moving forward at this stage.\n\nWe appreciate your interest and wish you every success.\n\nTalentFlow MY HR Team`,
           stageTriggered: 4,
           triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
         });
       }
 
       logAudit({
+        req,
         actor: req.user,
-        action: `SCREENING_${decision.toUpperCase()}`,
-        targetType: 'candidate',
-        targetId: id,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'UPDATE_SCREENING_DECISION',
+        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
         details:
           decision === 'proceed'
-            ? `Shortlisted ${existing.full_name} (Stage 5) & sent Employment Form + DISC Assessment links.`
-            : `Updated screening decision for ${existing.full_name} to ${decision}. Remarks: ${remarks}`,
+            ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Employment Form + DISC Assessment links.`
+            : `Updated screening decision for ${existing.full_name} to "${decision}". Remarks: ${remarks || 'None'}`,
       });
     }
     // 2. Stage 6-7 Document Checklist & Google Apps Script Verification
@@ -1413,11 +1570,12 @@ async function startServer() {
       `).run(nextStage, nextStatus, discProfile, id);
 
       logAudit({
+        req,
         actor: req.user,
-        action: 'DOCS_CHECKLIST_UPDATED',
-        targetType: 'candidate',
-        targetId: id,
-        details: `Verified forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}).`,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'VERIFY_DOCUMENT',
+        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+        details: `Verified forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}${discProfile ? `, DISC: ${discProfile}` : ''}).`,
       });
     }
     // 3. Stage 8 -> 9 Qualification Decision + Auto Interview Invite
@@ -1461,6 +1619,9 @@ async function startServer() {
           ].join('\n'),
           stageTriggered: 9,
           triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
         });
       } else if (qualStatus === 'not_qualified') {
         await dispatchEmail({
@@ -1472,15 +1633,19 @@ async function startServer() {
           bodyText: `Dear ${existing.full_name},\n\nThank you for submitting your assessments and academic documents for ${existing.position}. After review, we will not be advancing to the interview stage at this time.\n\nBest wishes,\nTalentFlow MY HR Team`,
           stageTriggered: 8,
           triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
         });
       }
 
       logAudit({
+        req,
         actor: req.user,
-        action: `QUALIFICATION_${qualStatus.toUpperCase()}`,
-        targetType: 'candidate',
-        targetId: id,
-        details: `Classified ${existing.full_name} as ${qualStatus}. Remarks: ${qualRemarks}`,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'UPDATE_QUALIFICATION',
+        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+        details: `Classified ${existing.full_name} as "${qualStatus}". Remarks: ${qualRemarks || 'None'}`,
       });
     }
     // 4. Stage 11-12 Post-Interview Evaluation & Decision
@@ -1508,14 +1673,18 @@ async function startServer() {
           bodyText: `Dear ${existing.full_name},\n\nThank you for interviewing with our team for ${existing.position} (${existing.department}). While we appreciated meeting you, we have decided to proceed with another candidate at this time.\n\nWarm regards,\nTalentFlow MY HR Team`,
           stageTriggered: 12,
           triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
         });
       }
 
       logAudit({
+        req,
         actor: req.user,
-        action: `POST_INTERVIEW_${decision.toUpperCase()}`,
-        targetType: 'candidate',
-        targetId: id,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'RECORD_INTERVIEW_FEEDBACK',
+        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
         details: `Recorded panel rating ${rating}/5 and post-interview decision "${decision}" for ${existing.full_name}.`,
       });
     }
@@ -1527,6 +1696,15 @@ async function startServer() {
       db.prepare(`
         UPDATE candidates SET full_name = ?, position = ?, department = ?, updated_at = datetime('now') WHERE id = ?
       `).run(fullName, position, department, id);
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'UPDATE_CANDIDATE',
+        targetEntity: `${fullName} (${existing.candidate_code})`,
+        details: `Updated candidate profile (${position}, ${department}).`,
+      });
     }
 
     const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
@@ -1554,9 +1732,9 @@ async function startServer() {
         return;
       }
 
-      const candidate = db.prepare('SELECT id, full_name FROM candidates WHERE id = ?').get(candidateId) as
-        | { id: number; full_name: string }
-        | undefined;
+      const candidate = db
+        .prepare('SELECT id, candidate_code, full_name FROM candidates WHERE id = ?')
+        .get(candidateId) as { id: number; candidate_code: string; full_name: string } | undefined;
       if (!candidate) {
         fs.unlink(req.file.path, () => {});
         res.status(404).json({ error: 'Candidate not found.' });
@@ -1571,10 +1749,11 @@ async function startServer() {
       `).run(req.file.originalname, req.file.filename, candidateId, docType);
 
       logAudit({
+        req,
         actor: req.user,
-        action: 'DOCUMENT_UPLOADED',
-        targetType: 'document',
-        targetId: `${candidateId}:${docType}`,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'UPLOAD_DOCUMENT',
+        targetEntity: `${candidate.full_name} (${candidate.candidate_code}) — ${docType}`,
         details: `Uploaded ${docType} (${req.file.originalname}) for ${candidate.full_name}.`,
       });
 
@@ -1625,14 +1804,16 @@ async function startServer() {
       ].join('\n'),
       stageTriggered: 6,
       triggeredBy: req.user!.email,
+      skipAuditLog: true,
     });
 
     logAudit({
+      req,
       actor: req.user,
-      action: 'DOCS_REMINDER_DISPATCHED',
-      targetType: 'candidate',
-      targetId: id,
-      details: `Sent document reminder to ${candidate.full_name} (${missing.length} outstanding items).`,
+      pageVisited: 'Candidate Detail Drawer',
+      actionTaken: 'SEND_EMAIL',
+      targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
+      details: `Sent document reminder email to ${candidate.email} (${missing.length} outstanding item(s)).`,
     });
 
     const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
@@ -1679,16 +1860,18 @@ async function startServer() {
         ].join('\n'),
         stageTriggered: 6,
         triggeredBy: req.user!.email,
+        skipAuditLog: true,
       });
       sentCount++;
     }
 
     logAudit({
+      req,
       actor: req.user,
-      action: 'BATCH_DOCS_REMINDER',
-      targetType: 'candidate',
-      targetId: `batch_${sentCount}`,
-      details: `Dispatched batch document reminders to ${sentCount} candidate(s).`,
+      pageVisited: 'Email Automation & Audit Trail',
+      actionTaken: 'SEND_EMAIL',
+      targetEntity: `Batch Document Reminders (${sentCount} candidates)`,
+      details: `Dispatched batch document submission reminder emails to ${sentCount} candidate(s).`,
     });
 
     res.json({ sentCount });
@@ -1800,14 +1983,18 @@ async function startServer() {
           .join('\n'),
         stageTriggered: 13,
         triggeredBy: req.user!.email,
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
       });
 
       logAudit({
+        req,
         actor: req.user,
-        action: 'EMPLOYMENT_OFFER_SENT',
-        targetType: 'offer',
-        targetId: id,
-        details: `Generated & dispatched MYR offer (RM ${salaryMyr}/mo) to ${candidate.full_name}.`,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'ISSUE_OFFER',
+        targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
+        details: `Issued MYR employment offer (RM ${salaryMyr.toLocaleString('en-MY')}/mo, start ${startDate || 'TBD'}) for ${position}.`,
       });
 
       const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
@@ -1855,15 +2042,16 @@ async function startServer() {
       UPDATE candidates SET stage = ?, status = ?, final_decision_notes = ?, updated_at = datetime('now') WHERE id = ?
     `).run(nextStage, candStatus, note || `Offer status updated to ${status}.`, id);
 
+    const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
     logAudit({
+      req,
       actor: req.user,
-      action: `OFFER_${status.toUpperCase().replace(/\s+/g, '_')}`,
-      targetType: 'offer',
-      targetId: id,
-      details: `Updated offer status for candidate #${id} to "${status}" (Stage ${nextStage}).`,
+      pageVisited: 'Candidate Detail Drawer',
+      actionTaken: 'UPDATE_OFFER_STATUS',
+      targetEntity: `${updated.full_name} (${updated.candidate_code})`,
+      details: `Updated offer status for ${updated.full_name} to "${status}" (Stage ${nextStage}).`,
     });
 
-    const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
     res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
   });
 
@@ -1890,11 +2078,12 @@ async function startServer() {
     deleteTx(id);
 
     logAudit({
+      req,
       actor: req.user,
-      action: 'CANDIDATE_DELETED',
-      targetType: 'candidate',
-      targetId: id,
-      details: `Deleted candidate ${existing.full_name} (${existing.candidate_code}).`,
+      pageVisited: 'Candidate Detail Drawer',
+      actionTaken: 'DELETE_CANDIDATE',
+      targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+      details: `Deleted candidate record ${existing.full_name} (${existing.candidate_code}).`,
     });
 
     res.json({ deleted: true });
@@ -1937,11 +2126,12 @@ async function startServer() {
 
     const slotId = Number(info.lastInsertRowid);
     logAudit({
+      req,
       actor: req.user,
-      action: 'INTERVIEW_SLOT_CREATED',
-      targetType: 'interview_slot',
-      targetId: slotId,
-      details: `Created slot ${date} ${startTime}-${endTime} (capacity ${capacity}) with ${interviewerName}.`,
+      pageVisited: 'Interview Calendar',
+      actionTaken: 'CREATE_INTERVIEW_SLOT',
+      targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
+      details: `Created interview slot ${date} ${startTime}-${endTime} (capacity ${capacity}, ${mode}) with ${interviewerName}.`,
     });
 
     const row = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
@@ -1974,11 +2164,12 @@ async function startServer() {
     `).run(date, startTime, endTime, capacity, locationOrLink, interviewerName, status, slotId);
 
     logAudit({
+      req,
       actor: req.user,
-      action: status === 'CANCELLED' ? 'INTERVIEW_SLOT_CANCELLED' : 'INTERVIEW_SLOT_UPDATED',
-      targetType: 'interview_slot',
-      targetId: slotId,
-      details: `Updated slot #${slotId} (${date} ${startTime}-${endTime}, capacity ${capacity}, status ${status}).`,
+      pageVisited: 'Interview Calendar',
+      actionTaken: status === 'CANCELLED' ? 'CANCEL_INTERVIEW' : 'RESCHEDULE_INTERVIEW',
+      targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
+      details: `Updated interview slot #${slotId} (${date} ${startTime}-${endTime}, capacity ${capacity}, status ${status}).`,
     });
 
     const updated = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
@@ -2000,11 +2191,12 @@ async function startServer() {
     }
     db.prepare('DELETE FROM interview_slots WHERE id = ?').run(slotId);
     logAudit({
+      req,
       actor: req.user,
-      action: 'INTERVIEW_SLOT_DELETED',
-      targetType: 'interview_slot',
-      targetId: slotId,
-      details: `Deleted interview slot ${existing.date} ${existing.start_time}.`,
+      pageVisited: 'Interview Calendar',
+      actionTaken: 'CANCEL_INTERVIEW',
+      targetEntity: `Slot #${slotId} (${existing.date} ${existing.start_time})`,
+      details: `Deleted interview slot #${slotId} (${existing.date} ${existing.start_time}).`,
     });
     res.json({ deleted: true });
   });
@@ -2042,14 +2234,18 @@ async function startServer() {
         ].join('\n'),
         stageTriggered: 10,
         triggeredBy: req.user!.email,
+        req,
+        actor: req.user,
+        pageVisited: 'Interview Calendar',
       });
 
       logAudit({
+        req,
         actor: req.user,
-        action: 'INTERVIEW_SLOT_BOOKED_ATOMIC',
-        targetType: 'interview_slot',
-        targetId: slotId,
-        details: `Atomically booked slot #${slotId} (${result.slot.date} ${result.slot.start_time}) for ${result.candidate.full_name}.`,
+        pageVisited: 'Interview Calendar',
+        actionTaken: 'BOOK_INTERVIEW_SLOT',
+        targetEntity: `${result.candidate.full_name} — Slot #${slotId}`,
+        details: `Booked interview slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}) for ${result.candidate.full_name}.`,
       });
 
       const slotRow = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
@@ -2100,12 +2296,27 @@ async function startServer() {
 
     try {
       const booking = tx();
+      const candInfo = db
+        .prepare('SELECT full_name, candidate_code FROM candidates WHERE id = ?')
+        .get(booking.candidate_id) as { full_name: string; candidate_code: string } | undefined;
+      const mappedAction =
+        nextStatus === 'CANCELLED'
+          ? 'CANCEL_INTERVIEW'
+          : nextStatus === 'RESCHEDULED'
+            ? 'RESCHEDULE_INTERVIEW'
+            : nextStatus === 'COMPLETED'
+              ? 'RECORD_INTERVIEW_FEEDBACK'
+              : 'BOOK_INTERVIEW_SLOT';
+
       logAudit({
+        req,
         actor: req.user,
-        action: `INTERVIEW_BOOKING_${nextStatus}`,
-        targetType: 'interview_slot',
-        targetId: booking.slot_id,
-        details: `Updated booking #${bookingId} (candidate #${booking.candidate_id}) to ${nextStatus}.`,
+        pageVisited: 'Interview Calendar',
+        actionTaken: mappedAction,
+        targetEntity: candInfo
+          ? `${candInfo.full_name} (${candInfo.candidate_code}) — Booking #${bookingId}`
+          : `Booking #${bookingId} (Slot #${booking.slot_id})`,
+        details: `Updated interview booking #${bookingId} to "${nextStatus}".`,
       });
       res.json({ updated: true });
     } catch (err: unknown) {
@@ -2189,11 +2400,12 @@ async function startServer() {
       );
 
       logAudit({
-        actorEmail: String(row.email),
-        actorRole: 'CANDIDATE',
-        action: 'PORTAL_DOCUMENT_UPLOADED',
-        targetType: 'document',
-        targetId: `${candidateId}:${docType}`,
+        req,
+        actorName: `${row.full_name} (${row.email})`,
+        actorRole: 'candidate_portal',
+        pageVisited: 'Candidate Self-Service Portal',
+        actionTaken: 'UPLOAD_DOCUMENT',
+        targetEntity: `${row.full_name} (${row.candidate_code}) — ${docType}`,
         details: `Candidate ${row.full_name} uploaded ${docType} (${req.file.originalname}) via self-service portal.`,
       });
     }
@@ -2228,12 +2440,13 @@ async function startServer() {
       );
 
       logAudit({
-        actorEmail: String(row.email),
-        actorRole: 'CANDIDATE',
-        action: 'PORTAL_FORMS_COMPLETED',
-        targetType: 'candidate',
-        targetId: candidateId,
-        details: `Candidate ${row.full_name} confirmed Google Apps Script form completion via portal.`,
+        req,
+        actorName: `${row.full_name} (${row.email})`,
+        actorRole: 'candidate_portal',
+        pageVisited: 'Candidate Self-Service Portal',
+        actionTaken: 'VERIFY_DOCUMENT',
+        targetEntity: `${row.full_name} (${row.candidate_code})`,
+        details: `Candidate ${row.full_name} confirmed Google Apps Script form completion via self-service portal.`,
       });
     }
     // Action C: Atomic Self-Service Interview Slot Booking
@@ -2272,15 +2485,20 @@ async function startServer() {
           ].join('\n'),
           stageTriggered: 10,
           triggeredBy: 'candidate-portal',
+          req,
+          actorName: `${row.full_name} (${row.email})`,
+          actorRole: 'candidate_portal',
+          pageVisited: 'Candidate Self-Service Portal',
         });
 
         logAudit({
-          actorEmail: String(row.email),
-          actorRole: 'CANDIDATE',
-          action: 'PORTAL_SLOT_BOOKED_ATOMIC',
-          targetType: 'interview_slot',
-          targetId: slotId,
-          details: `Candidate ${row.full_name} self-booked slot #${slotId} (${result.slot.date} ${result.slot.start_time}).`,
+          req,
+          actorName: `${row.full_name} (${row.email})`,
+          actorRole: 'candidate_portal',
+          pageVisited: 'Candidate Self-Service Portal',
+          actionTaken: 'BOOK_INTERVIEW_SLOT',
+          targetEntity: `${row.full_name} (${row.candidate_code}) — Slot #${slotId}`,
+          details: `Candidate ${row.full_name} self-booked slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}).`,
         });
       } catch (err: unknown) {
         res.status(409).json({ error: err instanceof Error ? err.message : 'Slot reservation conflict.' });
@@ -2311,12 +2529,13 @@ async function startServer() {
       `).run(candStatus, responseNote || `Offer ${offerStatus} via Candidate Portal.`, candidateId);
 
       logAudit({
-        actorEmail: String(row.email),
-        actorRole: 'CANDIDATE',
-        action: `PORTAL_OFFER_${offerStatus.toUpperCase()}`,
-        targetType: 'offer',
-        targetId: candidateId,
-        details: `Candidate ${row.full_name} ${offerStatus.toLowerCase()} employment offer via portal.`,
+        req,
+        actorName: `${row.full_name} (${row.email})`,
+        actorRole: 'candidate_portal',
+        pageVisited: 'Candidate Self-Service Portal',
+        actionTaken: 'UPDATE_OFFER_STATUS',
+        targetEntity: `${row.full_name} (${row.candidate_code})`,
+        details: `Candidate ${row.full_name} ${offerStatus.toLowerCase()} employment offer via self-service portal.`,
       });
     } else {
       res.status(400).json({ error: 'Unsupported portal action.' });
@@ -2387,29 +2606,194 @@ async function startServer() {
   });
 
   // ===========================================================================
-  // 7. EMAIL LOGS & AUDIT LOGS
+  // 7. EMAIL LOGS & TAMPER-EVIDENT IMMUTABLE AUDIT LOGS
   // ===========================================================================
   app.get('/api/email-logs', requireAuth, (_req: AuthedRequest, res: Response) => {
     const emailLogs = db.prepare('SELECT * FROM email_logs ORDER BY id DESC LIMIT 200').all();
     res.json({ emailLogs });
   });
 
-  app.get('/api/audit-logs', requireAuth, (_req: AuthedRequest, res: Response) => {
-    const auditLogs = db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 300').all();
-    res.json({ auditLogs });
+  // Strict immutability enforcement: explicitly reject ANY DELETE, PUT, or PATCH on audit_logs
+  const rejectAuditMutation = (_req: Request, res: Response) => {
+    res.status(403).json({
+      error: 'Forbidden: Audit trail records are strictly immutable and cannot be modified or deleted.',
+    });
+  };
+  app.delete('/api/audit-logs', rejectAuditMutation);
+  app.delete('/api/audit-logs/:id', rejectAuditMutation);
+  app.delete('/api/audit-logs/*', rejectAuditMutation);
+  app.put('/api/audit-logs', rejectAuditMutation);
+  app.put('/api/audit-logs/:id', rejectAuditMutation);
+  app.put('/api/audit-logs/*', rejectAuditMutation);
+  app.patch('/api/audit-logs', rejectAuditMutation);
+  app.patch('/api/audit-logs/:id', rejectAuditMutation);
+  app.patch('/api/audit-logs/*', rejectAuditMutation);
+
+  // Query audit logs with live multi-filter support (both administrator and manager)
+  app.get('/api/audit-logs', requireAuth, (req: AuthedRequest, res: Response) => {
+    const { whereClause, params } = buildAuditLogFilterSql(req.query as Record<string, unknown>);
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(1000, Math.round(requestedLimit)))
+      : 500;
+
+    const totalCount = (
+      db.prepare(`SELECT COUNT(*) as count FROM audit_logs ${whereClause}`).get(...params) as {
+        count: number;
+      }
+    ).count;
+
+    const auditLogs = db
+      .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT ?`)
+      .all(...params, limit);
+
+    const actors = (
+      db
+        .prepare(`SELECT DISTINCT actor_name FROM audit_logs WHERE actor_name != '' ORDER BY actor_name ASC`)
+        .all() as Array<{ actor_name: string }>
+    ).map((r) => r.actor_name);
+
+    const pages = (
+      db
+        .prepare(`SELECT DISTINCT page_visited FROM audit_logs WHERE page_visited != '' ORDER BY page_visited ASC`)
+        .all() as Array<{ page_visited: string }>
+    ).map((r) => r.page_visited);
+
+    const actions = (
+      db
+        .prepare(`SELECT DISTINCT action_taken FROM audit_logs WHERE action_taken != '' ORDER BY action_taken ASC`)
+        .all() as Array<{ action_taken: string }>
+    ).map((r) => r.action_taken);
+
+    res.json({
+      auditLogs,
+      totalCount,
+      facets: { actors, pages, actions },
+    });
   });
 
+  // Record automatic frontend page/view navigation visits (administrator & manager)
+  app.post('/api/audit-logs/page-visit', requireAuth, (req: AuthedRequest, res: Response) => {
+    const pageVisited = String(req.body?.page_visited || '').trim();
+    if (!pageVisited) {
+      res.status(400).json({ error: 'page_visited is required.' });
+      return;
+    }
+    const targetEntity = String(req.body?.target_entity || '').trim();
+    const details =
+      String(req.body?.details || '').trim() ||
+      `Visited ${pageVisited}${targetEntity ? ` (${targetEntity})` : ''}.`;
+
+    logAudit({
+      req,
+      actor: req.user,
+      pageVisited,
+      actionTaken: 'PAGE_VIEW',
+      targetEntity,
+      details,
+    });
+    res.status(201).json({ logged: true });
+  });
+
+  // Record candidate report CSV export
   app.post('/api/audit-logs/export', requireAuth, (req: AuthedRequest, res: Response) => {
     const count = Number(req.body?.count) || 0;
+    const filterSummary = String(req.body?.filter_summary || '').trim();
     logAudit({
+      req,
       actor: req.user,
-      action: 'EXCEL_CSV_EXPORTED',
-      targetType: 'export',
-      targetId: `csv_${count}`,
-      details: `Exported Excel-compatible CSV report covering ${count} filtered candidate record(s).`,
+      pageVisited: 'Candidate Database',
+      actionTaken: 'EXPORT_REPORT',
+      targetEntity: `Candidate CSV (${count} rows)`,
+      details: `Exported Excel-compatible CSV report covering ${count} candidate record(s)${filterSummary ? ` [Filters: ${filterSummary}]` : ''}.`,
     });
     res.json({ logged: true });
   });
+
+  // Administrator-only full/filtered Audit Trail CSV download
+  app.get(
+    '/api/audit-logs/export',
+    requireAuth,
+    requireRole('administrator'),
+    (req: AuthedRequest, res: Response) => {
+      const query = req.query as Record<string, unknown>;
+      const { whereClause, params } = buildAuditLogFilterSql(query);
+      const rows = db
+        .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT 50000`)
+        .all(...params) as Array<{
+        id: number;
+        timestamp: string;
+        actor_name: string;
+        actor_role: string;
+        page_visited: string;
+        action_taken: string;
+        target_entity: string;
+        details: string;
+        ip_address: string;
+        user_agent: string;
+      }>;
+
+      const activeFilterParts = [
+        query.search ? `search="${query.search}"` : '',
+        query.actor ? `actor="${query.actor}"` : '',
+        query.role ? `role="${query.role}"` : '',
+        query.page_visited ? `page="${query.page_visited}"` : '',
+        query.action_taken ? `action="${query.action_taken}"` : '',
+        query.date_from ? `from=${query.date_from}` : '',
+        query.date_to ? `to=${query.date_to}` : '',
+      ].filter(Boolean);
+
+      const filename = `TJW_HR_Audit_Trail_${getMalaysiaDateStamp()}.csv`;
+
+      logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Email Automation & Audit Trail',
+        actionTaken: 'EXPORT_AUDIT_LOG',
+        targetEntity: filename,
+        details: `Downloaded tamper-evident audit trail CSV (${rows.length} row(s))${activeFilterParts.length > 0 ? ` [${activeFilterParts.join(', ')}]` : ' [All records]'}.`,
+      });
+
+      const headers = [
+        'ID',
+        'Timestamp (MYT)',
+        'Actor Name',
+        'Role',
+        'Page Visited',
+        'Action Taken',
+        'Target Record',
+        'Details',
+        'IP Address',
+        'Device/Browser',
+      ];
+
+      const lines = [
+        headers.map(escapeCsvCell).join(','),
+        ...rows.map((r) =>
+          [
+            r.id,
+            r.timestamp,
+            r.actor_name,
+            r.actor_role,
+            r.page_visited,
+            r.action_taken,
+            r.target_entity,
+            r.details,
+            r.ip_address,
+            r.user_agent,
+          ]
+            .map(escapeCsvCell)
+            .join(',')
+        ),
+      ];
+
+      const csvContent = `\uFEFF${lines.join('\r\n')}`;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(csvContent);
+    }
+  );
 
   // ===========================================================================
   // VITE DEV MIDDLEWARE / PRODUCTION STATIC SPA

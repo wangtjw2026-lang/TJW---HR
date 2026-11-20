@@ -1,9 +1,14 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   BellRing,
   CheckCircle2,
+  Download,
+  Loader2,
+  Lock,
   Mail,
+  RotateCcw,
+  Search,
   Shield,
   Trash2,
   UserPlus,
@@ -12,11 +17,15 @@ import {
 import {
   createStaffUser,
   deleteStaffUser,
+  downloadAuditLogCsv,
+  fetchAuditLogsWithMeta,
   sendBatchDocReminders,
   updateStaffUser,
 } from '../lib/apiService';
 import { formatTimestamp, hasPendingDocs } from '../lib/atsHelpers';
 import {
+  AuditActorRole,
+  AuditLogFilters,
   AuditLogRecord,
   CandidateRecord,
   DEPARTMENTS,
@@ -25,6 +34,69 @@ import {
   StaffRole,
   StaffUser,
 } from '../types/ats';
+
+const EMPTY_AUDIT_FILTERS: AuditLogFilters = {
+  search: '',
+  actor: '',
+  role: '',
+  page_visited: '',
+  action_taken: '',
+  date_from: '',
+  date_to: '',
+};
+
+const AUDIT_ROLE_LABELS: Record<AuditActorRole, string> = {
+  administrator: 'Administrator',
+  manager: 'Manager (View Only)',
+  candidate_portal: 'Candidate Portal',
+  system: 'System',
+};
+
+function formatAuditMytDisplay(timestamp: string): { display: string; iso: string } {
+  const raw = String(timestamp || '').trim();
+  const parenIdx = raw.indexOf(' (');
+  if (parenIdx > 0 && raw.endsWith(')')) {
+    return {
+      display: raw.slice(0, parenIdx),
+      iso: raw.slice(parenIdx + 2, -1),
+    };
+  }
+  return { display: raw || '—', iso: raw };
+}
+
+function summarizeUserAgent(ua: string): string {
+  const raw = String(ua || '').trim();
+  if (!raw) return '';
+  if (/Edg\//i.test(raw)) return 'Edge';
+  if (/Chrome\//i.test(raw) && !/Chromium/i.test(raw)) return 'Chrome';
+  if (/Firefox\//i.test(raw)) return 'Firefox';
+  if (/Safari\//i.test(raw) && !/Chrome\//i.test(raw)) return 'Safari';
+  if (/curl\//i.test(raw)) return 'cURL';
+  return raw.slice(0, 32);
+}
+
+function getActionToneClass(action: string): string {
+  const upper = String(action || '').toUpperCase();
+  if (
+    upper.includes('FAILED') ||
+    upper.includes('DELETE') ||
+    upper.includes('CANCEL')
+  ) {
+    return 'text-[#B91C1C]';
+  }
+  if (
+    upper.includes('CREATE') ||
+    upper.includes('ISSUE_OFFER') ||
+    upper.includes('AI_RESUME') ||
+    upper.includes('EXPORT')
+  ) {
+    return 'text-[#0F766E]';
+  }
+  if (upper === 'PAGE_VIEW' || upper === 'LOGIN_SUCCESS') {
+    return 'text-[#1D4ED8]';
+  }
+  return 'text-[#334155]';
+}
 
 interface CommunicationsAndAuditViewProps {
   mode: 'emails' | 'team' | 'audit';
@@ -60,6 +132,62 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const [newRole, setNewRole] = useState<StaffRole>('manager');
   const [newDept, setNewDept] = useState<string>('Human Resources');
   const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<number | null>(null);
+
+  // Tamper-evident Audit Trail filter & query state
+  const [auditFilters, setAuditFilters] = useState<AuditLogFilters>(EMPTY_AUDIT_FILTERS);
+  const [filteredAuditLogs, setFilteredAuditLogs] = useState<AuditLogRecord[]>(auditLogs);
+  const [auditTotalCount, setAuditTotalCount] = useState<number>(auditLogs.length);
+  const [auditFacets, setAuditFacets] = useState<{
+    actors: string[];
+    pages: string[];
+    actions: string[];
+  }>({ actors: [], pages: [], actions: [] });
+  const [loadingAudit, setLoadingAudit] = useState(false);
+  const [downloadingAuditCsv, setDownloadingAuditCsv] = useState(false);
+  const [auditError, setAuditError] = useState('');
+
+  const hasActiveAuditFilters = useMemo(
+    () => Object.values(auditFilters).some((v) => String(v).trim().length > 0),
+    [auditFilters]
+  );
+
+  const loadAuditTrail = useCallback(async (activeFilters: AuditLogFilters) => {
+    setLoadingAudit(true);
+    setAuditError('');
+    try {
+      const result = await fetchAuditLogsWithMeta(activeFilters, 500);
+      setFilteredAuditLogs(result.auditLogs);
+      setAuditTotalCount(result.totalCount);
+      setAuditFacets(result.facets);
+    } catch (err) {
+      setAuditError(err instanceof Error ? err.message : 'Failed to load audit trail records.');
+    } finally {
+      setLoadingAudit(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (mode !== 'audit') return;
+    const timer = window.setTimeout(() => {
+      void loadAuditTrail(auditFilters);
+    }, auditFilters.search ? 220 : 0);
+    return () => window.clearTimeout(timer);
+  }, [mode, auditFilters, auditLogs, loadAuditTrail]);
+
+  const handleDownloadAuditCsv = async () => {
+    if (!isAdmin) return;
+    setDownloadingAuditCsv(true);
+    setAuditError('');
+    try {
+      const filename = await downloadAuditLogCsv(auditFilters);
+      onNotify(`Downloaded ${filename}.`);
+      await loadAuditTrail(auditFilters);
+    } catch (err) {
+      setAuditError(err instanceof Error ? err.message : 'Failed to download audit log CSV.');
+    } finally {
+      setDownloadingAuditCsv(false);
+    }
+  };
 
   const pendingDocCandidates = useMemo(
     () => candidates.filter((c) => hasPendingDocs(c)),
@@ -467,53 +595,260 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
     );
   }
 
-  // IMMUTABLE AUDIT LOG VIEW (BOTH ROLES)
+  // TAMPER-EVIDENT IMMUTABLE AUDIT TRAIL VIEW (BOTH ROLES; CSV DOWNLOAD FOR ADMINISTRATOR ONLY)
   return (
-    <div className="space-y-6">
-      <div className="border-b border-[#E2E8F0] pb-4">
-        <h1 className="text-xl font-bold text-[#0F172A]">Security Audit Trail</h1>
-        <p className="text-xs text-[#64748B] mt-0.5">
-          Immutable SQLite record of authentication, candidate lifecycle decisions, document uploads, interview bookings, and report exports.
-        </p>
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#E2E8F0] pb-4">
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="text-xl font-bold text-[#0F172A]">User Activity Audit Trail</h1>
+            <span className="inline-flex items-center gap-1.5 rounded border border-[#CBD5E1] bg-[#F8FAFC] px-2.5 py-0.5 text-[11px] font-mono font-semibold text-[#334155]">
+              <Lock className="h-3 w-3 text-[#0F766E]" />
+              Tamper-Proof Audit Trail • Deletion Disabled
+            </span>
+          </div>
+          <p className="text-xs text-[#64748B]">
+            Append-only SQLite activity ledger recording logins, page visits, AI resume screening, candidate lifecycle updates, documents, interviews, offers, emails, and exports.
+          </p>
+        </div>
+
+        {isAdmin && (
+          <button
+            type="button"
+            disabled={downloadingAuditCsv}
+            onClick={handleDownloadAuditCsv}
+            className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50 cursor-pointer shrink-0"
+          >
+            {downloadingAuditCsv ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            Download Audit Log (CSV)
+          </button>
+        )}
       </div>
 
-      <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
-        <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 text-xs font-bold text-[#0F172A]">
-          Recent Audit Events ({auditLogs.length})
+      {auditError && (
+        <div className="flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#B91C1C]">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{auditError}</span>
         </div>
+      )}
+
+      {/* Multi-Filter Toolbar */}
+      <div className="rounded-lg border border-[#E2E8F0] bg-white p-4 space-y-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+          <div className="lg:col-span-2">
+            <label className="block text-[11px] font-semibold text-[#475569] mb-1">
+              Search Activity
+            </label>
+            <div className="relative">
+              <Search className="h-3.5 w-3.5 text-[#94A3B8] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={auditFilters.search}
+                onChange={(e) => setAuditFilters((prev) => ({ ...prev, search: e.target.value }))}
+                placeholder="User, target, details, or IP..."
+                className="w-full rounded-md border border-[#CBD5E1] bg-white pl-8 pr-3 py-1.5 text-xs text-[#0F172A] placeholder:text-[#94A3B8] focus:border-[#0F766E] focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-[#475569] mb-1">Role</label>
+            <select
+              value={auditFilters.role}
+              onChange={(e) => setAuditFilters((prev) => ({ ...prev, role: e.target.value }))}
+              className="w-full rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+            >
+              <option value="">All Roles</option>
+              <option value="administrator">Administrator</option>
+              <option value="manager">Manager (View Only)</option>
+              <option value="candidate_portal">Candidate Portal</option>
+              <option value="system">System</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-[#475569] mb-1">
+              Page Visited
+            </label>
+            <select
+              value={auditFilters.page_visited}
+              onChange={(e) =>
+                setAuditFilters((prev) => ({ ...prev, page_visited: e.target.value }))
+              }
+              className="w-full rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+            >
+              <option value="">All Pages</option>
+              {auditFacets.pages.map((page) => (
+                <option key={page} value={page}>
+                  {page}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-[#475569] mb-1">
+              Action Taken
+            </label>
+            <select
+              value={auditFilters.action_taken}
+              onChange={(e) =>
+                setAuditFilters((prev) => ({ ...prev, action_taken: e.target.value }))
+              }
+              className="w-full rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-mono text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+            >
+              <option value="">All Actions</option>
+              {auditFacets.actions.map((action) => (
+                <option key={action} value={action}>
+                  {action}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">From</label>
+              <input
+                type="date"
+                value={auditFilters.date_from}
+                onChange={(e) =>
+                  setAuditFilters((prev) => ({ ...prev, date_from: e.target.value }))
+                }
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-2 py-1.5 text-xs font-mono text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">To</label>
+              <input
+                type="date"
+                value={auditFilters.date_to}
+                onChange={(e) => setAuditFilters((prev) => ({ ...prev, date_to: e.target.value }))}
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-2 py-1.5 text-xs font-mono text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#F1F5F9] text-[11px] text-[#64748B]">
+          <div className="flex items-center gap-2 font-mono tabular-nums">
+            {loadingAudit && <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />}
+            <span>
+              Showing <strong className="text-[#0F172A]">{filteredAuditLogs.length}</strong> of{' '}
+              <strong className="text-[#0F172A]">{auditTotalCount}</strong> immutable event(s)
+            </span>
+          </div>
+
+          {hasActiveAuditFilters && (
+            <button
+              type="button"
+              onClick={() => setAuditFilters(EMPTY_AUDIT_FILTERS)}
+              className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F8FAFC] cursor-pointer"
+            >
+              <RotateCcw className="h-3 w-3" />
+              Reset Filters
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Immutable 7-Column Activity Table (Zero Delete/Edit/Clear Controls) */}
+      <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
-            <thead className="border-b border-[#E2E8F0] bg-[#FAFBFC] text-[11px] uppercase tracking-wider text-[#64748B]">
+            <thead className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] uppercase tracking-wider text-[#64748B]">
               <tr>
-                <th className="px-4 py-2.5 font-semibold">Timestamp</th>
-                <th className="px-4 py-2.5 font-semibold">Actor</th>
-                <th className="px-4 py-2.5 font-semibold">Action</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Timestamp</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">User &amp; Role</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Page Visited</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Action Taken</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">Target</th>
                 <th className="px-4 py-2.5 font-semibold">Details</th>
+                <th className="px-4 py-2.5 font-semibold whitespace-nowrap">IP Address</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
-              {auditLogs.length === 0 ? (
+              {filteredAuditLogs.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-4 py-8 text-center text-[#64748B]">
-                    No audit events recorded yet.
+                  <td colSpan={7} className="px-4 py-10 text-center text-xs text-[#64748B]">
+                    {loadingAudit
+                      ? 'Loading audit trail records...'
+                      : hasActiveAuditFilters
+                        ? 'No audit events match the active filters.'
+                        : 'No user activity events recorded yet.'}
                   </td>
                 </tr>
               ) : (
-                auditLogs.map((log) => (
-                  <tr key={log.id} className="hover:bg-[#FAFBFC]">
-                    <td className="px-4 py-2.5 font-mono text-[11px] text-[#64748B] whitespace-nowrap">
-                      {formatTimestamp(log.created_at)}
-                    </td>
-                    <td className="px-4 py-2.5 whitespace-nowrap">
-                      <span className="font-medium text-[#0F172A]">{log.actor_email}</span>{' '}
-                      <span className="font-mono text-[10px] text-[#64748B]">({log.actor_role})</span>
-                    </td>
-                    <td className="px-4 py-2.5 font-mono font-semibold text-[#0F766E] whitespace-nowrap">
-                      {log.action}
-                    </td>
-                    <td className="px-4 py-2.5 text-[#334155]">{log.details}</td>
-                  </tr>
-                ))
+                filteredAuditLogs.map((log) => {
+                  const ts = formatAuditMytDisplay(log.timestamp);
+                  const browserSummary = summarizeUserAgent(log.user_agent);
+                  const roleLabel =
+                    AUDIT_ROLE_LABELS[log.actor_role] || log.actor_role;
+
+                  return (
+                    <tr key={log.id} className="hover:bg-[#FAFBFC] align-top">
+                      <td
+                        className="px-4 py-2.5 font-mono text-[11px] text-[#475569] whitespace-nowrap tabular-nums"
+                        title={ts.iso}
+                      >
+                        <div className="font-medium text-[#0F172A]">{ts.display}</div>
+                        <div className="text-[10px] text-[#94A3B8]">#{log.id}</div>
+                      </td>
+                      <td className="px-4 py-2.5 whitespace-nowrap">
+                        <div className="font-semibold text-[#0F172A]">{log.actor_name}</div>
+                        <div
+                          className={`text-[10px] font-mono ${
+                            log.actor_role === 'administrator'
+                              ? 'text-[#0F766E]'
+                              : log.actor_role === 'candidate_portal'
+                                ? 'text-[#1D4ED8]'
+                                : 'text-[#64748B]'
+                          }`}
+                        >
+                          {roleLabel}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2.5 font-medium text-[#334155] whitespace-nowrap">
+                        {log.page_visited}
+                      </td>
+                      <td className="px-4 py-2.5 whitespace-nowrap">
+                        <span
+                          className={`font-mono text-[11px] font-semibold ${getActionToneClass(
+                            log.action_taken
+                          )}`}
+                        >
+                          {log.action_taken}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5 text-[#334155] max-w-[200px]">
+                        <div className="truncate font-medium" title={log.target_entity || undefined}>
+                          {log.target_entity || '—'}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2.5 text-[#334155] min-w-[240px]">
+                        <div className="leading-relaxed">{log.details}</div>
+                        {browserSummary && (
+                          <div
+                            className="mt-0.5 text-[10px] font-mono text-[#94A3B8] truncate max-w-[320px]"
+                            title={log.user_agent}
+                          >
+                            Client: {browserSummary}
+                          </div>
+                        )}
+                      </td>
+                      <td
+                        className="px-4 py-2.5 font-mono text-[11px] text-[#64748B] whitespace-nowrap tabular-nums"
+                        title={log.user_agent || undefined}
+                      >
+                        {log.ip_address || '—'}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

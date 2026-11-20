@@ -164,16 +164,40 @@ export interface EmailLogRecord {
   created_at: string;
 }
 
+export type AuditActorRole = 'administrator' | 'manager' | 'candidate_portal' | 'system';
+
 export interface AuditLogRecord {
   id: number;
+  timestamp: string;
   actor_id: number | null;
-  actor_email: string;
-  actor_role: string;
-  action: string;
-  target_type: string;
-  target_id: string;
+  actor_name: string;
+  actor_role: AuditActorRole;
+  page_visited: string;
+  action_taken: string;
+  target_entity: string;
   details: string;
-  created_at: string;
+  ip_address: string;
+  user_agent: string;
+}
+
+export interface AuditLogFilters {
+  search: string;
+  actor: string;
+  role: string;
+  page_visited: string;
+  action_taken: string;
+  date_from: string;
+  date_to: string;
+}
+
+export interface AuditLogsQueryResult {
+  auditLogs: AuditLogRecord[];
+  totalCount: number;
+  facets: {
+    actors: string[];
+    pages: string[];
+    actions: string[];
+  };
 }
 
 export interface ParsedResumeResult {
