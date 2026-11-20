@@ -239,11 +239,16 @@ export async function parseResumeWithAi(payload: {
   department?: string;
   rubric?: string;
 }): Promise<ParsedResumeResult> {
+  const cleanedText = String(payload.resumeText ?? '')
+    .replace(/\uFFFD/g, ' ')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ')
+    .trim();
+
   if (payload.file) {
     const form = new FormData();
     form.append('file', payload.file);
-    if (payload.resumeText?.trim()) {
-      form.append('resumeText', payload.resumeText.trim());
+    if (cleanedText) {
+      form.append('resumeText', cleanedText);
     }
     form.append('position', payload.position);
     if (payload.department) {
@@ -259,7 +264,7 @@ export async function parseResumeWithAi(payload: {
         body: form,
       },
       true,
-      65_000
+      75_000
     );
     return unwrapResumePayload(raw);
   }
@@ -269,14 +274,14 @@ export async function parseResumeWithAi(payload: {
     {
       method: 'POST',
       body: JSON.stringify({
-        resumeText: payload.resumeText?.trim() || '',
+        resumeText: cleanedText,
         position: payload.position,
         department: payload.department || '',
         rubric: payload.rubric?.trim() || '',
       }),
     },
     true,
-    65_000
+    75_000
   );
   return unwrapResumePayload(raw);
 }

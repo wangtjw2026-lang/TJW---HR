@@ -7,7 +7,7 @@ import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   db,
   ensureCandidateDocumentRows,
@@ -196,6 +196,13 @@ function inferResumeMimeType(mimeType: string, fileName: string): string {
   const normalized = (mimeType || '').toLowerCase().split(';')[0].trim();
   if (normalized === 'image/jpg') return 'image/jpeg';
   return normalized;
+}
+
+function sanitizeResumeText(raw: unknown): string {
+  return String(raw ?? '')
+    .replace(/\uFFFD/g, ' ')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ')
+    .trim();
 }
 
 function formatMalaysianPhone(raw: string): string {
@@ -753,7 +760,7 @@ async function startServer() {
             ? (req.files[0] as Express.Multer.File)
             : null);
 
-        let combinedResumeText = String(body.resumeText ?? body.resume_text ?? '').trim();
+        let resumeText = sanitizeResumeText(body.resumeText ?? body.resume_text);
         const position = String(body.position ?? body.positionApplied ?? '').trim() || 'General Role';
         const department = String(body.department ?? '').trim() || 'Operations';
         const rubric = String(body.rubric ?? body.jobRequirements ?? '').trim();
@@ -788,17 +795,14 @@ async function startServer() {
 
           const resolvedMime = inferResumeMimeType(uploadedFile.mimetype, uploadedFile.originalname);
           if (resolvedMime === 'text/plain') {
-            const decodedText = fileBuffer.toString('utf8').trim();
+            const decodedText = sanitizeResumeText(fileBuffer.toString('utf8'));
             if (decodedText) {
-              combinedResumeText = combinedResumeText
-                ? `${combinedResumeText}\n\n${decodedText}`
-                : decodedText;
+              resumeText = resumeText ? `${resumeText}\n\n${decodedText}` : decodedText;
             }
           } else if (SUPPORTED_INLINE_MIMES.has(resolvedMime)) {
-            const base64Data = fileBuffer.toString('base64');
             inlineFile = {
               mimeType: resolvedMime,
-              data: base64Data,
+              data: fileBuffer.toString('base64'),
             };
           } else {
             res.status(400).json({
@@ -812,11 +816,9 @@ async function startServer() {
             : rawJsonBase64;
           const resolvedMime = inferResumeMimeType(rawJsonMimeType, fileName);
           if (resolvedMime === 'text/plain') {
-            const decodedText = Buffer.from(cleanBase64, 'base64').toString('utf8').trim();
+            const decodedText = sanitizeResumeText(Buffer.from(cleanBase64, 'base64').toString('utf8'));
             if (decodedText) {
-              combinedResumeText = combinedResumeText
-                ? `${combinedResumeText}\n\n${decodedText}`
-                : decodedText;
+              resumeText = resumeText ? `${resumeText}\n\n${decodedText}` : decodedText;
             }
           } else if (SUPPORTED_INLINE_MIMES.has(resolvedMime)) {
             inlineFile = {
@@ -831,22 +833,27 @@ async function startServer() {
           }
         }
 
-        if (!combinedResumeText && !inlineFile) {
-          res.status(400).json({
-            error: 'Please upload a resume file (PDF, PNG, JPG, or TXT) or paste resume text before analyzing.',
-          });
+        if (!inlineFile && !resumeText) {
+          res.status(400).json({ error: 'No resume file or text provided.' });
           return;
         }
 
         const ai = getGeminiClient();
-        const geminiModel = (process.env.GEMINI_MODEL || '').trim() || 'gemini-3.8-flash';
+        const configuredModel = (process.env.GEMINI_MODEL || '').trim();
+        const modelCandidates = Array.from(
+          new Set([
+            ...(configuredModel ? [configuredModel] : []),
+            'gemini-4-hydrogen',
+            'gemini-3.1-flash-lite',
+          ])
+        );
 
         console.log('[Gemini Parse Resume] Request:', {
-          model: geminiModel,
+          models: modelCandidates,
           hasInlineFile: Boolean(inlineFile),
           inlineMimeType: inlineFile?.mimeType || null,
           inlineBase64Length: inlineFile?.data.length || 0,
-          textLength: combinedResumeText.length,
+          textLength: resumeText.length,
           fileName: fileName || null,
           position,
         });
@@ -855,7 +862,7 @@ async function startServer() {
           'You are an experienced Malaysian enterprise HR recruitment specialist.',
           `Analyze the candidate resume for the position "${position}" in the "${department}" department.`,
           rubric ? `Screening rubric / role requirements: ${rubric}` : '',
-          'Extract every available candidate detail accurately from the attached resume document and/or resume text into a single flat JSON object with these exact keys:',
+          'Extract every available candidate detail accurately from the resume into a single flat JSON object with these exact keys:',
           '- full_name: Candidate full name exactly as written on the resume.',
           '- email: Candidate email address (empty string if not present; never invent).',
           '- phone: Candidate phone number formatted cleanly for Malaysia (e.g., 012-3456789 or 011-12345678; empty string if not present).',
@@ -871,7 +878,9 @@ async function startServer() {
           .filter(Boolean)
           .join('\n');
 
-        const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+        const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [
+          { text: prompt },
+        ];
 
         if (inlineFile) {
           parts.push({
@@ -882,93 +891,132 @@ async function startServer() {
           });
         }
 
-        parts.push({
-          text: combinedResumeText
-            ? `${prompt}\n\nCandidate Resume Text (${fileName || 'Pasted Resume'}):\n${combinedResumeText}`
-            : `${prompt}\n\nRead the attached resume file (${fileName || 'uploaded resume'}) thoroughly and extract all fields into JSON.`,
-        });
+        if (resumeText) {
+          parts.push({
+            text: `Resume Content:\n${resumeText.slice(0, 60_000)}`,
+          });
+        }
 
-        const AI_TIMEOUT_MS = 55_000;
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        const timeoutPromise = new Promise<never>((_resolve, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error('Gemini AI resume analysis timed out after 55 seconds. Please try again.'));
-          }, AI_TIMEOUT_MS);
-        });
-
-        const response = await Promise.race([
-          ai.models.generateContent({
-            model: geminiModel,
-            contents: [{ role: 'user', parts }],
-            config: {
-              systemInstruction:
-                'Return strictly valid flat JSON matching the provided schema. Never wrap the JSON inside an extra key or array. Never fabricate email addresses or phone numbers that do not appear in the resume.',
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  full_name: { type: Type.STRING, description: 'Candidate full name' },
-                  email: { type: Type.STRING, description: 'Candidate email address if present, else empty string' },
-                  phone: {
-                    type: Type.STRING,
-                    description: 'Phone number formatted cleanly for Malaysia e.g. 01X-XXXXXXX',
-                  },
-                  location: { type: Type.STRING, description: 'City / State location' },
-                  years_experience: {
-                    type: Type.NUMBER,
-                    description: 'Total relevant years of working experience (0 to 50)',
-                  },
-                  has_uec: {
-                    type: Type.BOOLEAN,
-                    description: 'Whether UEC qualification is explicitly mentioned',
-                  },
-                  skills: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: 'List of key technical and domain skills',
-                  },
-                  education: {
-                    type: Type.STRING,
-                    description: 'Highest qualification, institution, CGPA/grade, and SPM/UEC/Degree details',
-                  },
-                  experience: {
-                    type: Type.STRING,
-                    description: 'Concise summary of relevant roles, employers, and years of experience',
-                  },
-                  ai_score: { type: Type.INTEGER, description: 'Job-fit score from 0 to 100' },
-                  ai_summary: {
-                    type: Type.STRING,
-                    description: 'HR screening summary covering strengths, gaps, and recommendation',
-                  },
-                },
-                required: [
-                  'full_name',
-                  'email',
-                  'phone',
-                  'location',
-                  'years_experience',
-                  'has_uec',
-                  'skills',
-                  'education',
-                  'experience',
-                  'ai_score',
-                  'ai_summary',
-                ],
-              },
+        const responseSchema = {
+          type: Type.OBJECT,
+          properties: {
+            full_name: { type: Type.STRING, description: 'Candidate full name' },
+            email: { type: Type.STRING, description: 'Candidate email address if present, else empty string' },
+            phone: {
+              type: Type.STRING,
+              description: 'Phone number formatted cleanly for Malaysia e.g. 01X-XXXXXXX',
             },
-          }),
-          timeoutPromise,
-        ]).finally(() => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-        });
+            location: { type: Type.STRING, description: 'City / State location' },
+            years_experience: {
+              type: Type.NUMBER,
+              description: 'Total relevant years of working experience (0 to 50)',
+            },
+            has_uec: {
+              type: Type.BOOLEAN,
+              description: 'Whether UEC qualification is explicitly mentioned',
+            },
+            skills: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description: 'List of key technical and domain skills',
+            },
+            education: {
+              type: Type.STRING,
+              description: 'Highest qualification, institution, CGPA/grade, and SPM/UEC/Degree details',
+            },
+            experience: {
+              type: Type.STRING,
+              description: 'Concise summary of relevant roles, employers, and years of experience',
+            },
+            ai_score: { type: Type.INTEGER, description: 'Job-fit score from 0 to 100' },
+            ai_summary: {
+              type: Type.STRING,
+              description: 'HR screening summary covering strengths, gaps, and recommendation',
+            },
+          },
+          required: [
+            'full_name',
+            'email',
+            'phone',
+            'location',
+            'years_experience',
+            'has_uec',
+            'skills',
+            'education',
+            'experience',
+            'ai_score',
+            'ai_summary',
+          ],
+        };
 
-        const responseText = (response.text ?? '').trim();
+        const PER_ATTEMPT_TIMEOUT_MS = 28_000;
+        let responseText = '';
+        let lastError: unknown = null;
+
+        for (const modelName of modelCandidates) {
+          let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+          const abortController = new AbortController();
+          const timeoutPromise = new Promise<never>((_resolve, reject) => {
+            timeoutHandle = setTimeout(() => {
+              abortController.abort();
+              reject(new Error(`Model ${modelName} timed out after ${PER_ATTEMPT_TIMEOUT_MS / 1000}s.`));
+            }, PER_ATTEMPT_TIMEOUT_MS);
+          });
+
+          const thinkingConfig =
+            modelName === 'gemini-3.1-flash-lite'
+              ? { thinkingLevel: ThinkingLevel.MINIMAL }
+              : /^gemini-(3|4)/i.test(modelName)
+                ? { thinkingLevel: ThinkingLevel.LOW }
+                : undefined;
+
+          try {
+            const response = await Promise.race([
+              ai.models.generateContent({
+                model: modelName,
+                contents: [{ role: 'user', parts }],
+                config: {
+                  abortSignal: abortController.signal,
+                  systemInstruction:
+                    'Return strictly valid flat JSON matching the provided schema. Never wrap the JSON inside an extra key or array. Never fabricate email addresses or phone numbers that do not appear in the resume.',
+                  responseMimeType: 'application/json',
+                  responseSchema,
+                  ...(thinkingConfig ? { thinkingConfig } : {}),
+                },
+              }),
+              timeoutPromise,
+            ]).finally(() => {
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+            });
+
+            const candidateText = (response.text ?? '').trim();
+            if (candidateText) {
+              responseText = candidateText;
+              console.log(`[Gemini Parse Resume] Succeeded with model=${modelName}`);
+              break;
+            }
+            lastError = new Error(`Model ${modelName} returned an empty response.`);
+          } catch (attemptErr: unknown) {
+            lastError = attemptErr;
+            const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+            console.warn(`[Gemini Parse Resume] Attempt failed on model=${modelName}:`, errMsg);
+            // Stop retrying immediately on invalid API key or quota exhaustion
+            if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|429|RESOURCE_EXHAUSTED/i.test(errMsg)) {
+              throw attemptErr;
+            }
+          }
+        }
+
         console.log('Gemini raw extraction:', responseText);
 
         if (!responseText) {
+          if (lastError instanceof Error) {
+            throw lastError;
+          }
           res.status(502).json({
-            error:
-              'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.',
+            error: inlineFile
+              ? 'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
+              : 'Could not extract candidate details from the pasted resume text. Please try again.',
           });
           return;
         }
@@ -1038,7 +1086,7 @@ async function startServer() {
           : 0;
         const hasUec =
           Boolean(parsed.has_uec ?? parsed.hasUec ?? parsed.detected_uec_mention ?? parsed.detectedUecMention) ||
-          /\buec\b/i.test(`${education} ${combinedResumeText}`);
+          /\buec\b/i.test(`${education} ${resumeText}`);
 
         const extractedFieldCount = [
           fullName,
@@ -1053,8 +1101,9 @@ async function startServer() {
 
         if (extractedFieldCount === 0) {
           res.status(422).json({
-            error:
-              'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.',
+            error: inlineFile
+              ? 'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
+              : 'Could not extract candidate profile fields from the pasted resume text. Please include more candidate details and try again.',
           });
           return;
         }
@@ -1080,6 +1129,7 @@ async function startServer() {
         let userMessage = rawMessage;
         if (/timed out/i.test(rawMessage)) {
           statusCode = 504;
+          userMessage = 'Gemini AI resume analysis timed out. Please retry or paste the plain resume text.';
         } else if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(rawMessage)) {
           userMessage =
             'Invalid or unauthorized GEMINI_API_KEY on the server. Please verify your Gemini API key in Settings > Secrets.';

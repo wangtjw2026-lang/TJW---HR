@@ -107,8 +107,15 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
   };
 
   const handleAnalyzeResume = async () => {
-    if (!resumeFile && !resumeText.trim()) {
-      setParseError('Please upload a resume file (PDF, PNG, JPG, or TXT) or paste resume text first.');
+    const cleanedText = resumeText
+      .replace(/\uFFFD/g, ' ')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ')
+      .trim();
+
+    if (!resumeFile && cleanedText.length <= 20) {
+      setParseError(
+        'Please upload a resume file (PDF, PNG, JPG, or TXT) or paste at least 20 characters of resume text first.'
+      );
       setParseSuccess(null);
       return;
     }
@@ -121,7 +128,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
     try {
       const res = await parseResumeWithAi({
         file: resumeFile,
-        resumeText: resumeText.trim() || undefined,
+        resumeText: cleanedText || undefined,
         position: positionApplied,
         department,
         rubric: rubric.trim() || undefined,
@@ -175,7 +182,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
             payload.hasUec ||
             payload.detected_uec_mention ||
             payload.detectedUecMention
-        ) || /\buec\b/i.test(`${extractedEducation} ${resumeText}`);
+        ) || /\buec\b/i.test(`${extractedEducation} ${cleanedText}`);
 
       const extractedCount = [
         extractedName,
@@ -192,7 +199,9 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
         setAiMatchScore(null);
         setParseSuccess(null);
         setParseError(
-          'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
+          resumeFile
+            ? 'Could not read text from the uploaded resume. Please check that the PDF is not password-protected or paste the CV text directly.'
+            : 'Could not extract candidate profile fields from the pasted resume text. Please include more candidate details and try again.'
         );
         return;
       }
