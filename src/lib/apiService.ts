@@ -82,8 +82,30 @@ export function getProtectedFileUrl(filename: string, portalToken?: string): str
 }
 
 // =============================================================================
-// AUTH & STAFF USERS
+// AUTH, FIRST-RUN SETUP & STAFF USERS
 // =============================================================================
+export async function fetchAuthSetupStatus(): Promise<{ needsSetup: boolean }> {
+  return apiFetch<{ needsSetup: boolean }>('/api/auth/setup-status', {}, false);
+}
+
+export async function setupInitialHrAdmin(params: {
+  name: string;
+  email: string;
+  password: string;
+  department?: string;
+}): Promise<{ token: string; user: StaffUser }> {
+  const data = await apiFetch<{ token: string; user: StaffUser }>(
+    '/api/auth/setup',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    },
+    false
+  );
+  setStoredToken(data.token);
+  return data;
+}
+
 export async function loginStaff(email: string, password: string): Promise<{ token: string; user: StaffUser }> {
   const data = await apiFetch<{ token: string; user: StaffUser }>(
     '/api/auth/login',
@@ -131,6 +153,10 @@ export async function updateStaffUser(id: number, role: StaffRole, department: s
     body: JSON.stringify({ role, department }),
   });
   return data.user;
+}
+
+export async function deleteStaffUser(id: number): Promise<void> {
+  await apiFetch(`/api/users/${id}`, { method: 'DELETE' });
 }
 
 // =============================================================================
@@ -498,7 +524,7 @@ export async function portalRespondToOffer(
 }
 
 // =============================================================================
-// EMAIL LOGS, AUDIT LOGS & SEEDING
+// EMAIL LOGS & AUDIT LOGS
 // =============================================================================
 export async function fetchEmailLogs(): Promise<EmailLogRecord[]> {
   const data = await apiFetch<{ emailLogs: EmailLogRecord[] }>('/api/email-logs');
@@ -515,8 +541,4 @@ export async function logCsvExport(count: number): Promise<void> {
     method: 'POST',
     body: JSON.stringify({ count }),
   });
-}
-
-export async function seedSampleWorkspace(): Promise<void> {
-  await apiFetch('/api/seed', { method: 'POST' });
 }

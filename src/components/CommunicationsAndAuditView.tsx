@@ -5,11 +5,13 @@ import {
   CheckCircle2,
   Mail,
   Shield,
+  Trash2,
   UserPlus,
   Users,
 } from 'lucide-react';
 import {
   createStaffUser,
+  deleteStaffUser,
   sendBatchDocReminders,
   updateStaffUser,
 } from '../lib/apiService';
@@ -25,7 +27,7 @@ import {
 } from '../types/ats';
 
 interface CommunicationsAndAuditViewProps {
-  mode: 'emails' | 'audit';
+  mode: 'emails' | 'team' | 'audit';
   emailLogs: EmailLogRecord[];
   auditLogs: AuditLogRecord[];
   staffUsers: StaffUser[];
@@ -45,18 +47,19 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   onRefresh,
   onNotify,
 }) => {
-  const isHrAdmin = currentUser.role === 'HR_ADMIN';
+  const isAdmin = currentUser.role === 'administrator';
 
   const [selectedEmailId, setSelectedEmailId] = useState<number | null>(emailLogs[0]?.id ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  // Create new staff user form (HR_ADMIN only)
+  // Create new staff user form (administrator only)
   const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  const [newRole, setNewRole] = useState<StaffRole>('RECRUITER');
+  const [newRole, setNewRole] = useState<StaffRole>('manager');
   const [newDept, setNewDept] = useState<string>('Human Resources');
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<number | null>(null);
 
   const pendingDocCandidates = useMemo(
     () => candidates.filter((c) => hasPendingDocs(c)),
@@ -67,7 +70,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
     emailLogs.find((e) => e.id === selectedEmailId) || emailLogs[0] || null;
 
   const handleBatchReminder = async () => {
-    if (pendingDocCandidates.length === 0) return;
+    if (!isAdmin || pendingDocCandidates.length === 0) return;
     setBusy(true);
     setError('');
     try {
@@ -83,6 +86,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -96,29 +100,48 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
       setNewName('');
       setNewEmail('');
       setNewPassword('');
+      setNewRole('manager');
       await onRefresh();
-      onNotify(`Created ${newRole} account for ${newEmail}.`);
+      onNotify(`Created ${ROLE_META[newRole].label} account for ${newEmail}.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create staff user.');
+      setError(err instanceof Error ? err.message : 'Failed to create user account.');
     } finally {
       setBusy(false);
     }
   };
 
   const handleRoleChange = async (user: StaffUser, role: StaffRole) => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
       await updateStaffUser(user.id, role, user.department);
       await onRefresh();
-      onNotify(`Updated ${user.email} role to ${ROLE_META[role].label}.`);
+      onNotify(`Updated ${user.email} role to ${ROLE_META[role].badgeLabel}.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update staff role.');
+      setError(err instanceof Error ? err.message : 'Failed to update role.');
     } finally {
       setBusy(false);
     }
   };
 
+  const handleDeleteUser = async (user: StaffUser) => {
+    if (!isAdmin) return;
+    setBusy(true);
+    setError('');
+    try {
+      await deleteStaffUser(user.id);
+      setConfirmDeleteUserId(null);
+      await onRefresh();
+      onNotify(`Removed ${user.email} from workspace access.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove user.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // EMAIL AUTOMATION LOG VIEW
   if (mode === 'emails') {
     return (
       <div className="space-y-6">
@@ -129,15 +152,17 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
               Every Nodemailer dispatch (Shortlist Forms, Reminders, Interview Invites, Confirmations &amp; Offers) is logged in SQLite.
             </p>
           </div>
-          <button
-            type="button"
-            disabled={busy || pendingDocCandidates.length === 0}
-            onClick={handleBatchReminder}
-            className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-          >
-            <BellRing className="h-3.5 w-3.5" />
-            Send Batch Doc Reminders ({pendingDocCandidates.length})
-          </button>
+          {isAdmin && (
+            <button
+              type="button"
+              disabled={busy || pendingDocCandidates.length === 0}
+              onClick={handleBatchReminder}
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+            >
+              <BellRing className="h-3.5 w-3.5" />
+              Send Batch Doc Reminders ({pendingDocCandidates.length})
+            </button>
+          )}
         </div>
 
         {error && (
@@ -232,127 +257,98 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
     );
   }
 
-  // AUDIT & TEAM RBAC VIEW
-  return (
-    <div className="space-y-6">
-      <div className="border-b border-[#E2E8F0] pb-4">
-        <h1 className="text-xl font-bold text-[#0F172A]">Team Roles (RBAC) &amp; Security Audit Trail</h1>
-        <p className="text-xs text-[#64748B] mt-0.5">
-          Manage `HR_ADMIN` and `RECRUITER` staff accounts in SQLite and review immutable recruitment audit events.
-        </p>
-      </div>
-
-      {error && (
-        <div className="flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#B91C1C]">
-          <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>{error}</span>
+  // TEAM & ACCESS VIEW (ADMINISTRATOR ONLY)
+  if (mode === 'team') {
+    if (!isAdmin) {
+      return (
+        <div className="rounded-lg border border-[#E2E8F0] bg-white p-8 text-center text-xs text-[#64748B]">
+          Team &amp; Access management is restricted to Administrator accounts.
         </div>
-      )}
+      );
+    }
 
-      {/* Role Policy Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {(['HR_ADMIN', 'RECRUITER'] as StaffRole[]).map((roleKey) => (
-          <div key={roleKey} className="rounded-lg border border-[#E2E8F0] bg-white p-4 space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
-                <Shield className="h-4 w-4 text-[#0F766E]" />
-                {ROLE_META[roleKey].label}
-              </span>
-              <span className="font-mono text-[11px] font-semibold text-[#64748B]">{roleKey}</span>
-            </div>
-            <p className="text-xs text-[#475569] leading-relaxed">{ROLE_META[roleKey].summary}</p>
-          </div>
-        ))}
-      </div>
-
-      {/* Staff Accounts Table + Create Form */}
-      <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
-        <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 flex items-center justify-between">
-          <div className="inline-flex items-center gap-2 text-xs font-bold text-[#0F172A]">
-            <Users className="h-4 w-4 text-[#0F766E]" />
-            HR Staff Accounts ({staffUsers.length})
-          </div>
-          {!isHrAdmin && (
-            <span className="text-[11px] text-[#64748B]">Read-only (HR Admin required to modify roles)</span>
-          )}
+    return (
+      <div className="space-y-6">
+        <div className="border-b border-[#E2E8F0] pb-4">
+          <h1 className="text-xl font-bold text-[#0F172A]">Team &amp; Access</h1>
+          <p className="text-xs text-[#64748B] mt-0.5">
+            Create and manage <strong>Administrator</strong> (full access) and <strong>Manager (View Only)</strong> logins directly in SQLite.
+          </p>
         </div>
 
-        <table className="w-full text-left text-xs">
-          <thead className="border-b border-[#E2E8F0] bg-[#FAFBFC] text-[11px] uppercase tracking-wider text-[#64748B]">
-            <tr>
-              <th className="px-4 py-2.5 font-semibold">Staff Name</th>
-              <th className="px-4 py-2.5 font-semibold">Email</th>
-              <th className="px-4 py-2.5 font-semibold">Department</th>
-              <th className="px-4 py-2.5 font-semibold">Role</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-[#E2E8F0]">
-            {staffUsers.map((u) => (
-              <tr key={u.id} className="hover:bg-[#FAFBFC]">
-                <td className="px-4 py-3 font-semibold text-[#0F172A]">
-                  {u.name} {u.id === currentUser.id && <span className="text-[11px] text-[#0F766E]">(You)</span>}
-                </td>
-                <td className="px-4 py-3 font-mono text-[#334155]">{u.email}</td>
-                <td className="px-4 py-3 text-[#475569]">{u.department}</td>
-                <td className="px-4 py-3">
-                  {isHrAdmin ? (
-                    <select
-                      value={u.role}
-                      disabled={busy}
-                      onChange={(e) => handleRoleChange(u, e.target.value as StaffRole)}
-                      className="rounded border border-[#CBD5E1] bg-white px-2 py-1 text-xs font-semibold text-[#0F172A]"
-                    >
-                      <option value="HR_ADMIN">HR Admin</option>
-                      <option value="RECRUITER">Recruiter</option>
-                    </select>
-                  ) : (
-                    <span className="font-mono font-semibold text-[#334155]">{ROLE_META[u.role].label}</span>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        {error && (
+          <div className="flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#B91C1C]">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
 
-        {isHrAdmin && (
-          <form
-            onSubmit={handleCreateUser}
-            className="border-t border-[#E2E8F0] bg-[#FAFBFC] p-4 space-y-3"
-          >
-            <div className="inline-flex items-center gap-1.5 text-xs font-bold text-[#0F172A]">
-              <UserPlus className="h-3.5 w-3.5 text-[#0F766E]" />
-              Add New Staff Account
+        {/* Role Policy Overview */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {(['administrator', 'manager'] as StaffRole[]).map((roleKey) => (
+            <div key={roleKey} className="rounded-lg border border-[#E2E8F0] bg-white p-4 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
+                  <Shield className="h-4 w-4 text-[#0F766E]" />
+                  {ROLE_META[roleKey].badgeLabel}
+                </span>
+                <span className="font-mono text-[11px] font-semibold text-[#64748B]">{roleKey}</span>
+              </div>
+              <p className="text-xs text-[#475569] leading-relaxed">{ROLE_META[roleKey].summary}</p>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+          ))}
+        </div>
+
+        {/* Create User Form */}
+        <form
+          onSubmit={handleCreateUser}
+          className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4"
+        >
+          <div className="inline-flex items-center gap-1.5 text-sm font-bold text-[#0F172A]">
+            <UserPlus className="h-4 w-4 text-[#0F766E]" />
+            Create New User Login
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">Full Name</label>
               <input
                 type="text"
                 required
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                placeholder="Full Name"
-                className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs"
+                placeholder="Enter full name"
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
               />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">Work Email</label>
               <input
                 type="email"
                 required
                 value={newEmail}
                 onChange={(e) => setNewEmail(e.target.value)}
-                placeholder="staff@company.com"
-                className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs"
+                placeholder="name@yourcompany.com"
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
               />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">Password (min 6 chars)</label>
               <input
                 type="password"
                 required
                 minLength={6}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="Temp Password (6+ chars)"
-                className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs"
+                placeholder="Set login password"
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
               />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">Department</label>
               <select
                 value={newDept}
                 onChange={(e) => setNewDept(e.target.value)}
-                className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs"
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
               >
                 {DEPARTMENTS.map((d) => (
                   <option key={d} value={d}>
@@ -360,32 +356,130 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
                   </option>
                 ))}
               </select>
-              <div className="flex gap-2">
-                <select
-                  value={newRole}
-                  onChange={(e) => setNewRole(e.target.value as StaffRole)}
-                  className="flex-1 rounded border border-[#CBD5E1] bg-white px-2 py-1.5 text-xs"
-                >
-                  <option value="RECRUITER">Recruiter</option>
-                  <option value="HR_ADMIN">HR Admin</option>
-                </select>
-                <button
-                  type="submit"
-                  disabled={busy}
-                  className="rounded bg-[#0F766E] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                >
-                  Add
-                </button>
-              </div>
             </div>
-          </form>
-        )}
+            <div>
+              <label className="block text-[11px] font-semibold text-[#475569] mb-1">Access Role</label>
+              <select
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as StaffRole)}
+                className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-semibold text-[#0F172A]"
+              >
+                <option value="manager">Manager (View Only)</option>
+                <option value="administrator">Administrator (Full Access)</option>
+              </select>
+            </div>
+          </div>
+          <div className="flex justify-end">
+            <button
+              type="submit"
+              disabled={busy}
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+            >
+              <UserPlus className="h-3.5 w-3.5" />
+              Create User Account
+            </button>
+          </div>
+        </form>
+
+        {/* Staff Accounts Table */}
+        <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
+          <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 flex items-center justify-between">
+            <div className="inline-flex items-center gap-2 text-xs font-bold text-[#0F172A]">
+              <Users className="h-4 w-4 text-[#0F766E]" />
+              Registered Workspace Users ({staffUsers.length})
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-[#E2E8F0] bg-[#FAFBFC] text-[11px] uppercase tracking-wider text-[#64748B]">
+                <tr>
+                  <th className="px-4 py-2.5 font-semibold">Name</th>
+                  <th className="px-4 py-2.5 font-semibold">Work Email</th>
+                  <th className="px-4 py-2.5 font-semibold">Department</th>
+                  <th className="px-4 py-2.5 font-semibold">Role</th>
+                  <th className="px-4 py-2.5 font-semibold text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#E2E8F0]">
+                {staffUsers.map((u) => {
+                  const isSelf = u.id === currentUser.id;
+                  return (
+                    <tr key={u.id} className="hover:bg-[#FAFBFC]">
+                      <td className="px-4 py-3 font-semibold text-[#0F172A]">
+                        {u.name}{' '}
+                        {isSelf && <span className="text-[11px] font-mono text-[#0F766E]">(You)</span>}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-[#334155]">{u.email}</td>
+                      <td className="px-4 py-3 text-[#475569]">{u.department}</td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={u.role}
+                          disabled={busy}
+                          onChange={(e) => handleRoleChange(u, e.target.value as StaffRole)}
+                          className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-semibold text-[#0F172A]"
+                        >
+                          <option value="administrator">Administrator</option>
+                          <option value="manager">Manager (View Only)</option>
+                        </select>
+                      </td>
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                        {isSelf ? (
+                          <span className="text-[11px] text-[#94A3B8]">Current Session</span>
+                        ) : confirmDeleteUserId === u.id ? (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleDeleteUser(u)}
+                              className="rounded bg-[#DC2626] px-2 py-1 text-[11px] font-semibold text-white hover:bg-[#B91C1C]"
+                            >
+                              Confirm Delete
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteUserId(null)}
+                              className="rounded border border-[#CBD5E1] px-2 py-1 text-[11px] text-[#475569]"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => setConfirmDeleteUserId(u.id)}
+                            className="inline-flex items-center gap-1 rounded border border-[#FECACA] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#DC2626] hover:bg-[#FEF2F2]"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            Delete
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // IMMUTABLE AUDIT LOG VIEW (BOTH ROLES)
+  return (
+    <div className="space-y-6">
+      <div className="border-b border-[#E2E8F0] pb-4">
+        <h1 className="text-xl font-bold text-[#0F172A]">Security Audit Trail</h1>
+        <p className="text-xs text-[#64748B] mt-0.5">
+          Immutable SQLite record of authentication, candidate lifecycle decisions, document uploads, interview bookings, and report exports.
+        </p>
       </div>
 
-      {/* Audit Logs */}
       <div className="rounded-lg border border-[#E2E8F0] bg-white overflow-hidden">
         <div className="border-b border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 text-xs font-bold text-[#0F172A]">
-          Immutable Recruitment Audit Log ({auditLogs.length} recent events)
+          Recent Audit Events ({auditLogs.length})
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">

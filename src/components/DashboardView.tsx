@@ -3,13 +3,13 @@ import {
   ArrowRight,
   BellRing,
   Calendar,
-  Database,
   FileWarning,
   UserPlus,
 } from 'lucide-react';
 import {
   CandidateRecord,
   InterviewSlot,
+  StaffRole,
   STATUS_META,
   WORKFLOW_STAGES,
 } from '../types/ats';
@@ -18,8 +18,7 @@ import { computeDashboardKPIs, getMissingMandatoryDocs, hasPendingDocs } from '.
 interface DashboardViewProps {
   candidates: CandidateRecord[];
   slots: InterviewSlot[];
-  seeding: boolean;
-  onSeedSampleData: () => void;
+  role: StaffRole;
   onOpenIntake: () => void;
   onSelectCandidate: (candidate: CandidateRecord) => void;
   onNavigateToDatabase: (presetFilter?: { stage?: number; status?: string }) => void;
@@ -30,14 +29,14 @@ interface DashboardViewProps {
 export const DashboardView: React.FC<DashboardViewProps> = ({
   candidates,
   slots,
-  seeding,
-  onSeedSampleData,
+  role,
   onOpenIntake,
   onSelectCandidate,
   onNavigateToDatabase,
   onSendBatchDocReminders,
   sendingBatchReminders,
 }) => {
+  const isAdmin = role === 'administrator';
   const kpis = useMemo(() => computeDashboardKPIs(candidates), [candidates]);
 
   const kpiItems = [
@@ -93,30 +92,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           Ready to launch your Malaysian hiring pipeline
         </h2>
         <p className="text-sm text-slate-600 mt-2 leading-relaxed max-w-2xl">
-          Your self-contained Express + SQLite database is running in WAL mode with local protected document storage.
-          Register your first candidate using server-side Gemini AI resume screening, or populate a complete
-          8-candidate Malaysian sample pipeline across Stages 3–15.
+          Your self-contained Express + SQLite database is initialized with zero pre-populated records and local protected document storage.
+          Register your first candidate to begin screening, document verification, interview scheduling, and MYR offer management.
         </p>
 
-        <div className="flex flex-wrap items-center gap-3 mt-7">
-          <button
-            type="button"
-            onClick={onOpenIntake}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <UserPlus className="w-4 h-4" />
-            Register First Candidate
-          </button>
-          <button
-            type="button"
-            onClick={onSeedSampleData}
-            disabled={seeding}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <Database className="w-4 h-4 text-teal-700" />
-            {seeding ? 'Populating SQLite Database...' : 'Load Sample Malaysian Pipeline (8 Candidates)'}
-          </button>
-        </div>
+        {isAdmin ? (
+          <div className="flex flex-wrap items-center gap-3 mt-7">
+            <button
+              type="button"
+              onClick={onOpenIntake}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <UserPlus className="w-4 h-4" />
+              Register First Candidate
+            </button>
+          </div>
+        ) : (
+          <div className="mt-6 rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+            You are signed in with <strong>Manager (View Only)</strong> access. Once an Administrator registers candidates, live KPIs, pipeline milestones, and reports will appear here automatically.
+          </div>
+        )}
 
         <div className="grid sm:grid-cols-3 gap-6 mt-8 pt-6 border-t border-slate-200 text-xs text-slate-600">
           <div>
@@ -233,7 +228,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   Stage 5–6 · Pending Forms & Academic Docs
                 </h3>
               </div>
-              {pendingDocsQueue.length > 0 && (
+              {isAdmin && pendingDocsQueue.length > 0 && (
                 <button
                   type="button"
                   disabled={sendingBatchReminders}

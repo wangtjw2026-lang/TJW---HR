@@ -39,6 +39,7 @@ interface CandidatePortalViewProps {
   /** HR Workspace Preview mode */
   candidates?: CandidateRecord[];
   initialCandidateId?: number | null;
+  readOnly?: boolean;
   onRefreshWorkspace?: () => Promise<void> | void;
   onNotify?: (message: string) => void;
 }
@@ -74,10 +75,12 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
   publicToken,
   candidates = [],
   initialCandidateId = null,
+  readOnly = false,
   onRefreshWorkspace,
   onNotify,
 }) => {
   const isStandalone = Boolean(publicToken);
+  const canInteract = isStandalone || !readOnly;
 
   const [selectedToken, setSelectedToken] = useState<string>(() => {
     if (publicToken) return publicToken;
@@ -389,8 +392,9 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                       <input
                         type="checkbox"
                         checked={appFormChecked}
+                        disabled={!canInteract}
                         onChange={(e) => setAppFormChecked(e.target.checked)}
-                        className="h-4 w-4 accent-[#0F766E]"
+                        className="h-4 w-4 accent-[#0F766E] disabled:opacity-50"
                       />
                       Completed
                     </label>
@@ -418,8 +422,9 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                       <input
                         type="checkbox"
                         checked={discChecked}
+                        disabled={!canInteract}
                         onChange={(e) => setDiscChecked(e.target.checked)}
-                        className="h-4 w-4 accent-[#0F766E]"
+                        className="h-4 w-4 accent-[#0F766E] disabled:opacity-50"
                       />
                       Completed
                     </label>
@@ -427,16 +432,18 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                 </div>
               </div>
 
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={handleSaveForms}
-                  className="rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
-                >
-                  Confirm Online Forms Completed
-                </button>
-              </div>
+              {canInteract && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleSaveForms}
+                    className="rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
+                  >
+                    Confirm Online Forms Completed
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Section 2: Academic Documents Upload */}
@@ -490,7 +497,7 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                         )}
                       </div>
 
-                      {!doc?.not_applicable && (
+                      {canInteract && !doc?.not_applicable && (
                         <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC]">
                           <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
                           {uploadingType === item.type
@@ -583,14 +590,16 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                           {slot.mode}
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleBookSlot(slot.id)}
-                        className="w-full rounded-md bg-[#0F766E] py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                      >
-                        Select &amp; Confirm This Slot
-                      </button>
+                      {canInteract && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleBookSlot(slot.id)}
+                          className="w-full rounded-md bg-[#0F766E] py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                        >
+                          Select &amp; Confirm This Slot
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -651,8 +660,9 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
                   </div>
                 )}
 
-                {(portalCandidate.offer.status === 'Offer Sent' ||
-                  portalCandidate.offer.status === 'Pending Response') && (
+                {canInteract &&
+                  (portalCandidate.offer.status === 'Offer Sent' ||
+                    portalCandidate.offer.status === 'Pending Response') && (
                   <div className="space-y-3 border-t border-[#E2E8F0] pt-3">
                     <input
                       type="text"

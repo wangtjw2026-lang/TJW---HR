@@ -3,6 +3,7 @@ import {
   Calendar,
   CheckCircle2,
   Database,
+  Eye,
   Globe,
   LayoutDashboard,
   Loader2,
@@ -32,7 +33,6 @@ import {
   getStoredToken,
   logCsvExport,
   logoutStaff,
-  seedSampleWorkspace,
   sendBatchDocReminders,
 } from './lib/apiService';
 import { exportCandidatesToExcelCsv } from './lib/atsHelpers';
@@ -47,7 +47,7 @@ import {
   StaffUser,
 } from './types/ats';
 
-type NavTab = 'dashboard' | 'candidates' | 'interviews' | 'portal' | 'emails' | 'audit';
+type NavTab = 'dashboard' | 'candidates' | 'interviews' | 'portal' | 'emails' | 'team' | 'audit';
 
 const EMPTY_FILTERS: CandidateFilters = {
   search: '',
@@ -82,7 +82,6 @@ export default function App() {
   const [staffUsers, setStaffUsers] = useState<StaffUser[]>([]);
 
   const [loadingWorkspace, setLoadingWorkspace] = useState(false);
-  const [seeding, setSeeding] = useState(false);
   const [sendingBatchReminders, setSendingBatchReminders] = useState(false);
   const [exportingCsv, setExportingCsv] = useState(false);
 
@@ -92,6 +91,8 @@ export default function App() {
   const [portalPreviewCandidateId, setPortalPreviewCandidateId] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  const isAdmin = staffUser?.role === 'administrator';
+
   const notify = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => {
@@ -100,6 +101,7 @@ export default function App() {
   }, []);
 
   const refreshWorkspace = useCallback(async () => {
+    if (!staffUser) return;
     setLoadingWorkspace(true);
     try {
       const [cands, fetchedSlots, emails, audits, users] = await Promise.all([
@@ -107,7 +109,7 @@ export default function App() {
         fetchInterviewSlots(),
         fetchEmailLogs(),
         fetchAuditLogs(),
-        fetchStaffUsers(),
+        staffUser.role === 'administrator' ? fetchStaffUsers() : Promise.resolve([]),
       ]);
       setCandidates(cands);
       setSlots(fetchedSlots);
@@ -124,7 +126,7 @@ export default function App() {
     } finally {
       setLoadingWorkspace(false);
     }
-  }, [notify]);
+  }, [staffUser, notify]);
 
   useEffect(() => {
     if (publicPortalToken) return;
@@ -151,9 +153,12 @@ export default function App() {
 
   useEffect(() => {
     if (staffUser && !publicPortalToken) {
+      if (staffUser.role !== 'administrator' && activeTab === 'team') {
+        setActiveTab('dashboard');
+      }
       void refreshWorkspace();
     }
-  }, [staffUser, publicPortalToken, refreshWorkspace]);
+  }, [staffUser, publicPortalToken, refreshWorkspace, activeTab]);
 
   // Public self-service candidate portal (no HR login required)
   if (publicPortalToken) {
@@ -195,23 +200,11 @@ export default function App() {
     setAuditLogs([]);
     setStaffUsers([]);
     setSelectedCandidateId(null);
-  };
-
-  const handleSeedSampleData = async () => {
-    setSeeding(true);
-    try {
-      await seedSampleWorkspace();
-      await refreshWorkspace();
-      notify('Seeded 8 Malaysian candidates and 6 interview slots into SQLite.');
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Failed to seed sample data.');
-    } finally {
-      setSeeding(false);
-    }
+    setActiveTab('dashboard');
   };
 
   const handleBatchDocReminders = async (targets: CandidateRecord[]) => {
-    if (targets.length === 0) return;
+    if (!isAdmin || targets.length === 0) return;
     setSendingBatchReminders(true);
     try {
       const count = await sendBatchDocReminders(targets.map((c) => c.id));
@@ -247,14 +240,21 @@ export default function App() {
     setActiveTab('candidates');
   };
 
-  const navItems: Array<{ id: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  const navItems: Array<{
+    id: NavTab;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }> = [
     { id: 'dashboard', label: 'Pipeline Dashboard', icon: LayoutDashboard },
     { id: 'candidates', label: 'Candidate Database', icon: Database },
     { id: 'interviews', label: 'Interview Calendar', icon: Calendar },
     { id: 'portal', label: 'Candidate Portal', icon: Globe },
     { id: 'emails', label: 'Email Automation', icon: Mail },
-    { id: 'audit', label: 'Team RBAC & Audit', icon: Shield },
+    ...(isAdmin ? [{ id: 'team' as NavTab, label: 'Team & Access', icon: Users }] : []),
+    { id: 'audit', label: 'Audit Trail', icon: Shield },
   ];
+
+  const roleMeta = ROLE_META[staffUser.role];
 
   return (
     <ErrorBoundary>
@@ -273,18 +273,20 @@ export default function App() {
             </div>
           </div>
 
-          <div className="p-3">
-            <button
-              type="button"
-              onClick={() => setShowIntakeModal(true)}
-              className="w-full inline-flex items-center justify-center gap-1.5 rounded-md bg-[#0F766E] px-3 py-2 text-xs font-semibold text-white hover:bg-[#115E59] transition-colors"
-            >
-              <Plus className="h-4 w-4" />
-              New Candidate Intake
-            </button>
-          </div>
+          {isAdmin && (
+            <div className="p-3">
+              <button
+                type="button"
+                onClick={() => setShowIntakeModal(true)}
+                className="w-full inline-flex items-center justify-center gap-1.5 rounded-md bg-[#0F766E] px-3 py-2 text-xs font-semibold text-white hover:bg-[#115E59] transition-colors cursor-pointer"
+              >
+                <Plus className="h-4 w-4" />
+                New Candidate Intake
+              </button>
+            </div>
+          )}
 
-          <nav className="flex-1 px-3 py-1 space-y-0.5 overflow-x-auto lg:overflow-visible flex lg:flex-col gap-1 lg:gap-0">
+          <nav className="flex-1 px-3 py-2 space-y-0.5 overflow-x-auto lg:overflow-visible flex lg:flex-col gap-1 lg:gap-0">
             {navItems.map((item) => {
               const Icon = item.icon;
               const active = activeTab === item.id;
@@ -293,7 +295,7 @@ export default function App() {
                   key={item.id}
                   type="button"
                   onClick={() => setActiveTab(item.id)}
-                  className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                     active
                       ? 'bg-[#F0FDFA] text-[#0F766E]'
                       : 'text-[#475569] hover:bg-[#F8FAFC] hover:text-[#0F172A]'
@@ -318,15 +320,15 @@ export default function App() {
                 <div className="text-xs font-bold text-[#0F172A] truncate">{staffUser.name}</div>
                 <div className="text-[11px] text-[#64748B] truncate font-mono">{staffUser.email}</div>
                 <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-mono font-semibold text-[#0F766E]">
-                  <Users className="h-3 w-3" />
-                  {ROLE_META[staffUser.role].label}
+                  {isAdmin ? <Shield className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                  {roleMeta.badgeLabel}
                 </div>
               </div>
               <button
                 type="button"
                 onClick={handleLogout}
                 title="Sign out"
-                className="rounded p-1.5 text-[#64748B] hover:bg-[#E2E8F0]/60 hover:text-[#DC2626]"
+                className="rounded p-1.5 text-[#64748B] hover:bg-[#E2E8F0]/60 hover:text-[#DC2626] cursor-pointer"
               >
                 <LogOut className="h-4 w-4" />
               </button>
@@ -336,7 +338,7 @@ export default function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 min-w-0 flex flex-col">
-          {/* Top Utility Bar */}
+          {/* Top Utility Bar with Explicit Role Badge */}
           <header className="h-14 border-b border-[#E2E8F0] bg-white px-6 flex items-center justify-between gap-4">
             <div className="text-xs text-[#64748B] truncate">
               <span className="font-semibold text-[#0F172A]">
@@ -346,12 +348,23 @@ export default function App() {
               <span>Malaysian 15-Stage Recruitment Operations</span>
             </div>
 
-            <div className="flex items-center gap-2.5 shrink-0">
+            <div className="flex items-center gap-3 shrink-0">
+              <span
+                className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-[11px] font-mono font-semibold whitespace-nowrap ${
+                  isAdmin
+                    ? 'border-[#0F766E]/30 bg-[#F0FDFA] text-[#0F766E]'
+                    : 'border-[#CBD5E1] bg-[#F8FAFC] text-[#334155]'
+                }`}
+              >
+                {isAdmin ? <Shield className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                {roleMeta.badgeLabel}
+              </span>
+
               <button
                 type="button"
                 onClick={() => void refreshWorkspace()}
                 disabled={loadingWorkspace}
-                className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] disabled:opacity-50 cursor-pointer"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${loadingWorkspace ? 'animate-spin' : ''}`} />
                 Refresh
@@ -365,8 +378,7 @@ export default function App() {
               <DashboardView
                 candidates={candidates}
                 slots={slots}
-                seeding={seeding}
-                onSeedSampleData={handleSeedSampleData}
+                role={staffUser.role}
                 onOpenIntake={() => setShowIntakeModal(true)}
                 onSelectCandidate={(c) => setSelectedCandidateId(c.id)}
                 onNavigateToDatabase={handleNavigateToDatabase}
@@ -403,6 +415,7 @@ export default function App() {
               <CandidatePortalView
                 candidates={candidates}
                 initialCandidateId={portalPreviewCandidateId}
+                readOnly={!isAdmin}
                 onRefreshWorkspace={refreshWorkspace}
                 onNotify={notify}
               />
@@ -411,6 +424,19 @@ export default function App() {
             {activeTab === 'emails' && (
               <CommunicationsAndAuditView
                 mode="emails"
+                emailLogs={emailLogs}
+                auditLogs={auditLogs}
+                staffUsers={staffUsers}
+                candidates={candidates}
+                currentUser={staffUser}
+                onRefresh={refreshWorkspace}
+                onNotify={notify}
+              />
+            )}
+
+            {activeTab === 'team' && isAdmin && (
+              <CommunicationsAndAuditView
+                mode="team"
                 emailLogs={emailLogs}
                 auditLogs={auditLogs}
                 staffUsers={staffUsers}
@@ -437,7 +463,7 @@ export default function App() {
         </div>
 
         {/* Modals & Drawers */}
-        {showIntakeModal && (
+        {isAdmin && showIntakeModal && (
           <CandidateIntakeModal
             existingCandidates={candidates}
             onClose={() => setShowIntakeModal(false)}

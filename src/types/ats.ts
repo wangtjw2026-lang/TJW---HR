@@ -5,7 +5,7 @@ export const GOOGLE_APPS_SCRIPT_URLS = {
     'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec',
 } as const;
 
-export type StaffRole = 'HR_ADMIN' | 'RECRUITER';
+export type StaffRole = 'administrator' | 'manager';
 
 export type ApplicationSource = 'JobStreet' | 'Email';
 
@@ -275,20 +275,34 @@ export const STATUS_META: Record<
 
 export const ROLE_META: Record<
   StaffRole,
-  { label: string; summary: string; canViewSalary: boolean; canExportCsv: boolean; canManageUsers: boolean }
+  {
+    label: string;
+    badgeLabel: string;
+    summary: string;
+    canWrite: boolean;
+    canViewSalary: boolean;
+    canExportCsv: boolean;
+    canManageUsers: boolean;
+  }
 > = {
-  HR_ADMIN: {
-    label: 'HR Admin',
-    summary: 'Full access to candidate records, academic documents, MYR salary packages, offer letters, team roles, and Excel CSV exports.',
+  administrator: {
+    label: 'Administrator',
+    badgeLabel: 'Administrator',
+    summary:
+      'Full access — view all records, add/edit/delete candidates, run AI resume screening, make hiring decisions, manage interview slots, issue offers, send emails, export reports, and manage user accounts.',
+    canWrite: true,
     canViewSalary: true,
     canExportCsv: true,
     canManageUsers: true,
   },
-  RECRUITER: {
-    label: 'Recruiter',
-    summary: 'Operational access to screening, document verification, and interview scheduling. Confidential MYR salary packages and CSV exports are restricted to HR Admin.',
-    canViewSalary: false,
-    canExportCsv: false,
+  manager: {
+    label: 'Manager',
+    badgeLabel: 'Manager (View Only)',
+    summary:
+      'Read-only access — view the dashboard, recruitment pipeline, candidate profiles, uploaded resumes/academic documents, interview calendar, offer statuses, and export reports. Cannot modify records or manage users.',
+    canWrite: false,
+    canViewSalary: true,
+    canExportCsv: true,
     canManageUsers: false,
   },
 };

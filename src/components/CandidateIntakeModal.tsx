@@ -14,21 +14,6 @@ interface CandidateIntakeModalProps {
   onRegistered: (candidate: CandidateRecord) => void;
 }
 
-const SAMPLE_RESUME_TEXT = `AMIRUL HAKIM BIN ZULKIFLI
-Petaling Jaya, Selangor | +60 12-648 7721 | amirul.hakim.dev@gmail.com
-
-EDUCATION
-- Bachelor of Computer Science (Hons), Universiti Teknologi Malaysia (UTM), CGPA 3.74 (2018 - 2022)
-- SPM: 8A 1B, SMK Bandar Utama Damansara (2016)
-
-EXPERIENCE
-Full-Stack Software Engineer — FinCore Sdn Bhd, Kuala Lumpur (2022 - Present, 4 years)
-- Built React, TypeScript, and Node.js enterprise banking portals serving 180k Malaysian SMEs.
-- Designed SQLite & PostgreSQL transaction ledgers and REST API pipelines.
-- Led PDPA encryption compliance and automated CI/CD deployments.
-
-SKILLS
-TypeScript, React, Node.js, Express, SQLite, PostgreSQL, Tailwind CSS, REST APIs, Git`;
 
 function normalizePhone(val: string): string {
   return val.replace(/[\s\-()]/g, '').toLowerCase();
@@ -293,16 +278,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
                   Upload a PDF/image/text resume (saved to local uploads/) or paste CV content to extract & score.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setResumeText(SAMPLE_RESUME_TEXT);
-                  setFileName('Amirul_Hakim_CV.txt');
-                }}
-                className="text-xs font-medium text-teal-700 hover:text-teal-800 underline cursor-pointer"
-              >
-                Insert Sample Malaysian Resume
-              </button>
             </div>
 
             <div className="grid sm:grid-cols-12 gap-4">

@@ -27,11 +27,13 @@ const EMPLOYMENT_FORM_URL =
 const DISC_FORM_URL =
   'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec';
 
+type StaffRole = 'administrator' | 'manager';
+
 interface AuthPayload {
   id: number;
   email: string;
   name: string;
-  role: 'HR_ADMIN' | 'RECRUITER';
+  role: StaffRole;
   department: string;
 }
 
@@ -211,18 +213,22 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   next();
 }
 
-function requireHrAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
-  if (!req.user || req.user.role !== 'HR_ADMIN') {
-    res.status(403).json({ error: 'Access restricted to HR Admin role.' });
-    return;
-  }
-  next();
+function requireRole(...allowedRoles: StaffRole[]) {
+  return (req: AuthedRequest, res: Response, next: NextFunction) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      res.status(403).json({
+        error: 'Forbidden: Administrator role is required to perform this action.',
+      });
+      return;
+    }
+    next();
+  };
 }
 
 // =============================================================================
 // HYDRATION HELPERS
 // =============================================================================
-function hydrateCandidate(row: Record<string, unknown>, role: 'HR_ADMIN' | 'RECRUITER' | 'CANDIDATE') {
+function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CANDIDATE') {
   const candidateId = Number(row.id);
   const docs = db
     .prepare('SELECT * FROM candidate_documents WHERE candidate_id = ? ORDER BY id ASC')
@@ -251,7 +257,7 @@ function hydrateCandidate(row: Record<string, unknown>, role: 'HR_ADMIN' | 'RECR
     skills = [];
   }
 
-  const canSeeSalary = role === 'HR_ADMIN' || role === 'CANDIDATE';
+  const canSeeSalary = true;
 
   return {
     ...row,
@@ -423,8 +429,80 @@ async function startServer() {
   });
 
   // ===========================================================================
-  // 1. AUTHENTICATION & STAFF RBAC ROUTES
+  // 1. AUTHENTICATION, FIRST-RUN ADMIN SETUP & STAFF RBAC ROUTES
   // ===========================================================================
+  app.get('/api/auth/setup-status', (_req: Request, res: Response) => {
+    const row = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
+    res.json({ needsSetup: row.count === 0 });
+  });
+
+  app.post('/api/auth/setup', (req: Request, res: Response) => {
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
+
+    const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+    if (existingCount > 0) {
+      res.status(403).json({ error: 'Initial HR Admin account already exists. Please sign in.' });
+      return;
+    }
+
+    if (!name || !email || !email.includes('@') || password.length < 8) {
+      res.status(400).json({
+        error: 'Full name, valid work email, and a password of at least 8 characters are required.',
+      });
+      return;
+    }
+
+    const hash = bcrypt.hashSync(password, 10);
+    const createInitialAdmin = db.transaction(() => {
+      const countInsideTx = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+      if (countInsideTx > 0) {
+        return null;
+      }
+      const info = db
+        .prepare('INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, ?, ?)')
+        .run(name, email, hash, 'administrator', department);
+      return db
+        .prepare('SELECT id, name, email, role, department, created_at FROM users WHERE id = ?')
+        .get(info.lastInsertRowid) as {
+        id: number;
+        name: string;
+        email: string;
+        role: StaffRole;
+        department: string;
+        created_at: string;
+      };
+    });
+
+    const createdUser = createInitialAdmin();
+    if (!createdUser) {
+      res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
+      return;
+    }
+
+    const payload: AuthPayload = {
+      id: createdUser.id,
+      email: createdUser.email,
+      name: createdUser.name,
+      role: createdUser.role,
+      department: createdUser.department,
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
+
+    logAudit({
+      actor: payload,
+      action: 'INITIAL_ADMIN_CREATED',
+      targetType: 'auth',
+      targetId: createdUser.id,
+      details: `Registered initial Administrator account (${createdUser.email}).`,
+    });
+
+    res.status(201).json({ token, user: createdUser });
+  });
+
   app.post('/api/auth/login', (req: Request, res: Response) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
@@ -480,28 +558,28 @@ async function startServer() {
     res.json({ user: req.user });
   });
 
-  app.get('/api/users', requireAuth, (_req: AuthedRequest, res: Response) => {
+  app.get('/api/users', requireAuth, requireRole('administrator'), (_req: AuthedRequest, res: Response) => {
     const users = db
       .prepare('SELECT id, name, email, role, department, created_at FROM users ORDER BY id ASC')
       .all();
     res.json({ users });
   });
 
-  app.post('/api/users', requireAuth, requireHrAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/users', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const name = String(req.body?.name || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
-    const role = req.body?.role === 'HR_ADMIN' ? 'HR_ADMIN' : 'RECRUITER';
-    const department = String(req.body?.department || 'Human Resources').trim();
+    const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
 
-    if (!name || !email || password.length < 6) {
+    if (!name || !email || !email.includes('@') || password.length < 6) {
       res.status(400).json({ error: 'Name, valid email, and password (min 6 characters) are required.' });
       return;
     }
 
     const exists = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
     if (exists) {
-      res.status(409).json({ error: 'A staff account with this email already exists.' });
+      res.status(409).json({ error: 'A user account with this email already exists.' });
       return;
     }
 
@@ -524,17 +602,27 @@ async function startServer() {
     res.status(201).json({ user: created });
   });
 
-  app.patch('/api/users/:id', requireAuth, requireHrAdmin, (req: AuthedRequest, res: Response) => {
+  app.patch('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const targetId = Number(req.params.id);
-    const role = req.body?.role === 'HR_ADMIN' ? 'HR_ADMIN' : 'RECRUITER';
-    const department = String(req.body?.department || 'Human Resources').trim();
+    const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+    const department = String(req.body?.department || 'Human Resources').trim() || 'Human Resources';
 
-    const target = db.prepare('SELECT id, email FROM users WHERE id = ?').get(targetId) as
-      | { id: number; email: string }
+    const target = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(targetId) as
+      | { id: number; email: string; role: StaffRole }
       | undefined;
     if (!target) {
-      res.status(404).json({ error: 'Staff account not found.' });
+      res.status(404).json({ error: 'User account not found.' });
       return;
+    }
+
+    if (target.role === 'administrator' && role !== 'administrator') {
+      const adminCount = (
+        db.prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator'`).get() as { count: number }
+      ).count;
+      if (adminCount <= 1) {
+        res.status(400).json({ error: 'Cannot demote the last remaining Administrator account.' });
+        return;
+      }
     }
 
     db.prepare('UPDATE users SET role = ?, department = ? WHERE id = ?').run(role, department, targetId);
@@ -552,10 +640,47 @@ async function startServer() {
     res.json({ user: updated });
   });
 
+  app.delete('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
+    const targetId = Number(req.params.id);
+    if (req.user && targetId === req.user.id) {
+      res.status(400).json({ error: 'You cannot delete your own currently signed-in account.' });
+      return;
+    }
+
+    const target = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(targetId) as
+      | { id: number; email: string; role: StaffRole }
+      | undefined;
+    if (!target) {
+      res.status(404).json({ error: 'User account not found.' });
+      return;
+    }
+
+    if (target.role === 'administrator') {
+      const adminCount = (
+        db.prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator'`).get() as { count: number }
+      ).count;
+      if (adminCount <= 1) {
+        res.status(400).json({ error: 'Cannot delete the last remaining Administrator account.' });
+        return;
+      }
+    }
+
+    db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+    logAudit({
+      actor: req.user,
+      action: 'STAFF_USER_DELETED',
+      targetType: 'rbac',
+      targetId,
+      details: `Removed ${target.role} account (${target.email}).`,
+    });
+
+    res.json({ deleted: true });
+  });
+
   // ===========================================================================
   // 2. GEMINI AI RESUME PARSER & JOB-FIT SCORECARD (SERVER-SIDE ONLY)
   // ===========================================================================
-  app.post('/api/ai/parse-resume', requireAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/ai/parse-resume', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     try {
       const {
         resumeText,
@@ -702,7 +827,7 @@ async function startServer() {
     res.json({ candidate: hydrateCandidate(row, req.user!.role) });
   });
 
-  app.post('/api/candidates', requireAuth, upload.single('resumeFile'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/candidates', requireAuth, requireRole('administrator'), upload.single('resumeFile'), (req: AuthedRequest, res: Response) => {
     const body = req.body ?? {};
     const fullName = String(body.full_name || body.fullName || '').trim();
     const email = String(body.email || '').trim().toLowerCase();
@@ -825,7 +950,7 @@ async function startServer() {
   });
 
   // Update candidate workflow stages, screening decision, docs verification, qualification, panel evaluation
-  app.patch('/api/candidates/:id', requireAuth, async (req: AuthedRequest, res: Response) => {
+  app.patch('/api/candidates/:id', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     const id = Number(req.params.id);
     const existing = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
       | Record<string, unknown>
@@ -1074,6 +1199,7 @@ async function startServer() {
   app.post(
     '/api/candidates/:id/documents',
     requireAuth,
+    requireRole('administrator'),
     upload.single('file'),
     (req: AuthedRequest, res: Response) => {
       const candidateId = Number(req.params.id);
@@ -1120,7 +1246,7 @@ async function startServer() {
   );
 
   // Stage 6: Automated Document Reminder Email (Single)
-  app.post('/api/candidates/:id/remind-docs', requireAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/candidates/:id/remind-docs', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     const id = Number(req.params.id);
     const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
       | Record<string, unknown>
@@ -1176,7 +1302,7 @@ async function startServer() {
   });
 
   // Batch 48h Missing-Docs Reminder
-  app.post('/api/candidates/remind-docs-batch', requireAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/candidates/remind-docs-batch', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     const ids = Array.isArray(req.body?.candidateIds) ? req.body.candidateIds.map(Number) : [];
     let sentCount = 0;
 
@@ -1234,7 +1360,7 @@ async function startServer() {
   app.post(
     '/api/candidates/:id/offer',
     requireAuth,
-    requireHrAdmin,
+    requireRole('administrator'),
     upload.single('offerLetter'),
     async (req: AuthedRequest, res: Response) => {
       const id = Number(req.params.id);
@@ -1352,7 +1478,7 @@ async function startServer() {
   );
 
   // Stage 14-15: Update Offer Status (HR Admin)
-  app.patch('/api/candidates/:id/offer-status', requireAuth, requireHrAdmin, (req: AuthedRequest, res: Response) => {
+  app.patch('/api/candidates/:id/offer-status', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const id = Number(req.params.id);
     const status = String(req.body?.status || 'Pending Response');
     const note = String(req.body?.candidate_response_note || '').trim();
@@ -1403,7 +1529,7 @@ async function startServer() {
     res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
   });
 
-  app.delete('/api/candidates/:id', requireAuth, requireHrAdmin, (req: AuthedRequest, res: Response) => {
+  app.delete('/api/candidates/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const id = Number(req.params.id);
     const existing = db.prepare('SELECT id, full_name, candidate_code FROM candidates WHERE id = ?').get(id) as
       | { id: number; full_name: string; candidate_code: string }
@@ -1446,7 +1572,7 @@ async function startServer() {
     res.json({ slots: rows.map(hydrateSlot) });
   });
 
-  app.post('/api/interview-slots', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/interview-slots', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const body = req.body ?? {};
     const date = String(body.date || '').trim();
     const startTime = String(body.start_time || '').trim();
@@ -1484,7 +1610,7 @@ async function startServer() {
     res.status(201).json({ slot: hydrateSlot(row) });
   });
 
-  app.patch('/api/interview-slots/:id', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.patch('/api/interview-slots/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const slotId = Number(req.params.id);
     const existing = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as
       | Record<string, unknown>
@@ -1521,7 +1647,7 @@ async function startServer() {
     res.json({ slot: hydrateSlot(updated) });
   });
 
-  app.delete('/api/interview-slots/:id', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.delete('/api/interview-slots/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const slotId = Number(req.params.id);
     const existing = db.prepare('SELECT id, date, start_time, booked_count FROM interview_slots WHERE id = ?').get(slotId) as
       | { id: number; date: string; start_time: string; booked_count: number }
@@ -1546,7 +1672,7 @@ async function startServer() {
   });
 
   // HR-initiated atomic slot booking
-  app.post('/api/interview-slots/:id/book', requireAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/interview-slots/:id/book', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
     const slotId = Number(req.params.id);
     const candidateId = Number(req.body?.candidateId);
     if (!candidateId) {
@@ -1601,7 +1727,7 @@ async function startServer() {
   });
 
   // Update booking status (COMPLETE / CANCEL / RESCHEDULE)
-  app.patch('/api/interview-bookings/:id', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.patch('/api/interview-bookings/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
     const bookingId = Number(req.params.id);
     const nextStatus = String(req.body?.status || '');
     const valid = ['CONFIRMED', 'RESCHEDULED', 'CANCELLED', 'COMPLETED'];
@@ -1923,7 +2049,7 @@ async function startServer() {
   });
 
   // ===========================================================================
-  // 7. EMAIL LOGS, AUDIT LOGS & SAMPLE WORKSPACE SEEDER
+  // 7. EMAIL LOGS & AUDIT LOGS
   // ===========================================================================
   app.get('/api/email-logs', requireAuth, (_req: AuthedRequest, res: Response) => {
     const emailLogs = db.prepare('SELECT * FROM email_logs ORDER BY id DESC LIMIT 200').all();
@@ -1935,7 +2061,7 @@ async function startServer() {
     res.json({ auditLogs });
   });
 
-  app.post('/api/audit-logs/export', requireAuth, requireHrAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/audit-logs/export', requireAuth, (req: AuthedRequest, res: Response) => {
     const count = Number(req.body?.count) || 0;
     logAudit({
       actor: req.user,
@@ -1945,393 +2071,6 @@ async function startServer() {
       details: `Exported Excel-compatible CSV report covering ${count} filtered candidate record(s).`,
     });
     res.json({ logged: true });
-  });
-
-  // 1-Click Malaysian Sample Pipeline Seeder (for empty workspaces)
-  app.post('/api/seed', requireAuth, async (req: AuthedRequest, res: Response) => {
-    const existingCount = (db.prepare('SELECT COUNT(*) as count FROM candidates').get() as { count: number }).count;
-    if (existingCount > 0) {
-      res.status(400).json({ error: 'Workspace already contains candidate records.' });
-      return;
-    }
-
-    const today = new Date();
-    const daysAgo = (n: number) => {
-      const d = new Date(today);
-      d.setDate(d.getDate() - n);
-      return d.toISOString().slice(0, 10);
-    };
-    const daysAhead = (n: number) => {
-      const d = new Date(today);
-      d.setDate(d.getDate() + n);
-      return d.toISOString().slice(0, 10);
-    };
-
-    const slotSeeds = [
-      { date: daysAhead(2), start: '10:00', end: '11:00', cap: 2, interviewer: 'Puan Siti Nurhaliza (VP Product)', dept: 'Product & Design', mode: 'Google Meet', loc: 'https://meet.google.com/tfm-uxds-kls' },
-      { date: daysAhead(2), start: '14:30', end: '15:30', cap: 2, interviewer: 'Encik Hafizuddin (Head of Data)', dept: 'Engineering & Technology', mode: 'Google Meet', loc: 'https://meet.google.com/tfm-data-my1' },
-      { date: daysAhead(3), start: '11:00', end: '12:00', cap: 1, interviewer: 'Marcus Teh (Engineering Director)', dept: 'Engineering & Technology', mode: 'On-site (KL HQ)', loc: 'Menara TalentFlow, Level 18, Boardroom B' },
-      { date: daysAhead(4), start: '09:30', end: '10:30', cap: 2, interviewer: 'Ms. Evelyn Ong (Finance Controller)', dept: 'Finance & Accounting', mode: 'Microsoft Teams', loc: 'Teams Invite Auto-Generated' },
-      { date: daysAhead(4), start: '15:00', end: '16:00', cap: 1, interviewer: 'Encik Hafizuddin (Head of Data)', dept: 'Engineering & Technology', mode: 'Google Meet', loc: 'https://meet.google.com/tfm-data-my2' },
-      { date: daysAhead(5), start: '10:30', end: '11:30', cap: 1, interviewer: 'Dato’ Ramesh Pillai (HR Director)', dept: 'Human Resources', mode: 'On-site (KL HQ)', loc: 'Menara TalentFlow, Level 20, Suite A' },
-    ];
-
-    const slotIds: number[] = [];
-    const insertSlot = db.prepare(`
-      INSERT INTO interview_slots (date, start_time, end_time, capacity, booked_count, location_or_link, interviewer_name, department, mode, status)
-      VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'ACTIVE')
-    `);
-    for (const sl of slotSeeds) {
-      const info = insertSlot.run(sl.date, sl.start, sl.end, sl.cap, sl.loc, sl.interviewer, sl.dept, sl.mode);
-      slotIds.push(Number(info.lastInsertRowid));
-    }
-
-    const candidatesSeed = [
-      {
-        code: 'TFMY-2611-1041',
-        name: 'Nur Aisyah binti Mohd Razali',
-        email: 'aisyah.razali@gmail.com',
-        phone: '+60 12-482 9104',
-        location: 'Petaling Jaya, Selangor',
-        pos: 'Senior Full-Stack Engineer',
-        dept: 'Engineering & Technology',
-        source: 'JobStreet',
-        applied: daysAgo(1),
-        stage: 3,
-        status: 'pending_screening',
-        edu: 'B.Comp.Sc. (Hons) Software Engineering, Universiti Malaya (CGPA 3.78) · SPM 9A',
-        exp: 'Lead Full-Stack Engineer at PayNet Digital Partners (4 yrs); Developer at Grab Malaysia (2 yrs).',
-        yrs: 6,
-        skills: ['TypeScript', 'React', 'Node.js', 'SQLite', 'PostgreSQL', 'Tailwind CSS'],
-        score: 91,
-        summary: 'Strong 6-year full-stack track record at a KL fintech scale-up with Honours Degree from UM and 9As in SPM.',
-        screenDec: 'pending',
-        qual: 'pending',
-        qualRem: '',
-        disc: '',
-        hasUec: false,
-        docsCompleted: [] as string[],
-        docsVerified: [] as string[],
-      },
-      {
-        code: 'TFMY-2611-1042',
-        name: 'Tan Wei Jian',
-        email: 'weijian.tan@outlook.my',
-        phone: '+60 16-773 2219',
-        location: 'Georgetown, Penang',
-        pos: 'Financial Accountant (MIA/ACCA)',
-        dept: 'Finance & Accounting',
-        source: 'Email',
-        applied: daysAgo(4),
-        stage: 6,
-        status: 'shortlisted_docs',
-        edu: 'B.Acc (Hons) Universiti Sains Malaysia (CGPA 3.84) · ACCA Affiliate · UEC 7A & SPM 8A',
-        exp: 'Senior Audit Associate at PwC Malaysia (3.5 yrs); Accounts Executive at Intel Penang (1.5 yrs).',
-        yrs: 5,
-        skills: ['MFRS / IFRS', 'ACCA', 'SAP S/4HANA', 'SST & LHDN Tax', 'Financial Consolidation'],
-        score: 86,
-        summary: 'ACCA affiliate with 5 years statutory audit & MFRS reporting experience in Penang.',
-        screenDec: 'proceed',
-        qual: 'pending',
-        qualRem: '',
-        disc: '',
-        hasUec: true,
-        docsCompleted: ['APP_FORM', 'SPM', 'DEGREE'],
-        docsVerified: [],
-      },
-      {
-        code: 'TFMY-2611-1043',
-        name: 'Kavitha a/p Subramaniam',
-        email: 'kavitha.subra@gmail.com',
-        phone: '+60 17-390 8845',
-        location: 'Subang Jaya, Selangor',
-        pos: 'HR Business Partner',
-        dept: 'Human Resources',
-        source: 'JobStreet',
-        applied: daysAgo(6),
-        stage: 7,
-        status: 'docs_under_review',
-        edu: 'B.Sc. Human Resource Development, UTM Skudai (CGPA 3.65) · SPM 8A',
-        exp: 'HR Business Partner at Sime Darby Property (4 yrs); Talent Acquisition at Axiata (2.5 yrs).',
-        yrs: 6.5,
-        skills: ['Employment Act 1955', 'PDPA Compliance', 'Industrial Relations', 'HRD Corp'],
-        score: 89,
-        summary: 'Experienced Malaysian Employment Act 1955 & PDPA HRBP with all assessments submitted.',
-        screenDec: 'proceed',
-        qual: 'pending',
-        qualRem: 'Final CGPA transcript cross-check in progress.',
-        disc: 'I/S — Collaborative Influence',
-        hasUec: false,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'DEGREE'],
-      },
-      {
-        code: 'TFMY-2611-1044',
-        name: 'Muhammad Danish bin Iskandar',
-        email: 'danish.iskandar@yahoo.com.my',
-        phone: '+60 19-615 4402',
-        location: 'Cyberjaya, Selangor',
-        pos: 'Data & BI Analyst',
-        dept: 'Engineering & Technology',
-        source: 'JobStreet',
-        applied: daysAgo(8),
-        stage: 9,
-        status: 'interview_invited',
-        edu: 'B.Sc. Data Science, Multimedia University (MMU) Cyberjaya (CGPA 3.71) · SPM 7A',
-        exp: 'BI Analyst at CelcomDigi (3 yrs); Junior Data Analyst at Shopee Malaysia (1.5 yrs).',
-        yrs: 4.5,
-        skills: ['SQL', 'Power BI', 'Python', 'BigQuery', 'Looker Studio'],
-        score: 84,
-        summary: 'Solid Power BI & SQL analytics background; qualified and awaiting self-service slot booking.',
-        screenDec: 'proceed',
-        qual: 'qualified',
-        qualRem: 'Verified MMU degree and transcript; DISC C/S profile fits BI governance well.',
-        disc: 'C/S — Analytical & Methodical',
-        hasUec: false,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-      },
-      {
-        code: 'TFMY-2611-1045',
-        name: 'Chong Hui Xin',
-        email: 'huixin.chong@gmail.com',
-        phone: '+60 11-2834 9901',
-        location: 'Cheras, Kuala Lumpur',
-        pos: 'Product Designer (UI/UX)',
-        dept: 'Product & Design',
-        source: 'Email',
-        applied: daysAgo(10),
-        stage: 9,
-        status: 'interview_invited',
-        edu: 'B.A. Communication & Digital Media, Monash University Malaysia (Distinction) · UEC 6A & SPM 8A',
-        exp: 'Senior Product Designer at Carsome (3.5 yrs); UI/UX Designer at AirAsia Digital (2 yrs).',
-        yrs: 5.5,
-        skills: ['Figma', 'Design Systems', 'WCAG Accessibility', 'Prototyping', 'Enterprise SaaS'],
-        score: 93,
-        summary: 'Exceptional enterprise SaaS design systems portfolio; complete SPM/UEC/Monash credentials verified.',
-        screenDec: 'proceed',
-        qual: 'qualified',
-        qualRem: 'Verified SPM, UEC, Monash scroll & transcript.',
-        disc: 'D/I — Results & Creative Drive',
-        hasUec: true,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'],
-        autoBookSlotIndex: 0,
-      },
-      {
-        code: 'TFMY-2611-1046',
-        name: 'Arvind Nair a/l Rajendran',
-        email: 'arvind.nair@hotmail.my',
-        phone: '+60 12-901 3348',
-        location: 'Shah Alam, Selangor',
-        pos: 'Supply Chain & Logistics Lead',
-        dept: 'Operations & Supply Chain',
-        source: 'JobStreet',
-        applied: daysAgo(14),
-        stage: 12,
-        status: 'interview_completed',
-        edu: 'B.Eng (Hons) Industrial Engineering, UTAR Sungai Long (CGPA 3.59) · SPM 7A',
-        exp: 'Regional Logistics Lead at DHL Supply Chain Malaysia (5 yrs); Operations Planner at Top Glove (2 yrs).',
-        yrs: 7,
-        skills: ['SAP MM/WM', 'Port Klang Customs', 'Vendor Negotiation', 'Lean Six Sigma'],
-        score: 88,
-        summary: 'Strong ASEAN freight & Port Klang customs background. Panel approved (4/5) for Stage 13 MYR Offer.',
-        screenDec: 'proceed',
-        qual: 'qualified',
-        qualRem: 'All credentials verified.',
-        disc: 'D/C — Decisive Execution',
-        hasUec: false,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        rating: 4,
-        feedback: 'Strong crisis resolution on Port Klang clearance bottlenecks. Recommended for Employment Offer.',
-        postDec: 'offer',
-      },
-      {
-        code: 'TFMY-2611-1047',
-        name: 'Lim Mei Ling',
-        email: 'meiling.lim@gmail.com',
-        phone: '+60 16-552 8017',
-        location: 'Bangsar South, Kuala Lumpur',
-        pos: 'Compliance & PDPA Executive',
-        dept: 'Legal & Compliance',
-        source: 'Email',
-        applied: daysAgo(18),
-        stage: 13,
-        status: 'offer_sent',
-        edu: 'LL.B (Hons) University of Malaya (Second Upper) · CLP · SPM 9A',
-        exp: 'Data Privacy & Legal Executive at Maybank Group Compliance (4 yrs).',
-        yrs: 4,
-        skills: ['PDPA 2010 / 2024', 'ISO 27001', 'Contract Drafting', 'DPO Governance'],
-        score: 95,
-        summary: 'LL.B (Hons) specialist in Malaysian PDPA 2010 (Amendment 2024). Official MYR offer dispatched.',
-        screenDec: 'proceed',
-        qual: 'qualified',
-        qualRem: 'Verified UM LL.B scroll & transcript.',
-        disc: 'C/D — Precision & Governance',
-        hasUec: false,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        rating: 5,
-        feedback: 'Exceptional mastery of 2024 PDPA mandatory breach notification rules.',
-        postDec: 'offer',
-        offer: {
-          salary: 9200,
-          allowance: 600,
-          start: daysAhead(28),
-          deadline: daysAhead(5),
-          status: 'Offer Sent',
-          terms: 'Full-time Permanent (Bangsar South HQ, Hybrid 3/2). Statutory EPF 13%, SOCSO/EIS, medical coverage, 18 days annual leave.',
-        },
-      },
-      {
-        code: 'TFMY-2611-1048',
-        name: 'Farhan Hakim bin Azman',
-        email: 'farhan.hakim@gmail.com',
-        phone: '+60 13-229 7730',
-        location: 'Johor Bahru, Johor',
-        pos: 'Enterprise Sales Manager',
-        dept: 'Sales & Commercial',
-        source: 'JobStreet',
-        applied: daysAgo(24),
-        stage: 15,
-        status: 'offer_accepted',
-        edu: 'B.Bus.Admin (Hons) Marketing, Sunway University (CGPA 3.62) · SPM 7A',
-        exp: 'Enterprise Account Executive at Salesforce Malaysia (4 yrs); BDM at Maxis Business (3 yrs).',
-        yrs: 7,
-        skills: ['Enterprise B2B SaaS', 'MEDDPICC', 'Key Account Strategy', 'CRM Forecasting'],
-        score: 90,
-        summary: 'Proven B2B SaaS quota attainment (138% FY25). Offer accepted via Candidate Self-Service Portal.',
-        screenDec: 'proceed',
-        qual: 'qualified',
-        qualRem: 'All credentials verified.',
-        disc: 'D/I — High-Drive Closer',
-        hasUec: false,
-        docsCompleted: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        docsVerified: ['APP_FORM', 'DISC', 'SPM', 'DEGREE', 'TRANSCRIPT'],
-        rating: 5,
-        feedback: 'Strong executive presence and realistic 90-day Klang Valley enterprise pipeline plan.',
-        postDec: 'offer',
-        offer: {
-          salary: 11500,
-          allowance: 1200,
-          start: daysAhead(14),
-          deadline: daysAgo(2),
-          status: 'Accepted',
-          terms: 'Base RM 11,500 + RM 1,200 Travel Allowance + Quarterly OTE Commission. Permanent full-time.',
-        },
-      },
-    ];
-
-    for (const c of candidatesSeed) {
-      const token = generatePortalToken();
-      const info = db
-        .prepare(`
-          INSERT INTO candidates (
-            candidate_code, full_name, phone, email, location, position, department, source,
-            applied_date, stage, status, education, experience, years_experience, skills,
-            ai_score, ai_summary, screening_decision, disc_profile, qualification_status,
-            qualification_remarks, interview_rating, interview_feedback, post_interview_decision,
-            portal_token
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          c.code,
-          c.name,
-          c.phone,
-          c.email,
-          c.location,
-          c.pos,
-          c.dept,
-          c.source,
-          c.applied,
-          c.stage,
-          c.status,
-          c.edu,
-          c.exp,
-          c.yrs,
-          JSON.stringify(c.skills),
-          c.score,
-          c.summary,
-          c.screenDec,
-          c.disc,
-          c.qual,
-          c.qualRem,
-          c.rating ?? 0,
-          c.feedback ?? '',
-          c.postDec ?? 'pending',
-          token
-        );
-
-      const candId = Number(info.lastInsertRowid);
-      ensureCandidateDocumentRows(candId, c.hasUec);
-
-      for (const dt of c.docsCompleted) {
-        db.prepare(`UPDATE candidate_documents SET completed = 1, uploaded_at = datetime('now') WHERE candidate_id = ? AND doc_type = ?`).run(candId, dt);
-      }
-      for (const dt of c.docsVerified) {
-        db.prepare(`UPDATE candidate_documents SET verified = 1 WHERE candidate_id = ? AND doc_type = ?`).run(candId, dt);
-      }
-
-      if (c.stage >= 5 && c.stage <= 7) {
-        await dispatchEmail({
-          candidateId: candId,
-          candidateName: c.name,
-          recipientEmail: c.email,
-          templateType: 'shortlist_forms_disc',
-          subject: `[TalentFlow MY] Shortlisted for ${c.pos} — Complete Application & DISC Assessment`,
-          bodyText: `Dear ${c.name},\n\nCongratulations on advancing to Stage 5!\n1. Employment Application Form: ${EMPLOYMENT_FORM_URL}\n2. DISC Personality Assessment: ${DISC_FORM_URL}\n\nPlease upload SPM, UEC (if applicable), University Degree Certificate, and Academic Transcript via your Candidate Portal.`,
-          stageTriggered: 5,
-          triggeredBy: req.user!.email,
-        });
-      }
-
-      if (c.autoBookSlotIndex !== undefined && slotIds[c.autoBookSlotIndex]) {
-        const resBook = reserveSlotTransaction(slotIds[c.autoBookSlotIndex], candId);
-        await dispatchEmail({
-          candidateId: candId,
-          candidateName: c.name,
-          recipientEmail: c.email,
-          templateType: 'interview_confirmation',
-          subject: `[Confirmed] Interview Schedule for ${c.pos} on ${resBook.slot.date}`,
-          bodyText: `Dear ${c.name},\n\nYour interview is confirmed for ${resBook.slot.date} (${resBook.slot.start_time} - ${resBook.slot.end_time} MYT) via ${resBook.slot.mode} with ${resBook.slot.interviewer_name}.`,
-          stageTriggered: 10,
-          triggeredBy: req.user!.email,
-        });
-      }
-
-      if (c.offer) {
-        db.prepare(`
-          INSERT INTO offers (
-            candidate_id, position, department, salary_myr, allowance_myr, probation_months,
-            start_date, issue_date, deadline_date, offer_terms_summary, status, candidate_response_note, responded_at
-          ) VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          candId,
-          c.pos,
-          c.dept,
-          c.offer.salary,
-          c.offer.allowance,
-          c.offer.start,
-          daysAgo(5),
-          c.offer.deadline,
-          c.offer.terms,
-          c.offer.status,
-          c.offer.status === 'Accepted' ? 'Accepted with thanks. Excited to join!' : '',
-          c.offer.status === 'Accepted' ? daysAgo(3) : ''
-        );
-      }
-    }
-
-    logAudit({
-      actor: req.user,
-      action: 'WORKSPACE_SAMPLE_INITIALIZED',
-      targetType: 'candidate',
-      targetId: 'seed_8',
-      details: 'Populated SQLite database with 8 Malaysian candidates across Stages 3–15 and 6 interview slots.',
-    });
-
-    res.json({ seeded: true });
   });
 
   // ===========================================================================

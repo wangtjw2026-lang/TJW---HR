@@ -53,6 +53,7 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
   onSelectCandidate,
   onNotify,
 }) => {
+  const isAdmin = staffUser.role === 'administrator';
   const [date, setDate] = useState(() =>
     new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10)
   );
@@ -254,11 +255,12 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
         </div>
       )}
 
-      {/* Create Interview Slot Form */}
-      <form
-        onSubmit={handleCreateSlot}
-        className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4"
-      >
+      {/* Create Interview Slot Form (Administrator Only) */}
+      {isAdmin ? (
+        <form
+          onSubmit={handleCreateSlot}
+          className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4"
+        >
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-bold text-[#0F172A]">Publish New Interview Slot</h2>
           <span className="text-[11px] font-mono text-[#64748B]">MYT (UTC+8)</span>
@@ -319,7 +321,7 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
               required
               value={interviewerName}
               onChange={(e) => setInterviewerName(e.target.value)}
-              placeholder="e.g., Puan Nurul Huda"
+              placeholder="Enter interviewer full name"
               className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
             />
           </div>
@@ -374,7 +376,12 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
             Create Interview Slot
           </button>
         </div>
-      </form>
+        </form>
+      ) : (
+        <div className="rounded-lg border border-[#E2E8F0] bg-white px-4 py-3 text-xs text-[#475569]">
+          <strong>Manager (View Only):</strong> You can inspect published interview slots, capacity counts, and booked candidates below. Slot creation, rescheduling, and cancellations require Administrator access.
+        </div>
+      )}
 
       {/* Slots List */}
       <div className="space-y-3">
@@ -440,36 +447,38 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => openEditModal(slot)}
-                      className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
-                    >
-                      <Edit3 className="h-3 w-3" />
-                      Reschedule / Edit
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => handleToggleCancelSlot(slot)}
-                      className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
-                    >
-                      <XCircle className="h-3 w-3" />
-                      {slot.status === 'ACTIVE' ? 'Cancel Slot' : 'Re-activate'}
-                    </button>
-                    {slot.booked_count === 0 && (
+                  {isAdmin && (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => openEditModal(slot)}
+                        className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
+                      >
+                        <Edit3 className="h-3 w-3" />
+                        Reschedule / Edit
+                      </button>
                       <button
                         type="button"
                         disabled={busy}
-                        onClick={() => handleDeleteSlot(slot.id)}
-                        className="rounded border border-[#FECACA] p-1 text-[#DC2626] hover:bg-[#FEF2F2]"
-                        title="Delete empty slot"
+                        onClick={() => handleToggleCancelSlot(slot)}
+                        className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
                       >
-                        <Trash2 className="h-3.5 w-3.5" />
+                        <XCircle className="h-3 w-3" />
+                        {slot.status === 'ACTIVE' ? 'Cancel Slot' : 'Re-activate'}
                       </button>
-                    )}
-                  </div>
+                      {slot.booked_count === 0 && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleDeleteSlot(slot.id)}
+                          className="rounded border border-[#FECACA] p-1 text-[#DC2626] hover:bg-[#FEF2F2]"
+                          title="Delete empty slot"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Booked candidates table */}
@@ -495,7 +504,7 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
                               [{b.status}]
                             </span>
                           </div>
-                          {b.status === 'CONFIRMED' && (
+                          {isAdmin && b.status === 'CONFIRMED' && (
                             <div className="flex items-center gap-2">
                               <button
                                 type="button"
@@ -530,8 +539,8 @@ export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
                   </div>
                 )}
 
-                {/* Quick Assign Qualified Candidate */}
-                {slot.status === 'ACTIVE' && !isFull && qualifiedUnbooked.length > 0 && (
+                {/* Quick Assign Qualified Candidate (Administrator Only) */}
+                {isAdmin && slot.status === 'ACTIVE' && !isFull && qualifiedUnbooked.length > 0 && (
                   <div className="flex flex-wrap items-center gap-2 border-t border-[#F1F5F9] pt-2.5">
                     <select
                       value={assignMap[slot.id] ?? ''}

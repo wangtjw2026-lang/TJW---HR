@@ -156,8 +156,8 @@ function escapeCsvCell(value: unknown): string {
   return str;
 }
 
-export function exportCandidatesToExcelCsv(candidates: CandidateRecord[], role: StaffRole): void {
-  const includeSalary = role === 'HR_ADMIN';
+export function exportCandidatesToExcelCsv(candidates: CandidateRecord[], _role: StaffRole): void {
+  const includeSalary = true;
 
   const docStatusLabel = (c: CandidateRecord, t: DocType) => {
     const d = getDoc(c, t);

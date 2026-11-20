@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Copy,
+  Eye,
   ExternalLink,
   FileText,
   GraduationCap,
@@ -121,7 +122,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   onNotify,
   onOpenPortalPreview,
 }) => {
-  const isHrAdmin = staffUser.role === 'HR_ADMIN';
+  const isAdmin = staffUser.role === 'administrator';
 
   const [activeTab, setActiveTab] = useState<DrawerTab>(() => {
     if (candidate.stage >= 13) return 'offer';
@@ -214,6 +215,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleScreening = async (decision: ScreeningDecision) => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -233,6 +235,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleSaveChecklist = async () => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -253,6 +256,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleFileUpload = async (docType: DocType, file: File) => {
+    if (!isAdmin) return;
     setUploadingDoc(docType);
     setError('');
     try {
@@ -267,6 +271,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleSendReminder = async () => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -281,6 +286,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleQualification = async (status: QualificationStatus) => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -300,7 +306,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleBookSlot = async () => {
-    if (!selectedSlotId) return;
+    if (!isAdmin || !selectedSlotId) return;
     setBusy(true);
     setError('');
     try {
@@ -316,7 +322,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleMarkInterviewStatus = async (status: 'COMPLETED' | 'CANCELLED' | 'RESCHEDULED') => {
-    if (!candidate.active_booking) return;
+    if (!isAdmin || !candidate.active_booking) return;
     setBusy(true);
     setError('');
     try {
@@ -331,6 +337,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handlePostInterview = async (decision: PostInterviewDecision) => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -357,6 +364,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
 
   const handleSendOffer = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -382,6 +390,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleUpdateOfferStatus = async (nextStatus: OfferStatus) => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -396,6 +405,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   };
 
   const handleDeleteCandidate = async () => {
+    if (!isAdmin) return;
     setBusy(true);
     setError('');
     try {
@@ -474,6 +484,16 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Read-only notice for Manager */}
+        {!isAdmin && (
+          <div className="flex items-center gap-2 border-b border-[#E2E8F0] bg-[#F8FAFC] px-6 py-2 text-xs text-[#475569]">
+            <Eye className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
+            <span>
+              <strong>Manager (View Only):</strong> All candidate records, uploaded resumes, academic documents, interview details, and offer terms are viewable in read-only mode.
+            </span>
+          </div>
+        )}
 
         {/* 15-stage compact stepper bar */}
         <div className="border-b border-[#E2E8F0] bg-white px-6 py-2.5">
@@ -592,7 +612,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                         >
                           Download
                         </a>
-                      ) : (
+                      ) : isAdmin ? (
                         <label className="cursor-pointer font-semibold text-[#0F766E] hover:underline shrink-0 ml-2">
                           {uploadingDoc === 'RESUME' ? 'Uploading...' : 'Attach PDF'}
                           <input
@@ -605,6 +625,8 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                             }}
                           />
                         </label>
+                      ) : (
+                        <span className="text-[#94A3B8] shrink-0 ml-2">No file attached</span>
                       )}
                     </div>
                   )}
@@ -657,7 +679,9 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   <div>
                     <h3 className="text-sm font-bold text-[#0F172A]">Stage 3–4 · HR Screening Decision</h3>
                     <p className="text-xs text-[#64748B]">
-                      Selecting &ldquo;Proceed to Next Stage&rdquo; automatically sends the Employment Application Form, DISC Assessment, and Academic Docs instructions via email.
+                      {isAdmin
+                        ? 'Selecting "Proceed to Next Stage" automatically sends the Employment Application Form, DISC Assessment, and Academic Docs instructions via email.'
+                        : 'Recorded screening decision and HR reviewer notes.'}
                     </p>
                   </div>
                   <span className="font-mono text-xs font-semibold uppercase text-[#475569]">
@@ -665,42 +689,50 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   </span>
                 </div>
 
-                <textarea
-                  value={screeningRemarks}
-                  onChange={(e) => setScreeningRemarks(e.target.value)}
-                  rows={3}
-                  placeholder="Enter HR initial resume screening notes (e.g., relevant Malaysian statutory experience, technical fit, salary expectations)..."
-                  className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
-                />
+                {isAdmin ? (
+                  <>
+                    <textarea
+                      value={screeningRemarks}
+                      onChange={(e) => setScreeningRemarks(e.target.value)}
+                      rows={3}
+                      placeholder="Enter HR initial resume screening notes (e.g., relevant statutory experience, technical fit, salary expectations)..."
+                      className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                    />
 
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleScreening('proceed')}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                  >
-                    <Send className="h-3.5 w-3.5" />
-                    Proceed to Next Stage &amp; Auto-Send Forms
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleScreening('reject')}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
-                  >
-                    <XCircle className="h-3.5 w-3.5" />
-                    Reject at Screening
-                  </button>
-                </div>
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleScreening('proceed')}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        Proceed to Next Stage &amp; Auto-Send Forms
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleScreening('reject')}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                      >
+                        <XCircle className="h-3.5 w-3.5" />
+                        Reject at Screening
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-xs text-[#334155] bg-white border border-[#E2E8F0] rounded-md px-3 py-2.5">
+                    {candidate.screening_remarks || 'No screening remarks recorded yet.'}
+                  </p>
+                )}
               </div>
 
-              {isHrAdmin && (
-                <div className="border-t border-[#E2E8F0] pt-4 flex items-center justify-between">
-                  <span className="text-xs text-[#64748B]">
-                    Record created {formatTimestamp(candidate.created_at)}
-                  </span>
-                  {!confirmDelete ? (
+              <div className="border-t border-[#E2E8F0] pt-4 flex items-center justify-between">
+                <span className="text-xs text-[#64748B]">
+                  Record created {formatTimestamp(candidate.created_at)}
+                </span>
+                {isAdmin && (
+                  !confirmDelete ? (
                     <button
                       type="button"
                       onClick={() => setConfirmDelete(true)}
@@ -728,9 +760,9 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                         Cancel
                       </button>
                     </div>
-                  )}
-                </div>
-              )}
+                  )
+                )}
+              </div>
             </>
           )}
 
@@ -753,15 +785,17 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     </p>
                   )}
                 </div>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={handleSendReminder}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-[#F59E0B] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#B45309] hover:bg-[#FEF3C7] disabled:opacity-50"
-                >
-                  <BellRing className="h-3.5 w-3.5" />
-                  Send Document Reminder Email
-                </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleSendReminder}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#F59E0B] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#B45309] hover:bg-[#FEF3C7] disabled:opacity-50"
+                  >
+                    <BellRing className="h-3.5 w-3.5" />
+                    Send Document Reminder Email
+                  </button>
+                )}
               </div>
 
               {/* Checklist table */}
@@ -795,21 +829,21 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                             <input
                               type="checkbox"
                               checked={flag.completed}
-                              disabled={flag.not_applicable}
+                              disabled={!isAdmin || flag.not_applicable}
                               onChange={(e) =>
                                 setDocFlags((prev) => ({
                                   ...prev,
                                   [item.type]: { ...prev[item.type], completed: e.target.checked },
                                 }))
                               }
-                              className="h-4 w-4 accent-[#0F766E]"
+                              className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
                             />
                           </td>
                           <td className="px-3 py-3 text-center">
                             <input
                               type="checkbox"
                               checked={flag.verified}
-                              disabled={flag.not_applicable}
+                              disabled={!isAdmin || flag.not_applicable}
                               onChange={(e) =>
                                 setDocFlags((prev) => ({
                                   ...prev,
@@ -820,7 +854,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                                   },
                                 }))
                               }
-                              className="h-4 w-4 accent-[#15803D]"
+                              className="h-4 w-4 accent-[#15803D] disabled:opacity-60"
                             />
                           </td>
                           <td className="px-3 py-3 text-center">
@@ -828,6 +862,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                               <input
                                 type="checkbox"
                                 checked={flag.not_applicable}
+                                disabled={!isAdmin}
                                 onChange={(e) =>
                                   setDocFlags((prev) => ({
                                     ...prev,
@@ -838,7 +873,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                                     },
                                   }))
                                 }
-                                className="h-4 w-4 accent-[#64748B]"
+                                className="h-4 w-4 accent-[#64748B] disabled:opacity-60"
                               />
                             ) : (
                               <span className="text-[#CBD5E1]">—</span>
@@ -867,7 +902,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                                   View PDF
                                 </a>
                               )}
-                              {item.allowUpload && !flag.not_applicable && (
+                              {isAdmin && item.allowUpload && !flag.not_applicable && (
                                 <label className="inline-flex cursor-pointer items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F8FAFC]">
                                   <Upload className="h-3 w-3" />
                                   {uploadingDoc === item.type ? 'Saving...' : 'Upload'}
@@ -896,23 +931,31 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   <label className="block text-xs font-semibold text-[#334155] mb-1">
                     DISC Personality Profile Result
                   </label>
-                  <input
-                    type="text"
-                    value={discProfile}
-                    onChange={(e) => setDiscProfile(e.target.value)}
-                    placeholder="e.g., High D / C — Analytical Driver"
-                    className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
-                  />
+                  {isAdmin ? (
+                    <input
+                      type="text"
+                      value={discProfile}
+                      onChange={(e) => setDiscProfile(e.target.value)}
+                      placeholder="e.g., High D / C — Analytical Driver"
+                      className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                    />
+                  ) : (
+                    <div className="rounded-md border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 text-xs text-[#334155]">
+                      {candidate.disc_profile || 'Not recorded yet'}
+                    </div>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={handleSaveChecklist}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
-                >
-                  <ClipboardCheck className="h-3.5 w-3.5" />
-                  Save Checklist Verification
-                </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleSaveChecklist}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
+                  >
+                    <ClipboardCheck className="h-3.5 w-3.5" />
+                    Save Checklist Verification
+                  </button>
+                )}
               </div>
 
               {/* Stage 8 Qualification */}
@@ -921,7 +964,9 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   <div>
                     <h3 className="text-sm font-bold text-[#0F172A]">Stage 8 · Qualification Decision</h3>
                     <p className="text-xs text-[#64748B]">
-                      Marking a candidate Qualified automatically dispatches the Interview Invitation email with their self-service slot booking link.
+                      {isAdmin
+                        ? 'Marking a candidate Qualified automatically dispatches the Interview Invitation email with their self-service slot booking link.'
+                        : 'Recorded academic qualification review status.'}
                     </p>
                   </div>
                   <span className="font-mono text-xs font-semibold uppercase text-[#475569]">
@@ -929,34 +974,42 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   </span>
                 </div>
 
-                <textarea
-                  value={qualRemarks}
-                  onChange={(e) => setQualRemarks(e.target.value)}
-                  rows={2}
-                  placeholder="Enter qualification review remarks (SPM/UEC/Degree verification, DISC team fit)..."
-                  className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
-                />
+                {isAdmin ? (
+                  <>
+                    <textarea
+                      value={qualRemarks}
+                      onChange={(e) => setQualRemarks(e.target.value)}
+                      rows={2}
+                      placeholder="Enter qualification review remarks (SPM/UEC/Degree verification, DISC team fit)..."
+                      className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                    />
 
-                <div className="flex flex-wrap gap-2.5">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleQualification('qualified')}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                  >
-                    <UserCheck className="h-3.5 w-3.5" />
-                    Mark Qualified &amp; Send Interview Invite
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleQualification('not_qualified')}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
-                  >
-                    <XCircle className="h-3.5 w-3.5" />
-                    Mark Not Qualified
-                  </button>
-                </div>
+                    <div className="flex flex-wrap gap-2.5">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleQualification('qualified')}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                      >
+                        <UserCheck className="h-3.5 w-3.5" />
+                        Mark Qualified &amp; Send Interview Invite
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleQualification('not_qualified')}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                      >
+                        <XCircle className="h-3.5 w-3.5" />
+                        Mark Not Qualified
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-xs text-[#334155] bg-white border border-[#E2E8F0] rounded-md px-3 py-2.5">
+                    {candidate.qualification_remarks || 'No qualification remarks recorded yet.'}
+                  </p>
+                )}
               </div>
             </>
           )}
@@ -988,39 +1041,41 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                       Location / Link: {candidate.active_booking.location_or_link}
                     </div>
 
-                    <div className="pt-2 flex flex-wrap gap-2 border-t border-[#CCFBF1]">
-                      {candidate.active_booking.status !== 'COMPLETED' && (
+                    {isAdmin && (
+                      <div className="pt-2 flex flex-wrap gap-2 border-t border-[#CCFBF1]">
+                        {candidate.active_booking.status !== 'COMPLETED' && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handleMarkInterviewStatus('COMPLETED')}
+                            className="rounded bg-[#0F766E] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[#115E59]"
+                          >
+                            Mark Interview Conducted
+                          </button>
+                        )}
                         <button
                           type="button"
                           disabled={busy}
-                          onClick={() => handleMarkInterviewStatus('COMPLETED')}
-                          className="rounded bg-[#0F766E] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[#115E59]"
+                          onClick={() => handleMarkInterviewStatus('RESCHEDULED')}
+                          className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
                         >
-                          Mark Interview Conducted
+                          Release Slot (Reschedule)
                         </button>
-                      )}
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleMarkInterviewStatus('RESCHEDULED')}
-                        className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
-                      >
-                        Release Slot (Reschedule)
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleMarkInterviewStatus('CANCELLED')}
-                        className="rounded border border-[#FECACA] bg-white px-2.5 py-1 text-xs font-medium text-[#DC2626] hover:bg-[#FEF2F2]"
-                      >
-                        Cancel Booking
-                      </button>
-                    </div>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleMarkInterviewStatus('CANCELLED')}
+                          className="rounded border border-[#FECACA] bg-white px-2.5 py-1 text-xs font-medium text-[#DC2626] hover:bg-[#FEF2F2]"
+                        >
+                          Cancel Booking
+                        </button>
+                      </div>
+                    )}
                   </div>
-                ) : (
+                ) : isAdmin ? (
                   <div className="space-y-3">
                     <p className="text-xs text-[#64748B]">
-                      No active booking yet. The candidate can book directly via their portal link, or HR can assign an open slot atomically below:
+                      No active booking yet. The candidate can book directly via their portal link, or an Administrator can assign an open slot atomically below:
                     </p>
                     <div className="flex flex-wrap items-center gap-2">
                       <select
@@ -1046,6 +1101,8 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                       </button>
                     </div>
                   </div>
+                ) : (
+                  <p className="text-xs text-[#64748B]">No interview slot has been booked yet.</p>
                 )}
               </div>
 
@@ -1060,75 +1117,94 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                   </span>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-[#334155] mb-1">
-                    Panel Rating (1–5)
-                  </label>
-                  <div className="flex items-center gap-1.5">
-                    {[1, 2, 3, 4, 5].map((n) => (
+                {isAdmin ? (
+                  <>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Panel Rating (1–5)
+                      </label>
+                      <div className="flex items-center gap-1.5">
+                        {[1, 2, 3, 4, 5].map((n) => (
+                          <button
+                            key={n}
+                            type="button"
+                            onClick={() => setInterviewRating(n)}
+                            className={`inline-flex items-center gap-1 rounded border px-2.5 py-1 text-xs font-semibold ${
+                              interviewRating === n
+                                ? 'border-[#0F766E] bg-[#0F766E] text-white'
+                                : 'border-[#CBD5E1] bg-white text-[#475569]'
+                            }`}
+                          >
+                            <Star className="h-3 w-3" />
+                            {n}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Interview Panel Feedback
+                      </label>
+                      <textarea
+                        value={interviewFeedback}
+                        onChange={(e) => setInterviewFeedback(e.target.value)}
+                        rows={3}
+                        placeholder="Document technical competency, leadership, communication, and cultural alignment..."
+                        className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Final Hiring Panel Notes
+                      </label>
+                      <input
+                        type="text"
+                        value={finalNotes}
+                        onChange={(e) => setFinalNotes(e.target.value)}
+                        placeholder="Recommended band, notice period, or rejection summary..."
+                        className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap gap-2.5">
                       <button
-                        key={n}
                         type="button"
-                        onClick={() => setInterviewRating(n)}
-                        className={`inline-flex items-center gap-1 rounded border px-2.5 py-1 text-xs font-semibold ${
-                          interviewRating === n
-                            ? 'border-[#0F766E] bg-[#0F766E] text-white'
-                            : 'border-[#CBD5E1] bg-white text-[#475569]'
-                        }`}
+                        disabled={busy}
+                        onClick={() => handlePostInterview('offer')}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
                       >
-                        <Star className="h-3 w-3" />
-                        {n}
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        Approve for Employment Offer
                       </button>
-                    ))}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handlePostInterview('reject')}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                      >
+                        <XCircle className="h-3.5 w-3.5" />
+                        Reject Post-Interview
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="space-y-2 text-xs text-[#334155] bg-white border border-[#E2E8F0] rounded-md p-3.5">
+                    <div>
+                      Panel Rating:{' '}
+                      <strong className="font-mono">
+                        {candidate.interview_rating ? `${candidate.interview_rating} / 5` : 'Not rated yet'}
+                      </strong>
+                    </div>
+                    <div>
+                      Feedback: {candidate.interview_feedback || 'No interview feedback recorded yet.'}
+                    </div>
+                    {candidate.final_decision_notes && (
+                      <div>Final Notes: {candidate.final_decision_notes}</div>
+                    )}
                   </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#334155] mb-1">
-                    Interview Panel Feedback
-                  </label>
-                  <textarea
-                    value={interviewFeedback}
-                    onChange={(e) => setInterviewFeedback(e.target.value)}
-                    rows={3}
-                    placeholder="Document technical competency, leadership, communication, and cultural alignment..."
-                    className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#334155] mb-1">
-                    Final Hiring Panel Notes
-                  </label>
-                  <input
-                    type="text"
-                    value={finalNotes}
-                    onChange={(e) => setFinalNotes(e.target.value)}
-                    placeholder="Recommended band, notice period, or rejection summary..."
-                    className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
-                  />
-                </div>
-
-                <div className="flex flex-wrap gap-2.5">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handlePostInterview('offer')}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                  >
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    Approve for Employment Offer
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handlePostInterview('reject')}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
-                  >
-                    <XCircle className="h-3.5 w-3.5" />
-                    Reject Post-Interview
-                  </button>
-                </div>
+                )}
               </div>
             </>
           )}
@@ -1136,196 +1212,182 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
           {/* TAB 4: EMPLOYMENT OFFER */}
           {activeTab === 'offer' && (
             <>
-              {!isHrAdmin ? (
-                <div className="rounded-lg border border-[#E2E8F0] bg-[#FAFBFC] p-5 space-y-2">
-                  <h3 className="text-sm font-bold text-[#0F172A]">
-                    Confidential Compensation &amp; Offer Management
-                  </h3>
-                  <p className="text-xs text-[#475569]">
-                    MYR salary packages, allowances, and offer letter issuance are restricted to{' '}
-                    <strong>HR Admin</strong> accounts.
-                  </p>
-                  {candidate.offer ? (
-                    <div className="pt-2 border-t border-[#E2E8F0] text-xs text-[#334155] space-y-1">
-                      <div>
-                        Offer Status: <strong>{candidate.offer.status}</strong>
-                      </div>
-                      <div>Start Date: {candidate.offer.start_date}</div>
-                      <div>Response Deadline: {candidate.offer.deadline_date}</div>
+              {isAdmin && (
+                <form
+                  onSubmit={handleSendOffer}
+                  className="border border-[#E2E8F0] rounded-lg p-4 space-y-4 bg-white"
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-bold text-[#0F172A]">
+                        Stage 13 · Malaysian Employment Offer Builder (MYR)
+                      </h3>
+                      <p className="text-xs text-[#64748B]">
+                        Issuing an offer stores the record in SQLite, attaches the PDF to local storage, and emails the candidate portal link.
+                      </p>
                     </div>
-                  ) : (
-                    <p className="text-xs text-[#64748B]">No employment offer has been issued yet.</p>
-                  )}
-                </div>
-              ) : (
-                <>
-                  {/* Offer Builder / Revision Form */}
-                  <form
-                    onSubmit={handleSendOffer}
-                    className="border border-[#E2E8F0] rounded-lg p-4 space-y-4 bg-white"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <h3 className="text-sm font-bold text-[#0F172A]">
-                          Stage 13 · Malaysian Employment Offer Builder (MYR)
-                        </h3>
-                        <p className="text-xs text-[#64748B]">
-                          Issuing an offer stores the record in SQLite, attaches the PDF to local storage, and emails the candidate portal link.
-                        </p>
-                      </div>
-                      {candidate.offer && (
-                        <button
-                          type="button"
-                          onClick={handlePrintOfferLetter}
-                          className="inline-flex items-center gap-1 rounded-md border border-[#CBD5E1] px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
-                        >
-                          <Printer className="h-3.5 w-3.5" />
-                          Print Offer
-                        </button>
-                      )}
-                    </div>
+                    {candidate.offer && (
+                      <button
+                        type="button"
+                        onClick={handlePrintOfferLetter}
+                        className="inline-flex items-center gap-1 rounded-md border border-[#CBD5E1] px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
+                      >
+                        <Printer className="h-3.5 w-3.5" />
+                        Print Offer
+                      </button>
+                    )}
+                  </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-xs font-semibold text-[#334155] mb-1">
-                          Monthly Basic Salary (RM)
-                        </label>
-                        <input
-                          type="number"
-                          required
-                          min={1500}
-                          step={100}
-                          value={offerSalary}
-                          onChange={(e) => setOfferSalary(Number(e.target.value))}
-                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-[#334155] mb-1">
-                          Monthly Allowance (RM)
-                        </label>
-                        <input
-                          type="number"
-                          min={0}
-                          step={50}
-                          value={offerAllowance}
-                          onChange={(e) => setOfferAllowance(Number(e.target.value))}
-                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-[#334155] mb-1">
-                          Probation (Months)
-                        </label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={12}
-                          value={offerProbation}
-                          onChange={(e) => setOfferProbation(Number(e.target.value))}
-                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-semibold text-[#334155] mb-1">
-                          Commencement Date
-                        </label>
-                        <input
-                          type="date"
-                          required
-                          value={offerStartDate}
-                          onChange={(e) => setOfferStartDate(e.target.value)}
-                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-[#334155] mb-1">
-                          Offer Acceptance Deadline
-                        </label>
-                        <input
-                          type="date"
-                          required
-                          value={offerDeadline}
-                          onChange={(e) => setOfferDeadline(e.target.value)}
-                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
-                        />
-                      </div>
-                    </div>
-
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div>
                       <label className="block text-xs font-semibold text-[#334155] mb-1">
-                        Statutory &amp; Benefits Terms Summary
+                        Monthly Basic Salary (RM)
                       </label>
-                      <textarea
-                        rows={2}
-                        value={offerTerms}
-                        onChange={(e) => setOfferTerms(e.target.value)}
+                      <input
+                        type="number"
+                        required
+                        min={1500}
+                        step={100}
+                        value={offerSalary}
+                        onChange={(e) => setOfferSalary(Number(e.target.value))}
+                        className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Monthly Allowance (RM)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step={50}
+                        value={offerAllowance}
+                        onChange={(e) => setOfferAllowance(Number(e.target.value))}
+                        className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Probation (Months)
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={12}
+                        value={offerProbation}
+                        onChange={(e) => setOfferProbation(Number(e.target.value))}
+                        className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Commencement Date
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        value={offerStartDate}
+                        onChange={(e) => setOfferStartDate(e.target.value)}
                         className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
                       />
                     </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-[#CBD5E1] bg-[#F8FAFC] px-3 py-2 text-xs font-medium text-[#334155] hover:bg-[#F1F5F9]">
-                        <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
-                        {offerLetterFile
-                          ? `Attached: ${offerLetterFile.name}`
-                          : candidate.offer?.offer_letter_path
-                          ? 'Replace Offer Letter PDF'
-                          : 'Attach Official Offer Letter (PDF)'}
-                        <input
-                          type="file"
-                          accept=".pdf,.doc,.docx"
-                          className="hidden"
-                          onChange={(e) => setOfferLetterFile(e.target.files?.[0] || null)}
-                        />
+                    <div>
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Offer Acceptance Deadline
                       </label>
-
-                      <button
-                        type="submit"
-                        disabled={busy}
-                        className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
-                      >
-                        <Send className="h-3.5 w-3.5" />
-                        {candidate.offer ? 'Update & Re-Send Offer' : 'Issue Employment Offer'}
-                      </button>
+                      <input
+                        type="date"
+                        required
+                        value={offerDeadline}
+                        onChange={(e) => setOfferDeadline(e.target.value)}
+                        className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+                      />
                     </div>
-                  </form>
+                  </div>
 
-                  {/* Stage 14-15 Offer Tracking */}
-                  {candidate.offer && (
-                    <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <h3 className="text-sm font-bold text-[#0F172A]">
-                            Stage 14–15 · Offer Response Tracking
-                          </h3>
-                          <p className="text-xs text-[#64748B]">
-                            Package: <strong className="text-[#0F172A]">{formatMYR(candidate.offer.salary_myr)}</strong> basic +{' '}
-                            {formatMYR(candidate.offer.allowance_myr)} allowance · Start {candidate.offer.start_date}
-                          </p>
-                        </div>
-                        <span className="font-mono text-xs font-bold text-[#0F766E]">
-                          {candidate.offer.status}
-                        </span>
-                      </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-[#334155] mb-1">
+                      Statutory &amp; Benefits Terms Summary
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={offerTerms}
+                      onChange={(e) => setOfferTerms(e.target.value)}
+                      className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+                    />
+                  </div>
 
-                      {candidate.offer.offer_letter_path && (
-                        <div className="text-xs">
-                          <a
-                            href={getProtectedFileUrl(candidate.offer.offer_letter_path)}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1.5 font-semibold text-[#0F766E] hover:underline"
-                          >
-                            <FileText className="h-3.5 w-3.5" />
-                            Download Attached Offer Letter
-                          </a>
-                        </div>
-                      )}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-[#CBD5E1] bg-[#F8FAFC] px-3 py-2 text-xs font-medium text-[#334155] hover:bg-[#F1F5F9]">
+                      <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
+                      {offerLetterFile
+                        ? `Attached: ${offerLetterFile.name}`
+                        : candidate.offer?.offer_letter_path
+                        ? 'Replace Offer Letter PDF'
+                        : 'Attach Official Offer Letter (PDF)'}
+                      <input
+                        type="file"
+                        accept=".pdf,.doc,.docx"
+                        className="hidden"
+                        onChange={(e) => setOfferLetterFile(e.target.files?.[0] || null)}
+                      />
+                    </label>
 
+                    <button
+                      type="submit"
+                      disabled={busy}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                      {candidate.offer ? 'Update & Re-Send Offer' : 'Issue Employment Offer'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Stage 14-15 Offer Summary & Tracking (Viewable by Both Roles) */}
+              {candidate.offer ? (
+                <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-bold text-[#0F172A]">
+                        Stage 14–15 · Employment Offer Status
+                      </h3>
+                      <p className="text-xs text-[#64748B]">
+                        Package: <strong className="text-[#0F172A]">{formatMYR(candidate.offer.salary_myr)}</strong> basic +{' '}
+                        {formatMYR(candidate.offer.allowance_myr)} allowance · Start {candidate.offer.start_date} · Deadline {candidate.offer.deadline_date}
+                      </p>
+                    </div>
+                    <span className="font-mono text-xs font-bold text-[#0F766E]">
+                      {candidate.offer.status}
+                    </span>
+                  </div>
+
+                  {candidate.offer.offer_terms_summary && (
+                    <p className="text-xs text-[#334155] leading-relaxed">
+                      {candidate.offer.offer_terms_summary}
+                    </p>
+                  )}
+
+                  {candidate.offer.offer_letter_path && (
+                    <div className="text-xs">
+                      <a
+                        href={getProtectedFileUrl(candidate.offer.offer_letter_path)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 font-semibold text-[#0F766E] hover:underline"
+                      >
+                        <FileText className="h-3.5 w-3.5" />
+                        Download Attached Offer Letter
+                      </a>
+                    </div>
+                  )}
+
+                  {isAdmin ? (
+                    <>
                       <input
                         type="text"
                         value={offerResponseNote}
@@ -1357,9 +1419,21 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                           </button>
                         ))}
                       </div>
-                    </div>
+                    </>
+                  ) : (
+                    candidate.offer.candidate_response_note && (
+                      <div className="text-xs text-[#475569] border-t border-[#E2E8F0] pt-2">
+                        Response Note: {candidate.offer.candidate_response_note}
+                      </div>
+                    )
                   )}
-                </>
+                </div>
+              ) : (
+                !isAdmin && (
+                  <div className="rounded-lg border border-[#E2E8F0] bg-[#FAFBFC] p-5 text-xs text-[#64748B]">
+                    No employment offer has been issued for this candidate yet.
+                  </div>
+                )
               )}
             </>
           )}

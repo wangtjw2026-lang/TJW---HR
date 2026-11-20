@@ -1,19 +1,53 @@
-import React, { useState } from 'react';
-import { ShieldCheck, FileCheck2, CalendarCheck2, Sparkles, ArrowRight, KeyRound } from 'lucide-react';
-import { StaffUser } from '../types/ats';
-import { loginStaff } from '../lib/apiService';
+import React, { useEffect, useState } from 'react';
+import {
+  ArrowRight,
+  CalendarCheck2,
+  FileCheck2,
+  Loader2,
+  ShieldCheck,
+  Sparkles,
+  UserCheck,
+} from 'lucide-react';
+import { DEPARTMENTS, StaffUser } from '../types/ats';
+import { fetchAuthSetupStatus, loginStaff, setupInitialHrAdmin } from '../lib/apiService';
 
 interface AuthGateProps {
   onAuthenticated: (user: StaffUser) => void;
 }
 
 export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
+  const [checkingSetup, setCheckingSetup] = useState(true);
+  const [needsSetup, setNeedsSetup] = useState(false);
+
+  // Initial HR Admin Setup fields
+  const [adminName, setAdminName] = useState('');
+  const [adminDepartment, setAdminDepartment] = useState<string>('Human Resources');
+  const [confirmPassword, setConfirmPassword] = useState('');
+
+  // Shared email/password fields
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  useEffect(() => {
+    let active = true;
+    fetchAuthSetupStatus()
+      .then((res) => {
+        if (active) setNeedsSetup(Boolean(res.needsSetup));
+      })
+      .catch(() => {
+        if (active) setNeedsSetup(false);
+      })
+      .finally(() => {
+        if (active) setCheckingSetup(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
@@ -27,10 +61,37 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
     }
   };
 
-  const quickFill = (demoEmail: string, demoPassword: string) => {
-    setEmail(demoEmail);
-    setPassword(demoPassword);
+  const handleInitialSetupSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     setError(null);
+
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { user } = await setupInitialHrAdmin({
+        name: adminName,
+        email,
+        password,
+        department: adminDepartment,
+      });
+      onAuthenticated(user);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to create initial HR Admin account.';
+      setError(msg);
+      if (msg.toLowerCase().includes('already exists')) {
+        setNeedsSetup(false);
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -51,7 +112,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
           <p className="text-slate-300 text-base mt-4 max-w-xl leading-relaxed">
             Manage JobStreet and Email candidate intake, server-side Gemini AI resume scoring,
             automated Google Apps Script assessments, SPM/UEC/Degree verification, atomic SQLite
-            interview booking, and MYR offers with local encrypted disk storage.
+            interview booking, and MYR offers with local protected disk storage.
           </p>
 
           <div className="grid sm:grid-cols-2 gap-6 mt-12 pt-8 border-t border-slate-800 max-w-2xl">
@@ -88,7 +149,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
                 <span>JWT RBAC & PDPA Audit Trail</span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Role-based access control between HR Admin and Recruiter accounts with immutable SQLite security audit logs.
+                Role-based access control between Administrator and Manager (View Only) accounts with immutable SQLite security audit logs.
               </p>
             </div>
           </div>
@@ -103,96 +164,191 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
         </div>
       </div>
 
-      {/* Right Email / Password Login Column */}
+      {/* Right Authentication / First-Run Setup Column */}
       <div className="lg:w-5/12 flex items-center justify-center p-8 sm:p-12">
         <div className="w-full max-w-sm space-y-6">
-          <div>
-            <h2 className="font-display text-2xl font-bold text-slate-900">
-              Sign in to HR Workspace
-            </h2>
-            <p className="text-sm text-slate-600 mt-1.5">
-              Authenticate with your HR staff credentials to access candidate pipelines and PDPA-protected documents.
-            </p>
-          </div>
-
-          {error && (
-            <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md">
-              {error}
+          {checkingSetup ? (
+            <div className="flex items-center justify-center gap-2 py-12 text-xs text-slate-500">
+              <Loader2 className="w-4 h-4 animate-spin text-teal-700" />
+              <span>Checking workspace initialization...</span>
             </div>
+          ) : needsSetup ? (
+            <>
+              <div>
+                <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-teal-700 mb-2">
+                  <UserCheck className="w-4 h-4" />
+                  <span>First-Time Workspace Setup</span>
+                </div>
+                <h2 className="font-display text-2xl font-bold text-slate-900">
+                  Create Initial Administrator Account
+                </h2>
+                <p className="text-sm text-slate-600 mt-1.5">
+                  No staff accounts exist yet. Register your primary Administrator account to unlock the recruitment workspace and manage Manager access.
+                </p>
+              </div>
+
+              {error && (
+                <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md">
+                  {error}
+                </div>
+              )}
+
+              <form onSubmit={handleInitialSetupSubmit} className="space-y-4">
+                <div>
+                  <label htmlFor="setup-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Full Name
+                  </label>
+                  <input
+                    id="setup-name"
+                    type="text"
+                    required
+                    autoComplete="name"
+                    value={adminName}
+                    onChange={(e) => setAdminName(e.target.value)}
+                    placeholder="Enter your full name"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="setup-email" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Work Email
+                  </label>
+                  <input
+                    id="setup-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="name@yourcompany.com"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="setup-department" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Department
+                  </label>
+                  <select
+                    id="setup-department"
+                    value={adminDepartment}
+                    onChange={(e) => setAdminDepartment(e.target.value)}
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  >
+                    {DEPARTMENTS.map((dept) => (
+                      <option key={dept} value={dept}>
+                        {dept}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="setup-password" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Password (min. 8 characters)
+                  </label>
+                  <input
+                    id="setup-password"
+                    type="password"
+                    required
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Create a strong password"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="setup-confirm-password" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Confirm Password
+                  </label>
+                  <input
+                    id="setup-confirm-password"
+                    type="password"
+                    required
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    placeholder="Re-enter password"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full inline-flex items-center justify-center gap-2.5 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-60 rounded-md transition-colors cursor-pointer"
+                >
+                  <span>{loading ? 'Creating Administrator Account...' : 'Create Initial Administrator Account'}</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              </form>
+            </>
+          ) : (
+            <>
+              <div>
+                <h2 className="font-display text-2xl font-bold text-slate-900">
+                  Sign in to HR Workspace
+                </h2>
+                <p className="text-sm text-slate-600 mt-1.5">
+                  Authenticate with your HR staff credentials to access candidate pipelines and PDPA-protected documents.
+                </p>
+              </div>
+
+              {error && (
+                <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md">
+                  {error}
+                </div>
+              )}
+
+              <form onSubmit={handleLoginSubmit} className="space-y-4">
+                <div>
+                  <label htmlFor="login-email" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Work Email
+                  </label>
+                  <input
+                    id="login-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="name@yourcompany.com"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="login-password" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Password
+                  </label>
+                  <input
+                    id="login-password"
+                    type="password"
+                    required
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter password"
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full inline-flex items-center justify-center gap-2.5 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-60 rounded-md transition-colors cursor-pointer"
+                >
+                  <span>{loading ? 'Authenticating...' : 'Sign In'}</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              </form>
+            </>
           )}
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label htmlFor="login-email" className="block text-xs font-semibold text-slate-700 mb-1">
-                Corporate Email
-              </label>
-              <input
-                id="login-email"
-                type="email"
-                required
-                autoComplete="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="admin@company.com"
-                className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="login-password" className="block text-xs font-semibold text-slate-700 mb-1">
-                Password
-              </label>
-              <input
-                id="login-password"
-                type="password"
-                required
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password"
-                className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full inline-flex items-center justify-center gap-2.5 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-60 rounded-md transition-colors cursor-pointer"
-            >
-              <span>{loading ? 'Authenticating...' : 'Sign In'}</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
-          </form>
-
-          {/* Quick-Fill Seeded Demo Accounts */}
-          <div className="pt-4 border-t border-slate-200 space-y-2.5">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
-              <KeyRound className="w-3.5 h-3.5 text-teal-700" />
-              <span>Seeded Demo Credentials</span>
-            </div>
-            <div className="grid grid-cols-1 gap-2">
-              <button
-                type="button"
-                onClick={() => quickFill('admin@company.com', 'Admin@1234')}
-                className="w-full px-3 py-2 text-left bg-white border border-slate-200 hover:border-teal-600 rounded-md transition-colors cursor-pointer"
-              >
-                <div className="text-xs font-semibold text-slate-900">Quick-Fill HR Admin</div>
-                <div className="font-mono text-[11px] text-slate-500 mt-0.5">
-                  admin@company.com · Admin@1234
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => quickFill('recruiter@company.com', 'Recruiter@1234')}
-                className="w-full px-3 py-2 text-left bg-white border border-slate-200 hover:border-teal-600 rounded-md transition-colors cursor-pointer"
-              >
-                <div className="text-xs font-semibold text-slate-900">Quick-Fill Recruiter (Salary Masked)</div>
-                <div className="font-mono text-[11px] text-slate-500 mt-0.5">
-                  recruiter@company.com · Recruiter@1234
-                </div>
-              </button>
-            </div>
-          </div>
         </div>
       </div>
     </div>

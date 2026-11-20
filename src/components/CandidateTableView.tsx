@@ -229,7 +229,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
             <span className="font-mono tabular-nums">{candidates.length}</span> candidates
           </span>
           <span>
-            Active Role: <strong className="text-slate-700">{ROLE_META[role].label}</strong>
+            Active Role: <strong className="text-slate-700">{ROLE_META[role].badgeLabel}</strong>
           </span>
         </div>
 

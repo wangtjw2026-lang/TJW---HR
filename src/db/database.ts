@@ -1,5 +1,4 @@
 import Database from 'better-sqlite3';
-import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -32,7 +31,7 @@ export function initializeDatabase() {
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('HR_ADMIN', 'RECRUITER')),
+      role TEXT NOT NULL CHECK(role IN ('administrator', 'manager')),
       department TEXT NOT NULL DEFAULT 'Human Resources',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -157,19 +156,6 @@ export function initializeDatabase() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
-
-  // Seed default HR Admin & Recruiter accounts if users table is empty
-  const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
-  if (userCount.count === 0) {
-    const insertUser = db.prepare(
-      'INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, ?, ?)'
-    );
-    const adminHash = bcrypt.hashSync('Admin@1234', 10);
-    const recruiterHash = bcrypt.hashSync('Recruiter@1234', 10);
-    insertUser.run('HR Administrator', 'admin@company.com', adminHash, 'HR_ADMIN', 'Human Resources');
-    insertUser.run('Talent Recruiter', 'recruiter@company.com', recruiterHash, 'RECRUITER', 'Human Resources');
-    console.log('[TalentFlow DB] Seeded default HR Admin (admin@company.com / Admin@1234) and Recruiter (recruiter@company.com / Recruiter@1234)');
-  }
 }
 
 export function generatePortalToken(): string {
