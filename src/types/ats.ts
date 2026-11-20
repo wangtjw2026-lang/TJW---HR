@@ -5,9 +5,7 @@ export const GOOGLE_APPS_SCRIPT_URLS = {
     'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec',
 } as const;
 
-export const BOOTSTRAPPED_ADMIN_EMAIL = 'wangtjw2026@gmail.com';
-
-export type StaffRole = 'hr_admin' | 'recruiter' | 'hiring_manager';
+export type StaffRole = 'HR_ADMIN' | 'RECRUITER';
 
 export type ApplicationSource = 'JobStreet' | 'Email';
 
@@ -29,12 +27,13 @@ export type CandidateStatus =
   | 'offer_expired'
   | 'rejected_post_interview';
 
-export type DocStatus = 'missing' | 'submitted' | 'verified';
-export type UecDocStatus = 'not_applicable' | 'missing' | 'submitted' | 'verified';
+export type DocType = 'RESUME' | 'APP_FORM' | 'DISC' | 'SPM' | 'UEC' | 'DEGREE' | 'TRANSCRIPT';
+
 export type ScreeningDecision = 'pending' | 'proceed' | 'reject';
-export type QualificationDecision = 'pending' | 'qualified' | 'not_qualified';
+export type QualificationStatus = 'pending' | 'qualified' | 'not_qualified';
 export type PostInterviewDecision = 'pending' | 'offer' | 'reject';
-export type OfferStatus = 'none' | 'offer_sent' | 'pending_response' | 'accepted' | 'rejected' | 'expired';
+export type OfferStatus = 'Offer Sent' | 'Pending Response' | 'Accepted' | 'Rejected' | 'Expired';
+export type BookingStatus = 'CONFIRMED' | 'RESCHEDULED' | 'CANCELLED' | 'COMPLETED';
 
 export type InterviewMode =
   | 'Google Meet'
@@ -42,160 +41,139 @@ export type InterviewMode =
   | 'On-site (KL HQ)'
   | 'On-site (Penang)';
 
-export type SlotStatus = 'available' | 'booked' | 'completed' | 'cancelled';
-
-export type EmailTemplateType =
-  | 'shortlist_forms_disc'
-  | 'docs_reminder_48h'
-  | 'interview_invite'
-  | 'interview_confirmation'
-  | 'employment_offer'
-  | 'rejection_notice';
-
-export type AuditTargetType =
-  | 'candidate'
-  | 'pii'
-  | 'compensation'
-  | 'interview_slot'
-  | 'export'
-  | 'rbac';
-
 export interface StaffUser {
-  uid: string;
+  id: number;
+  name: string;
   email: string;
-  displayName: string;
   role: StaffRole;
   department: string;
-  createdAt?: unknown;
-  updatedAt?: unknown;
+  created_at?: string;
+}
+
+export interface CandidateDocument {
+  id: number;
+  candidate_id: number;
+  doc_type: DocType;
+  completed: boolean;
+  verified: boolean;
+  not_applicable: boolean;
+  file_name: string;
+  file_path: string;
+  uploaded_at: string;
+}
+
+export interface InterviewBooking {
+  id: number;
+  slot_id: number;
+  candidate_id: number;
+  candidate_name?: string;
+  candidate_position?: string;
+  status: BookingStatus;
+  booked_at: string;
+  date?: string;
+  start_time?: string;
+  end_time?: string;
+  location_or_link?: string;
+  interviewer_name?: string;
+  mode?: string;
+}
+
+export interface OfferRecord {
+  id: number;
+  candidate_id: number;
+  position: string;
+  department: string;
+  salary_myr: number | null;
+  allowance_myr: number | null;
+  probation_months: number;
+  start_date: string;
+  issue_date: string;
+  deadline_date: string;
+  offer_letter_path: string;
+  offer_terms_summary: string;
+  status: OfferStatus;
+  candidate_response_note: string;
+  responded_at: string;
+  created_at: string;
 }
 
 export interface CandidateRecord {
-  id: string;
-  candidateCode: string;
-  fullName: string;
-  maskedEmail: string;
-  maskedPhone: string;
-  emailHash: string;
-  phoneHash: string;
-  positionApplied: string;
+  id: number;
+  candidate_code: string;
+  full_name: string;
+  phone: string;
+  email: string;
+  location: string;
+  position: string;
   department: string;
   source: ApplicationSource;
-  applicationDate: string;
-  currentStage: number;
+  applied_date: string;
+  stage: number;
   status: CandidateStatus;
-  aiMatchScore: number;
-  aiSummary: string;
-  educationSummary: string;
-  experienceSummary: string;
-  yearsExperience: number;
+  education: string;
+  experience: string;
+  years_experience: number;
   skills: string[];
-  screeningDecision: ScreeningDecision;
-  screeningRejectionReason: string;
-  employmentFormCompleted: boolean;
-  discFormCompleted: boolean;
-  discProfile: string;
-  docSpmStatus: DocStatus;
-  docUecStatus: UecDocStatus;
-  docDegreeStatus: DocStatus;
-  docTranscriptStatus: DocStatus;
-  lastDocReminderAt: string;
-  qualificationDecision: QualificationDecision;
-  qualificationRemarks: string;
-  interviewSlotId: string;
-  interviewDate: string;
-  interviewTime: string;
-  interviewMode: string;
-  interviewerName: string;
-  interviewFeedback: string;
-  interviewRating: number;
-  postInterviewDecision: PostInterviewDecision;
-  offerStatus: OfferStatus;
-  finalDecisionNotes: string;
-  ownerId: string;
-  assignedStaffIds: string[];
-  createdAt?: unknown;
-  updatedAt?: unknown;
-}
-
-export interface CandidatePrivatePii {
-  email: string;
-  phone: string;
-  location: string;
-  resumeFileName: string;
-  resumeExcerpt: string;
-  spmFileName: string;
-  uecFileName: string;
-  degreeFileName: string;
-  transcriptFileName: string;
-  ownerId: string;
-  createdAt?: unknown;
-  updatedAt?: unknown;
-}
-
-export interface CandidatePrivateCompensation {
-  positionOffered: string;
-  departmentOffered: string;
-  monthlySalaryMYR: number;
-  allowanceMYR: number;
-  probationMonths: number;
-  startDate: string;
-  offerDeadline: string;
-  offerLetterRef: string;
-  offerTermsSummary: string;
-  candidateResponseNote: string;
-  respondedAt: string;
-  ownerId: string;
-  createdAt?: unknown;
-  updatedAt?: unknown;
+  ai_score: number;
+  ai_summary: string;
+  screening_decision: ScreeningDecision;
+  screening_remarks: string;
+  disc_profile: string;
+  last_doc_reminder_at: string;
+  qualification_status: QualificationStatus;
+  qualification_remarks: string;
+  interview_feedback: string;
+  interview_rating: number;
+  post_interview_decision: PostInterviewDecision;
+  final_decision_notes: string;
+  portal_token: string;
+  created_at: string;
+  updated_at: string;
+  documents: CandidateDocument[];
+  active_booking: InterviewBooking | null;
+  offer: OfferRecord | null;
 }
 
 export interface InterviewSlot {
-  id: string;
+  id: number;
   date: string;
-  startTime: string;
-  endTime: string;
-  interviewerName: string;
+  start_time: string;
+  end_time: string;
+  capacity: number;
+  booked_count: number;
+  location_or_link: string;
+  interviewer_name: string;
   department: string;
   mode: InterviewMode;
-  meetingLinkOrRoom: string;
-  status: SlotStatus;
-  bookedCandidateId: string;
-  bookedCandidateName: string;
-  ownerId: string;
-  assignedStaffIds: string[];
-  createdAt?: unknown;
-  updatedAt?: unknown;
+  status: 'ACTIVE' | 'CANCELLED';
+  created_at: string;
+  bookings: InterviewBooking[];
 }
 
 export interface EmailLogRecord {
-  id: string;
-  candidateId: string;
-  candidateName: string;
-  maskedRecipient: string;
-  templateType: EmailTemplateType;
+  id: number;
+  candidate_id: number | null;
+  candidate_name: string;
+  recipient_email: string;
+  template_type: string;
   subject: string;
-  bodyPreview: string;
-  stageTriggered: number;
-  deliveryStatus: 'dispatched' | 'queued';
-  triggeredByUid: string;
-  ownerId: string;
-  assignedStaffIds: string[];
-  createdAt?: unknown;
+  body_preview: string;
+  stage_triggered: number;
+  delivery_status: string;
+  triggered_by: string;
+  created_at: string;
 }
 
-export interface PdpaAuditLogRecord {
-  id: string;
-  actorUid: string;
-  actorEmail: string;
-  actorRole: StaffRole;
+export interface AuditLogRecord {
+  id: number;
+  actor_id: number | null;
+  actor_email: string;
+  actor_role: string;
   action: string;
-  targetType: AuditTargetType;
-  targetId: string;
+  target_type: string;
+  target_id: string;
   details: string;
-  ownerId: string;
-  assignedStaffIds: string[];
-  createdAt?: unknown;
+  created_at: string;
 }
 
 export interface ParsedResumeResult {
@@ -224,7 +202,7 @@ export interface CandidateFilters {
   stage: '' | number;
   status: '' | CandidateStatus;
   interviewDate: string;
-  offerStatus: '' | OfferStatus;
+  offerStatus: '' | OfferStatus | 'NONE';
 }
 
 export interface WorkflowStageMeta {
@@ -297,27 +275,20 @@ export const STATUS_META: Record<
 
 export const ROLE_META: Record<
   StaffRole,
-  { label: string; summary: string; canViewPii: boolean; canViewSalary: boolean; canExportCsv: boolean }
+  { label: string; summary: string; canViewSalary: boolean; canExportCsv: boolean; canManageUsers: boolean }
 > = {
-  hr_admin: {
+  HR_ADMIN: {
     label: 'HR Admin',
-    summary: 'Full access to candidate PII, academic transcripts, MYR salary packages, offer letters, and Excel CSV exports.',
-    canViewPii: true,
+    summary: 'Full access to candidate records, academic documents, MYR salary packages, offer letters, team roles, and Excel CSV exports.',
     canViewSalary: true,
     canExportCsv: true,
+    canManageUsers: true,
   },
-  recruiter: {
+  RECRUITER: {
     label: 'Recruiter',
-    summary: 'Operational access to screening, document verification, and interview scheduling. MYR salary packages are masked.',
-    canViewPii: true,
+    summary: 'Operational access to screening, document verification, and interview scheduling. Confidential MYR salary packages and CSV exports are restricted to HR Admin.',
     canViewSalary: false,
     canExportCsv: false,
-  },
-  hiring_manager: {
-    label: 'Hiring Manager',
-    summary: 'Restricted to interview schedules and evaluation scorecards. Raw PII, academic certificates, and MYR salaries are masked.',
-    canViewPii: false,
-    canViewSalary: false,
-    canExportCsv: false,
+    canManageUsers: false,
   },
 };

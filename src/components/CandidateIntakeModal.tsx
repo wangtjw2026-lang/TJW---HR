@@ -4,18 +4,14 @@ import {
   ApplicationSource,
   CandidateRecord,
   DEPARTMENTS,
-  ParsedResumeResult,
   POSITIONS,
-  StaffUser,
 } from '../types/ats';
-import { hashContactValue } from '../lib/atsHelpers';
-import { registerCandidate } from '../lib/firestoreService';
+import { parseResumeWithAi, registerCandidate } from '../lib/apiService';
 
 interface CandidateIntakeModalProps {
-  actor: StaffUser;
   existingCandidates: CandidateRecord[];
   onClose: () => void;
-  onRegistered: (candidateId: string) => void;
+  onRegistered: (candidate: CandidateRecord) => void;
 }
 
 const SAMPLE_RESUME_TEXT = `AMIRUL HAKIM BIN ZULKIFLI
@@ -28,14 +24,17 @@ EDUCATION
 EXPERIENCE
 Full-Stack Software Engineer — FinCore Sdn Bhd, Kuala Lumpur (2022 - Present, 4 years)
 - Built React, TypeScript, and Node.js enterprise banking portals serving 180k Malaysian SMEs.
-- Designed Cloud Firestore real-time ledgers and PostgreSQL reporting pipelines.
-- Led PDPA encryption compliance and automated CI/CD on Google Cloud Run.
+- Designed SQLite & PostgreSQL transaction ledgers and REST API pipelines.
+- Led PDPA encryption compliance and automated CI/CD deployments.
 
 SKILLS
-TypeScript, React, Node.js, Express, Firebase, PostgreSQL, Tailwind CSS, REST APIs, Git`;
+TypeScript, React, Node.js, Express, SQLite, PostgreSQL, Tailwind CSS, REST APIs, Git`;
+
+function normalizePhone(val: string): string {
+  return val.replace(/[\s\-()]/g, '').toLowerCase();
+}
 
 export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
-  actor,
   existingCandidates,
   onClose,
   onRegistered,
@@ -48,6 +47,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
   );
 
   const [resumeText, setResumeText] = useState('');
+  const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState('');
   const [fileBase64, setFileBase64] = useState('');
   const [fileMimeType, setFileMimeType] = useState('');
@@ -55,7 +55,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
   const [parsing, setParsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
 
-  // Extracted / editable registration fields
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
@@ -73,9 +72,28 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  const checkDuplicates = (emailVal: string, phoneVal: string): boolean => {
+    const cleanEmail = emailVal.trim().toLowerCase();
+    const cleanPhone = normalizePhone(phoneVal);
+    const dup = existingCandidates.find(
+      (c) =>
+        (cleanEmail && c.email.toLowerCase() === cleanEmail) ||
+        (cleanPhone.length >= 7 && normalizePhone(c.phone) === cleanPhone)
+    );
+    if (dup) {
+      setDuplicateWarning(
+        `Duplicate detected: ${dup.full_name} (${dup.candidate_code}) already exists in Stage ${dup.stage} with matching email or phone.`
+      );
+      return true;
+    }
+    setDuplicateWarning(null);
+    return false;
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setResumeFile(file);
     setFileName(file.name);
     setParseError(null);
 
@@ -108,24 +126,15 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
     setParseError(null);
     setDuplicateWarning(null);
     try {
-      const res = await fetch('/api/gemini/parse-resume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          resumeText: resumeText.trim() || undefined,
-          fileBase64: fileBase64 || undefined,
-          fileMimeType: fileMimeType || undefined,
-          fileName: fileName || 'pasted_resume.txt',
-          positionApplied,
-          department,
-          jobRequirements,
-        }),
+      const parsed = await parseResumeWithAi({
+        resumeText: resumeText.trim() || undefined,
+        fileBase64: fileBase64 || undefined,
+        fileMimeType: fileMimeType || undefined,
+        fileName: fileName || 'pasted_resume.txt',
+        positionApplied,
+        department,
+        jobRequirements,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to analyze resume with Gemini AI.');
-      }
-      const parsed = data as ParsedResumeResult;
       setFullName(parsed.fullName);
       setEmail(parsed.email);
       setPhone(parsed.phone);
@@ -138,30 +147,12 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
       setAiSummary(parsed.aiSummary);
       setHasUec(parsed.detectedUecMention);
       setAiParsedDone(true);
-
-      // Immediate duplicate check by email / phone hash
-      await checkDuplicates(parsed.email, parsed.phone);
+      checkDuplicates(parsed.email, parsed.phone);
     } catch (err: unknown) {
       setParseError(err instanceof Error ? err.message : 'Gemini resume extraction failed.');
     } finally {
       setParsing(false);
     }
-  };
-
-  const checkDuplicates = async (emailVal: string, phoneVal: string): Promise<boolean> => {
-    const eHash = emailVal.trim() ? await hashContactValue(emailVal) : '';
-    const pHash = phoneVal.trim() ? await hashContactValue(phoneVal) : '';
-    const dup = existingCandidates.find(
-      (c) => (eHash && c.emailHash === eHash) || (pHash && c.phoneHash === pHash)
-    );
-    if (dup) {
-      setDuplicateWarning(
-        `Duplicate detected: ${dup.fullName} (${dup.candidateCode}) already exists in Stage ${dup.currentStage} with matching email or phone.`
-      );
-      return true;
-    }
-    setDuplicateWarning(null);
-    return false;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -172,10 +163,8 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
       setSubmitError('Full Name, Email, and Phone Number are required to register a candidate.');
       return;
     }
-
-    const isDup = await checkDuplicates(email, phone);
-    if (isDup) {
-      setSubmitError('Duplicate candidate record blocked by email/phone uniqueness policy (Stage 2).');
+    if (checkDuplicates(email, phone)) {
+      setSubmitError('Duplicate candidate record blocked by email/phone uniqueness policy.');
       return;
     }
 
@@ -187,8 +176,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
         .filter(Boolean)
         .slice(0, 20);
 
-      const id = await registerCandidate({
-        actor,
+      const created = await registerCandidate({
         fullName,
         email,
         phone,
@@ -196,8 +184,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
         positionApplied,
         department,
         source,
-        resumeFileName: fileName || 'pasted_resume.txt',
-        resumeExcerpt: resumeText.slice(0, 3800) || `${educationSummary}\n${experienceSummary}`,
         educationSummary: educationSummary || 'Not specified',
         experienceSummary: experienceSummary || 'Not specified',
         yearsExperience,
@@ -205,8 +191,10 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
         aiMatchScore,
         aiSummary: aiSummary || 'Registered manually pending initial HR screening.',
         hasUec,
+        resumeFile,
+        resumeFileName: fileName || 'pasted_resume.txt',
       });
-      onRegistered(id);
+      onRegistered(created);
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : 'Failed to register candidate.');
     } finally {
@@ -217,14 +205,13 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4 overflow-y-auto">
       <div className="bg-white border border-slate-200 rounded-lg w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden">
-        {/* Header */}
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
           <div>
             <h2 className="font-display text-lg font-bold text-slate-900">
               Stages 1–2 · Register Candidate & Gemini AI Resume Screening
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Intake from JobStreet or Email · Automatic extraction, 0–100% job-fit match score & duplicate prevention
+              Intake from JobStreet or Email · Stores resume in local uploads/, runs backend Gemini AI scoring & prevents duplicates
             </p>
           </div>
           <button
@@ -237,9 +224,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
           </button>
         </div>
 
-        {/* Body */}
         <form onSubmit={handleSubmit} className="overflow-y-auto p-6 space-y-6">
-          {/* Step 1: Source & Target Role */}
           <div className="grid sm:grid-cols-3 gap-4">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -298,7 +283,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
             </div>
           </div>
 
-          {/* Step 2: Upload Resume or Paste Text for Gemini AI Extraction */}
           <div className="pt-4 border-t border-slate-200 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
@@ -306,7 +290,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
                   Resume Input for Gemini AI Extraction
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Upload a PDF/image/text resume or paste CV content below to auto-populate and score candidate fit.
+                  Upload a PDF/image/text resume (saved to local uploads/) or paste CV content to extract & score.
                 </p>
               </div>
               <button
@@ -327,7 +311,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
                   <FileUp className="w-5 h-5 text-teal-700" />
                   <div className="text-xs font-semibold text-slate-800">Upload Resume File</div>
                   <p className="text-[11px] text-slate-500">
-                    Supports PDF, PNG, JPG, or TXT up to 10MB.
+                    Supports PDF, PNG, JPG, or TXT up to 15MB.
                   </p>
                 </div>
                 <div className="mt-3">
@@ -397,7 +381,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
             </div>
           )}
 
-          {/* Step 3: Candidate Profile & Scorecard Verification */}
           <div className="pt-4 border-t border-slate-200 space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-slate-900">
@@ -427,7 +410,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
                   value={email}
                   onChange={(e) => {
                     setEmail(e.target.value);
-                    void checkDuplicates(e.target.value, phone);
+                    checkDuplicates(e.target.value, phone);
                   }}
                   className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
                 />
@@ -440,7 +423,7 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
                   value={phone}
                   onChange={(e) => {
                     setPhone(e.target.value);
-                    void checkDuplicates(email, e.target.value);
+                    checkDuplicates(email, e.target.value);
                   }}
                   placeholder="+60 12-xxx xxxx"
                   className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
@@ -551,7 +534,6 @@ export const CandidateIntakeModal: React.FC<CandidateIntakeModalProps> = ({
             </div>
           )}
 
-          {/* Footer Actions */}
           <div className="pt-4 border-t border-slate-200 flex items-center justify-end gap-3">
             <button
               type="button"

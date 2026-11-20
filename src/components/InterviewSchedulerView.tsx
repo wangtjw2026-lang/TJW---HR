@@ -1,29 +1,44 @@
-import React, { useState } from 'react';
-import { CalendarPlus, CheckCircle2, Lock } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import {
+  AlertCircle,
+  Calendar,
+  CheckCircle2,
+  Clock,
+  Edit3,
+  MapPin,
+  Plus,
+  Trash2,
+  UserPlus,
+  Users,
+  Video,
+  X,
+  XCircle,
+} from 'lucide-react';
+import {
+  bookInterviewSlotAtomically,
+  createInterviewSlot,
+  deleteInterviewSlot,
+  updateBookingStatus,
+  updateInterviewSlot,
+} from '../lib/apiService';
 import {
   CandidateRecord,
   DEPARTMENTS,
   InterviewMode,
   InterviewSlot,
-  StaffRole,
   StaffUser,
 } from '../types/ats';
-import {
-  bookInterviewSlotAtomically,
-  createInterviewSlot,
-  markInterviewCompleted,
-} from '../lib/firestoreService';
 
 interface InterviewSchedulerViewProps {
   slots: InterviewSlot[];
   candidates: CandidateRecord[];
-  actor: StaffUser;
-  effectiveRole: StaffRole;
-  onSelectCandidate: (c: CandidateRecord) => void;
-  onNotify: (msg: string) => void;
+  staffUser: StaffUser;
+  onRefresh: () => Promise<void> | void;
+  onSelectCandidate: (candidate: CandidateRecord) => void;
+  onNotify: (message: string) => void;
 }
 
-const MODES: InterviewMode[] = [
+const INTERVIEW_MODES: InterviewMode[] = [
   'Google Meet',
   'Microsoft Teams',
   'On-site (KL HQ)',
@@ -33,378 +48,624 @@ const MODES: InterviewMode[] = [
 export const InterviewSchedulerView: React.FC<InterviewSchedulerViewProps> = ({
   slots,
   candidates,
-  actor,
-  effectiveRole,
+  staffUser,
+  onRefresh,
   onSelectCandidate,
   onNotify,
 }) => {
-  const [date, setDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 3);
-    return d.toISOString().slice(0, 10);
-  });
+  const [date, setDate] = useState(() =>
+    new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10)
+  );
   const [startTime, setStartTime] = useState('10:00');
   const [endTime, setEndTime] = useState('11:00');
-  const [interviewerName, setInterviewerName] = useState('');
+  const [capacity, setCapacity] = useState(2);
+  const [interviewerName, setInterviewerName] = useState(staffUser.name);
   const [department, setDepartment] = useState<string>(DEPARTMENTS[0]);
   const [mode, setMode] = useState<InterviewMode>('Google Meet');
-  const [meetingLinkOrRoom, setMeetingLinkOrRoom] = useState('https://meet.google.com/tfm-panel-my');
-  const [creating, setCreating] = useState(false);
+  const [locationOrLink, setLocationOrLink] = useState('https://meet.google.com/tfmy-interview');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
-  const [assigningSlotId, setAssigningSlotId] = useState<string | null>(null);
-  const [assignCandidateId, setAssignCandidateId] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  // Assign candidate state per slot
+  const [assignMap, setAssignMap] = useState<Record<number, number | ''>>({});
 
-  const invitedCandidates = candidates.filter(
-    (c) => (c.status === 'interview_invited' || c.qualificationDecision === 'qualified') && !c.interviewSlotId
+  // Edit slot modal state
+  const [editingSlot, setEditingSlot] = useState<InterviewSlot | null>(null);
+  const [editDate, setEditDate] = useState('');
+  const [editStart, setEditStart] = useState('');
+  const [editEnd, setEditEnd] = useState('');
+  const [editCapacity, setEditCapacity] = useState(1);
+  const [editLocation, setEditLocation] = useState('');
+  const [editInterviewer, setEditInterviewer] = useState('');
+
+  const qualifiedUnbooked = useMemo(
+    () =>
+      candidates.filter(
+        (c) =>
+          (c.qualification_status === 'qualified' || c.stage === 8 || c.stage === 9) &&
+          !c.active_booking
+      ),
+    [candidates]
   );
 
-  const handleAddSlot = async (e: React.FormEvent) => {
+  const stats = useMemo(() => {
+    const activeSlots = slots.filter((s) => s.status === 'ACTIVE');
+    const totalCapacity = activeSlots.reduce((sum, s) => sum + s.capacity, 0);
+    const totalBooked = activeSlots.reduce((sum, s) => sum + s.booked_count, 0);
+    const openSeats = Math.max(0, totalCapacity - totalBooked);
+    return { activeCount: activeSlots.length, totalCapacity, totalBooked, openSeats };
+  }, [slots]);
+
+  const handleCreateSlot = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!interviewerName.trim()) {
-      setError('Interviewer name is required.');
-      return;
-    }
-    setCreating(true);
-    setError(null);
+    setBusy(true);
+    setError('');
     try {
       await createInterviewSlot({
-        actor: { ...actor, role: effectiveRole },
         date,
-        startTime,
-        endTime,
-        interviewerName,
+        start_time: startTime,
+        end_time: endTime,
+        capacity,
+        location_or_link: locationOrLink,
+        interviewer_name: interviewerName,
         department,
         mode,
-        meetingLinkOrRoom,
       });
-      setInterviewerName('');
-      onNotify(`Published available interview slot on ${date} (${startTime}–${endTime}).`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to create slot.');
+      await onRefresh();
+      onNotify(`Published interview slot on ${date} (${startTime}–${endTime}, capacity ${capacity}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create interview slot.');
     } finally {
-      setCreating(false);
+      setBusy(false);
     }
   };
 
-  const handleAtomicAssign = async (slotId: string) => {
-    const cand = candidates.find((c) => c.id === assignCandidateId);
-    if (!cand) return;
-    setError(null);
+  const handleAssignCandidate = async (slotId: number) => {
+    const candId = assignMap[slotId];
+    if (!candId) return;
+    setBusy(true);
+    setError('');
     try {
-      await bookInterviewSlotAtomically({
-        actor: { ...actor, role: effectiveRole },
-        candidate: cand,
-        slotId,
-      });
-      setAssigningSlotId(null);
-      setAssignCandidateId('');
-      onNotify(`Atomically reserved slot for ${cand.fullName} & dispatched confirmation email.`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Atomic slot booking failed.');
+      await bookInterviewSlotAtomically(slotId, Number(candId));
+      setAssignMap((prev) => ({ ...prev, [slotId]: '' }));
+      await onRefresh();
+      onNotify('Interview slot reserved atomically and confirmation email dispatched.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to book slot.');
+    } finally {
+      setBusy(false);
     }
   };
 
-  const handleMarkCompleted = async (slot: InterviewSlot) => {
-    const cand = candidates.find((c) => c.id === slot.bookedCandidateId);
-    if (!cand) return;
-    setError(null);
+  const handleToggleCancelSlot = async (slot: InterviewSlot) => {
+    setBusy(true);
+    setError('');
     try {
-      await markInterviewCompleted({
-        actor: { ...actor, role: effectiveRole },
-        candidate: cand,
-        slotId: slot.id,
-      });
-      onNotify(`Interview with ${cand.fullName} marked completed (Stage 11). Ready for panel evaluation.`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to mark interview completed.');
+      const nextStatus = slot.status === 'ACTIVE' ? 'CANCELLED' : 'ACTIVE';
+      await updateInterviewSlot(slot.id, { status: nextStatus });
+      await onRefresh();
+      onNotify(`Interview slot ${nextStatus === 'CANCELLED' ? 'cancelled' : 're-activated'}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update slot.');
+    } finally {
+      setBusy(false);
     }
   };
 
-  const availableCount = slots.filter((s) => s.status === 'available').length;
-  const bookedCount = slots.filter((s) => s.status === 'booked').length;
-  const completedCount = slots.filter((s) => s.status === 'completed').length;
+  const handleDeleteSlot = async (slotId: number) => {
+    setBusy(true);
+    setError('');
+    try {
+      await deleteInterviewSlot(slotId);
+      await onRefresh();
+      onNotify('Deleted interview slot.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete slot.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openEditModal = (slot: InterviewSlot) => {
+    setEditingSlot(slot);
+    setEditDate(slot.date);
+    setEditStart(slot.start_time);
+    setEditEnd(slot.end_time);
+    setEditCapacity(slot.capacity);
+    setEditLocation(slot.location_or_link);
+    setEditInterviewer(slot.interviewer_name);
+  };
+
+  const handleSaveEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingSlot) return;
+    setBusy(true);
+    setError('');
+    try {
+      await updateInterviewSlot(editingSlot.id, {
+        date: editDate,
+        start_time: editStart,
+        end_time: editEnd,
+        capacity: editCapacity,
+        location_or_link: editLocation,
+        interviewer_name: editInterviewer,
+      });
+      setEditingSlot(null);
+      await onRefresh();
+      onNotify('Updated interview slot schedule & capacity.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update slot.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBookingTransition = async (
+    bookingId: number,
+    status: 'COMPLETED' | 'RESCHEDULED' | 'CANCELLED'
+  ) => {
+    setBusy(true);
+    setError('');
+    try {
+      await updateBookingStatus(bookingId, status);
+      await onRefresh();
+      onNotify(`Booking marked as ${status}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update booking.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
+      {/* Header summary strip */}
+      <div className="flex flex-wrap items-end justify-between gap-4 border-b border-[#E2E8F0] pb-4">
+        <div>
+          <h1 className="text-xl font-bold text-[#0F172A]">Interview Calendar &amp; Atomic Slot Booking</h1>
+          <p className="text-xs text-[#64748B] mt-0.5">
+            SQLite transactions enforce capacity limits (`booked_count &lt; capacity`) so candidates never double-book a time slot.
+          </p>
+        </div>
+        <div className="flex items-center gap-6 text-xs">
+          <div>
+            <div className="text-[#64748B]">Active Slots</div>
+            <div className="font-mono text-lg font-bold text-[#0F172A] tabular-nums">{stats.activeCount}</div>
+          </div>
+          <div>
+            <div className="text-[#64748B]">Booked Seats</div>
+            <div className="font-mono text-lg font-bold text-[#0F766E] tabular-nums">
+              {stats.totalBooked} / {stats.totalCapacity}
+            </div>
+          </div>
+          <div>
+            <div className="text-[#64748B]">Awaiting Booking</div>
+            <div className="font-mono text-lg font-bold text-[#B45309] tabular-nums">
+              {qualifiedUnbooked.length}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {error && (
-        <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md">
-          {error}
+        <div className="flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#B91C1C]">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{error}</span>
         </div>
       )}
 
-      {/* Summary Bar */}
-      <div className="bg-white border border-slate-200 rounded-lg grid grid-cols-2 sm:grid-cols-4 divide-x divide-slate-200">
-        <div className="p-4">
-          <div className="text-xs text-slate-500">Available Slots</div>
-          <div className="font-mono tabular-nums text-2xl font-semibold text-teal-700 mt-1">{availableCount}</div>
+      {/* Create Interview Slot Form */}
+      <form
+        onSubmit={handleCreateSlot}
+        className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4"
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-bold text-[#0F172A]">Publish New Interview Slot</h2>
+          <span className="text-[11px] font-mono text-[#64748B]">MYT (UTC+8)</span>
         </div>
-        <div className="p-4">
-          <div className="text-xs text-slate-500">Confirmed Bookings</div>
-          <div className="font-mono tabular-nums text-2xl font-semibold text-slate-900 mt-1">{bookedCount}</div>
-        </div>
-        <div className="p-4">
-          <div className="text-xs text-slate-500">Interviews Conducted</div>
-          <div className="font-mono tabular-nums text-2xl font-semibold text-emerald-700 mt-1">{completedCount}</div>
-        </div>
-        <div className="p-4">
-          <div className="text-xs text-slate-500">Awaiting Slot Selection</div>
-          <div className="font-mono tabular-nums text-2xl font-semibold text-amber-700 mt-1">
-            {invitedCandidates.length}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Interview Date</label>
+            <input
+              type="date"
+              required
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Start Time</label>
+            <input
+              type="time"
+              required
+              value={startTime}
+              onChange={(e) => setStartTime(e.target.value)}
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">End Time</label>
+            <input
+              type="time"
+              required
+              value={endTime}
+              onChange={(e) => setEndTime(e.target.value)}
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">
+              Capacity Limit (Candidates)
+            </label>
+            <input
+              type="number"
+              required
+              min={1}
+              max={20}
+              value={capacity}
+              onChange={(e) => setCapacity(Math.max(1, Number(e.target.value)))}
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
+            />
           </div>
         </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Panelist / Interviewer</label>
+            <input
+              type="text"
+              required
+              value={interviewerName}
+              onChange={(e) => setInterviewerName(e.target.value)}
+              placeholder="e.g., Puan Nurul Huda"
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Department</label>
+            <select
+              value={department}
+              onChange={(e) => setDepartment(e.target.value)}
+              className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
+            >
+              {DEPARTMENTS.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Interview Mode</label>
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value as InterviewMode)}
+              className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
+            >
+              {INTERVIEW_MODES.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#334155] mb-1">Meeting Link / Room</label>
+            <input
+              type="text"
+              required
+              value={locationOrLink}
+              onChange={(e) => setLocationOrLink(e.target.value)}
+              placeholder="Meet URL or KL HQ Room"
+              className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            type="submit"
+            disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+          >
+            <Plus className="h-4 w-4" />
+            Create Interview Slot
+          </button>
+        </div>
+      </form>
+
+      {/* Slots List */}
+      <div className="space-y-3">
+        {slots.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-[#CBD5E1] bg-white p-10 text-center text-xs text-[#64748B]">
+            No interview slots configured yet. Publish a slot above so qualified candidates can book via their self-service portal.
+          </div>
+        ) : (
+          slots.map((slot) => {
+            const isFull = slot.booked_count >= slot.capacity;
+            const remaining = Math.max(0, slot.capacity - slot.booked_count);
+            const activeBookings = slot.bookings.filter((b) => b.status === 'CONFIRMED');
+
+            return (
+              <div
+                key={slot.id}
+                className={`rounded-lg border bg-white p-4 space-y-3 ${
+                  slot.status === 'CANCELLED' ? 'border-[#E2E8F0] opacity-70' : 'border-[#E2E8F0]'
+                }`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2.5 text-sm font-bold text-[#0F172A]">
+                      <span className="inline-flex items-center gap-1.5 font-mono">
+                        <Calendar className="h-4 w-4 text-[#0F766E]" />
+                        {slot.date}
+                      </span>
+                      <span className="inline-flex items-center gap-1 font-mono text-[#334155]">
+                        <Clock className="h-3.5 w-3.5 text-[#64748B]" />
+                        {slot.start_time} – {slot.end_time}
+                      </span>
+                      <span
+                        className={`text-xs font-semibold ${
+                          slot.status === 'CANCELLED'
+                            ? 'text-[#DC2626]'
+                            : isFull
+                            ? 'text-[#B45309]'
+                            : 'text-[#15803D]'
+                        }`}
+                      >
+                        {slot.status === 'CANCELLED'
+                          ? 'CANCELLED'
+                          : isFull
+                          ? 'FULL CAPACITY'
+                          : `${remaining} OF ${slot.capacity} OPEN`}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-4 text-xs text-[#475569]">
+                      <span className="inline-flex items-center gap-1">
+                        <Users className="h-3.5 w-3.5 text-[#64748B]" />
+                        Panelist: <strong className="text-[#0F172A]">{slot.interviewer_name}</strong>
+                      </span>
+                      <span>{slot.department}</span>
+                      <span className="inline-flex items-center gap-1">
+                        {slot.mode.startsWith('On-site') ? (
+                          <MapPin className="h-3.5 w-3.5 text-[#64748B]" />
+                        ) : (
+                          <Video className="h-3.5 w-3.5 text-[#64748B]" />
+                        )}
+                        {slot.mode} · <span className="font-mono text-[11px]">{slot.location_or_link}</span>
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => openEditModal(slot)}
+                      className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
+                    >
+                      <Edit3 className="h-3 w-3" />
+                      Reschedule / Edit
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleToggleCancelSlot(slot)}
+                      className="inline-flex items-center gap-1 rounded border border-[#CBD5E1] px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
+                    >
+                      <XCircle className="h-3 w-3" />
+                      {slot.status === 'ACTIVE' ? 'Cancel Slot' : 'Re-activate'}
+                    </button>
+                    {slot.booked_count === 0 && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleDeleteSlot(slot.id)}
+                        className="rounded border border-[#FECACA] p-1 text-[#DC2626] hover:bg-[#FEF2F2]"
+                        title="Delete empty slot"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Booked candidates table */}
+                {slot.bookings.length > 0 && (
+                  <div className="border-t border-[#F1F5F9] pt-2.5 space-y-1.5">
+                    {slot.bookings.map((b) => {
+                      const cand = candidates.find((c) => c.id === b.candidate_id);
+                      return (
+                        <div
+                          key={b.id}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded bg-[#F8FAFC] px-3 py-2 text-xs"
+                        >
+                          <div className="flex items-center gap-2.5">
+                            <button
+                              type="button"
+                              onClick={() => cand && onSelectCandidate(cand)}
+                              className="font-semibold text-[#0F766E] hover:underline"
+                            >
+                              {b.candidate_name || `Candidate #${b.candidate_id}`}
+                            </button>
+                            <span className="text-[#64748B]">{b.candidate_position}</span>
+                            <span className="font-mono text-[11px] font-semibold text-[#334155]">
+                              [{b.status}]
+                            </span>
+                          </div>
+                          {b.status === 'CONFIRMED' && (
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleBookingTransition(b.id, 'COMPLETED')}
+                                className="inline-flex items-center gap-1 font-semibold text-[#15803D] hover:underline"
+                              >
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                Mark Conducted
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleBookingTransition(b.id, 'RESCHEDULED')}
+                                className="font-medium text-[#B45309] hover:underline"
+                              >
+                                Reschedule
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleBookingTransition(b.id, 'CANCELLED')}
+                                className="font-medium text-[#DC2626] hover:underline"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Quick Assign Qualified Candidate */}
+                {slot.status === 'ACTIVE' && !isFull && qualifiedUnbooked.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2 border-t border-[#F1F5F9] pt-2.5">
+                    <select
+                      value={assignMap[slot.id] ?? ''}
+                      onChange={(e) =>
+                        setAssignMap((prev) => ({
+                          ...prev,
+                          [slot.id]: e.target.value ? Number(e.target.value) : '',
+                        }))
+                      }
+                      className="flex-1 min-w-[220px] rounded border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs text-[#0F172A]"
+                    >
+                      <option value="">Assign a qualified candidate to this slot...</option>
+                      {qualifiedUnbooked.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.candidate_code} · {c.full_name} ({c.position})
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={busy || !assignMap[slot.id]}
+                      onClick={() => handleAssignCandidate(slot.id)}
+                      className="inline-flex items-center gap-1 rounded bg-[#0F766E] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                    >
+                      <UserPlus className="h-3.5 w-3.5" />
+                      Book Atomically ({activeBookings.length}/{slot.capacity})
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
       </div>
 
-      <div className="grid lg:grid-cols-12 gap-6 items-start">
-        {/* Publish New Slot Panel */}
-        <section className="lg:col-span-4 bg-white border border-slate-200 rounded-lg p-5">
-          <div className="flex items-center gap-2 mb-1">
-            <CalendarPlus className="w-4 h-4 text-teal-700" />
-            <h3 className="font-display text-sm font-bold text-slate-900">
-              Publish Available Slot
-            </h3>
-          </div>
-          <p className="text-xs text-slate-500 mb-4">
-            Open slots immediately appear in the Candidate Self-Service Interview Portal.
-          </p>
-
-          {effectiveRole === 'hiring_manager' ? (
-            <div className="p-3 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-md flex items-center gap-2">
-              <Lock className="w-4 h-4 text-slate-400 shrink-0" />
-              <span>Publishing interview slots is managed by HR Admin and Recruiters.</span>
+      {/* Edit Slot Modal */}
+      {editingSlot && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0F172A]/45 p-4">
+          <form
+            onSubmit={handleSaveEdit}
+            className="w-full max-w-md rounded-lg border border-[#E2E8F0] bg-white p-5 shadow-xl space-y-4"
+          >
+            <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-3">
+              <h3 className="text-sm font-bold text-[#0F172A]">Reschedule / Edit Interview Slot</h3>
+              <button
+                type="button"
+                onClick={() => setEditingSlot(null)}
+                className="text-[#64748B] hover:text-[#0F172A]"
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
-          ) : (
-            <form onSubmit={handleAddSlot} className="space-y-3 text-xs">
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Interview Date</label>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="col-span-2">
+                <label className="block text-xs font-semibold text-[#334155] mb-1">Date</label>
                 <input
                   type="date"
                   required
-                  value={date}
-                  onChange={(e) => setDate(e.target.value)}
-                  className="w-full px-3 py-2 font-mono border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
+                  value={editDate}
+                  onChange={(e) => setEditDate(e.target.value)}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs"
                 />
               </div>
-
-              <div className="grid grid-cols-2 gap-2.5">
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">Start (MYT)</label>
-                  <input
-                    type="time"
-                    required
-                    value={startTime}
-                    onChange={(e) => setStartTime(e.target.value)}
-                    className="w-full px-3 py-2 font-mono border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
-                  />
-                </div>
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">End (MYT)</label>
-                  <input
-                    type="time"
-                    required
-                    value={endTime}
-                    onChange={(e) => setEndTime(e.target.value)}
-                    className="w-full px-3 py-2 font-mono border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
-                  />
-                </div>
-              </div>
-
               <div>
-                <label className="block font-medium text-slate-700 mb-1">Panelist / Interviewer</label>
+                <label className="block text-xs font-semibold text-[#334155] mb-1">Start Time</label>
+                <input
+                  type="time"
+                  required
+                  value={editStart}
+                  onChange={(e) => setEditStart(e.target.value)}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#334155] mb-1">End Time</label>
+                <input
+                  type="time"
+                  required
+                  value={editEnd}
+                  onChange={(e) => setEditEnd(e.target.value)}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#334155] mb-1">Capacity</label>
+                <input
+                  type="number"
+                  required
+                  min={Math.max(1, editingSlot.booked_count)}
+                  value={editCapacity}
+                  onChange={(e) => setEditCapacity(Number(e.target.value))}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#334155] mb-1">Panelist</label>
                 <input
                   type="text"
                   required
-                  value={interviewerName}
-                  onChange={(e) => setInterviewerName(e.target.value)}
-                  placeholder="e.g. Puan Nurul Huda (VP Engineering)"
-                  className="w-full px-3 py-2 border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
+                  value={editInterviewer}
+                  onChange={(e) => setEditInterviewer(e.target.value)}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs"
                 />
               </div>
-
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Department</label>
-                <select
-                  value={department}
-                  onChange={(e) => setDepartment(e.target.value)}
-                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
-                >
-                  {DEPARTMENTS.map((d) => (
-                    <option key={d} value={d}>
-                      {d}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Interview Mode</label>
-                <select
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value as InterviewMode)}
-                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
-                >
-                  {MODES.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Meeting Link or HQ Room</label>
+              <div className="col-span-2">
+                <label className="block text-xs font-semibold text-[#334155] mb-1">Location / Meeting Link</label>
                 <input
                   type="text"
-                  value={meetingLinkOrRoom}
-                  onChange={(e) => setMeetingLinkOrRoom(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-200 rounded-md focus:outline-none focus:border-teal-700"
+                  required
+                  value={editLocation}
+                  onChange={(e) => setEditLocation(e.target.value)}
+                  className="w-full rounded border border-[#CBD5E1] px-3 py-1.5 text-xs"
                 />
               </div>
-
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-[#E2E8F0]">
+              <button
+                type="button"
+                onClick={() => setEditingSlot(null)}
+                className="rounded border border-[#CBD5E1] px-3 py-1.5 text-xs font-medium text-[#475569]"
+              >
+                Cancel
+              </button>
               <button
                 type="submit"
-                disabled={creating}
-                className="w-full py-2.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md transition-colors cursor-pointer"
+                disabled={busy}
+                className="rounded bg-[#0F766E] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
               >
-                {creating ? 'Publishing Slot...' : 'Add Available Interview Slot'}
+                Save Changes
               </button>
-            </form>
-          )}
-        </section>
-
-        {/* Master Interview Schedule Grid */}
-        <section className="lg:col-span-8 bg-white border border-slate-200 rounded-lg overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-            <div>
-              <h3 className="font-display text-sm font-bold text-slate-900">
-                Stages 10–11 · Interview Schedule & Atomic Slot Ledger
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Real-time Firestore transaction locking guarantees zero double-booking across candidates.
-              </p>
             </div>
-            <span className="font-mono tabular-nums text-xs text-slate-500">{slots.length} slots</span>
-          </div>
-
-          {slots.length === 0 ? (
-            <div className="p-8 text-center text-xs text-slate-500">
-              No interview slots published yet. Use the form on the left to add open interview slots.
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-100">
-              {slots.map((slot) => {
-                const cand = candidates.find((c) => c.id === slot.bookedCandidateId);
-                return (
-                  <div key={slot.id} className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs">
-                        <span className="font-mono tabular-nums font-semibold text-slate-900">
-                          {slot.date} · {slot.startTime}–{slot.endTime} MYT
-                        </span>
-                        <span aria-hidden="true" className="text-slate-300">·</span>
-                        <span
-                          className={`font-semibold ${
-                            slot.status === 'available'
-                              ? 'text-teal-700'
-                              : slot.status === 'booked'
-                                ? 'text-amber-700'
-                                : 'text-emerald-700'
-                          }`}
-                        >
-                          {slot.status === 'available'
-                            ? 'Available'
-                            : slot.status === 'booked'
-                              ? 'Confirmed (Locked)'
-                              : slot.status === 'completed'
-                                ? 'Completed'
-                                : 'Cancelled'}
-                        </span>
-                      </div>
-                      <div className="text-xs text-slate-600">
-                        {slot.interviewerName} · {slot.department} · {slot.mode}
-                      </div>
-                      <div className="text-[11px] font-mono text-slate-400 truncate max-w-md">
-                        {slot.meetingLinkOrRoom}
-                      </div>
-                      {slot.bookedCandidateName && (
-                        <div className="text-xs text-slate-800 pt-0.5">
-                          Candidate:{' '}
-                          <button
-                            type="button"
-                            onClick={() => cand && onSelectCandidate(cand)}
-                            className="font-semibold text-teal-700 hover:underline cursor-pointer"
-                          >
-                            {slot.bookedCandidateName}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="shrink-0">
-                      {slot.status === 'available' && effectiveRole !== 'hiring_manager' && (
-                        assigningSlotId === slot.id ? (
-                          <div className="flex items-center gap-1.5">
-                            <select
-                              value={assignCandidateId}
-                              onChange={(e) => setAssignCandidateId(e.target.value)}
-                              className="px-2 py-1.5 text-xs border border-slate-300 rounded bg-white"
-                            >
-                              <option value="">Select invited candidate...</option>
-                              {invitedCandidates.map((c) => (
-                                <option key={c.id} value={c.id}>
-                                  {c.fullName} ({c.positionApplied})
-                                </option>
-                              ))}
-                            </select>
-                            <button
-                              type="button"
-                              disabled={!assignCandidateId}
-                              onClick={() => handleAtomicAssign(slot.id)}
-                              className="px-2.5 py-1.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded cursor-pointer"
-                            >
-                              Lock
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setAssigningSlotId(null)}
-                              className="px-2 py-1.5 text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            disabled={invitedCandidates.length === 0}
-                            onClick={() => {
-                              setAssigningSlotId(slot.id);
-                              setAssignCandidateId(invitedCandidates[0]?.id || '');
-                            }}
-                            className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-40 rounded-md cursor-pointer whitespace-nowrap"
-                          >
-                            Assign Candidate
-                          </button>
-                        )
-                      )}
-
-                      {slot.status === 'booked' && cand && (
-                        <button
-                          type="button"
-                          onClick={() => handleMarkCompleted(slot)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md cursor-pointer whitespace-nowrap"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>Mark Conducted</span>
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-      </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

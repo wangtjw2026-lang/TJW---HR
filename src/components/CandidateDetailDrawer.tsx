@@ -1,1322 +1,1389 @@
 import React, { useEffect, useState } from 'react';
 import {
+  AlertCircle,
   BellRing,
+  Briefcase,
   Calendar,
+  Check,
   CheckCircle2,
+  ClipboardCheck,
+  Copy,
   ExternalLink,
-  FileCheck2,
-  Lock,
+  FileText,
+  GraduationCap,
+  Link2,
+  Mail,
+  MapPin,
+  Phone,
   Printer,
   Send,
+  Star,
+  Trash2,
+  Upload,
   UserCheck,
   X,
+  XCircle,
 } from 'lucide-react';
 import {
-  CandidatePrivateCompensation,
-  CandidatePrivatePii,
+  bookInterviewSlotAtomically,
+  deleteCandidate,
+  getProtectedFileUrl,
+  sendDocReminder,
+  sendEmploymentOffer,
+  submitPostInterviewDecision,
+  submitQualificationDecision,
+  submitScreeningDecision,
+  updateBookingStatus,
+  updateCandidateDocsChecklist,
+  updateOfferStatus,
+  uploadCandidateDocument,
+} from '../lib/apiService';
+import { formatMYR, formatTimestamp, getDoc, getMissingMandatoryDocs } from '../lib/atsHelpers';
+import {
   CandidateRecord,
-  DocStatus,
+  DocType,
   GOOGLE_APPS_SCRIPT_URLS,
   InterviewSlot,
   OfferStatus,
   PostInterviewDecision,
-  QualificationDecision,
-  ROLE_META,
+  QualificationStatus,
   ScreeningDecision,
-  StaffRole,
   StaffUser,
   STATUS_META,
-  UecDocStatus,
   WORKFLOW_STAGES,
 } from '../types/ats';
-import { formatMYR, getMissingMandatoryDocs, getStageTitle } from '../lib/atsHelpers';
-import {
-  bookInterviewSlotAtomically,
-  fetchCandidateCompensation,
-  fetchCandidatePrivatePii,
-  markInterviewCompleted,
-  sendEmploymentOffer,
-  sendMissingDocsReminder,
-  submitPostInterviewEvaluation,
-  submitQualificationDecision,
-  submitScreeningDecision,
-  updateCandidateDocsAndForms,
-  updateOfferResponseStatus,
-} from '../lib/firestoreService';
 
 interface CandidateDetailDrawerProps {
   candidate: CandidateRecord;
   slots: InterviewSlot[];
-  actor: StaffUser;
-  effectiveRole: StaffRole;
+  staffUser: StaffUser;
   onClose: () => void;
-  onOpenCandidatePortal: (candidateId: string) => void;
-  onNotify: (msg: string) => void;
+  onUpdated: (updated?: CandidateRecord) => Promise<void> | void;
+  onNotify: (message: string) => void;
+  onOpenPortalPreview: (candidate: CandidateRecord) => void;
 }
 
-type PhaseTab = 'screening' | 'docs' | 'interview' | 'offer';
+type DrawerTab = 'overview' | 'documents' | 'interview' | 'offer';
+
+const DOC_META: Array<{
+  type: DocType;
+  label: string;
+  requiredLabel: string;
+  allowUpload: boolean;
+  externalUrl?: string;
+}> = [
+  {
+    type: 'APP_FORM',
+    label: 'Employment Application Form',
+    requiredLabel: 'Mandatory · Google Apps Script',
+    allowUpload: false,
+    externalUrl: GOOGLE_APPS_SCRIPT_URLS.employmentApplicationForm,
+  },
+  {
+    type: 'DISC',
+    label: 'DISC Personality Assessment',
+    requiredLabel: 'Mandatory · Google Apps Script',
+    allowUpload: false,
+    externalUrl: GOOGLE_APPS_SCRIPT_URLS.discPersonalityAssessment,
+  },
+  {
+    type: 'SPM',
+    label: 'SPM Examination Results',
+    requiredLabel: 'Mandatory Academic Doc',
+    allowUpload: true,
+  },
+  {
+    type: 'UEC',
+    label: 'UEC Examination Results',
+    requiredLabel: 'If Applicable (Independent Schools)',
+    allowUpload: true,
+  },
+  {
+    type: 'DEGREE',
+    label: 'University Degree Certificate',
+    requiredLabel: 'Mandatory Academic Doc',
+    allowUpload: true,
+  },
+  {
+    type: 'TRANSCRIPT',
+    label: 'University Academic Transcript',
+    requiredLabel: 'Mandatory Academic Doc',
+    allowUpload: true,
+  },
+];
 
 export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
   candidate,
   slots,
-  actor,
-  effectiveRole,
+  staffUser,
   onClose,
-  onOpenCandidatePortal,
+  onUpdated,
   onNotify,
+  onOpenPortalPreview,
 }) => {
-  const defaultTab: PhaseTab =
-    candidate.currentStage <= 4
-      ? 'screening'
-      : candidate.currentStage <= 8
-        ? 'docs'
-        : candidate.currentStage <= 12
-          ? 'interview'
-          : 'offer';
+  const isHrAdmin = staffUser.role === 'HR_ADMIN';
 
-  const [activeTab, setActiveTab] = useState<PhaseTab>(defaultTab);
-  const [pii, setPii] = useState<CandidatePrivatePii | null>(null);
-  const [comp, setComp] = useState<CandidatePrivateCompensation | null>(null);
-  const [loadingPrivate, setLoadingPrivate] = useState(false);
-
-  // Stage 4 Screening state
-  const [screeningDecision, setScreeningDecision] = useState<ScreeningDecision>(candidate.screeningDecision);
-  const [rejectionReason, setRejectionReason] = useState(candidate.screeningRejectionReason);
-
-  // Stage 5-8 Docs & Qualification state
-  const [empFormDone, setEmpFormDone] = useState(candidate.employmentFormCompleted);
-  const [discFormDone, setDiscFormDone] = useState(candidate.discFormCompleted);
-  const [discProfile, setDiscProfile] = useState(candidate.discProfile);
-  const [docSpm, setDocSpm] = useState<DocStatus>(candidate.docSpmStatus);
-  const [docUec, setDocUec] = useState<UecDocStatus>(candidate.docUecStatus);
-  const [docDegree, setDocDegree] = useState<DocStatus>(candidate.docDegreeStatus);
-  const [docTranscript, setDocTranscript] = useState<DocStatus>(candidate.docTranscriptStatus);
-  const [qualDecision, setQualDecision] = useState<QualificationDecision>(candidate.qualificationDecision);
-  const [qualRemarks, setQualRemarks] = useState(candidate.qualificationRemarks);
-
-  // Stage 9-12 Interview & Evaluation state
-  const [selectedSlotId, setSelectedSlotId] = useState('');
-  const [interviewFeedback, setInterviewFeedback] = useState(candidate.interviewFeedback);
-  const [interviewRating, setInterviewRating] = useState<number>(candidate.interviewRating || 4);
-  const [postDecision, setPostDecision] = useState<PostInterviewDecision>(candidate.postInterviewDecision);
-  const [finalNotes, setFinalNotes] = useState(candidate.finalDecisionNotes);
-
-  // Stage 13-15 Offer Builder state (MYR)
-  const [positionOffered, setPositionOffered] = useState(candidate.positionApplied);
-  const [departmentOffered, setDepartmentOffered] = useState(candidate.department);
-  const [monthlySalaryMYR, setMonthlySalaryMYR] = useState<number>(7500);
-  const [allowanceMYR, setAllowanceMYR] = useState<number>(500);
-  const [probationMonths, setProbationMonths] = useState<number>(3);
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 30);
-    return d.toISOString().slice(0, 10);
+  const [activeTab, setActiveTab] = useState<DrawerTab>(() => {
+    if (candidate.stage >= 13) return 'offer';
+    if (candidate.stage >= 9) return 'interview';
+    if (candidate.stage >= 5) return 'documents';
+    return 'overview';
   });
-  const [offerDeadline, setOfferDeadline] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().slice(0, 10);
-  });
-  const [offerTermsSummary, setOfferTermsSummary] = useState(
-    'Full-time permanent appointment under Malaysian Employment Act 1955. Includes statutory EPF, SOCSO & EIS contributions, outpatient & hospitalization medical coverage, and 16 days annual leave.'
-  );
-  const [offerStatusInput, setOfferStatusInput] = useState<OfferStatus>(
-    candidate.offerStatus === 'none' ? 'offer_sent' : candidate.offerStatus
-  );
-  const [offerResponseNote, setOfferResponseNote] = useState('');
-  const [showOfferLetterPreview, setShowOfferLetterPreview] = useState(false);
 
   const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [uploadingDoc, setUploadingDoc] = useState<DocType | null>(null);
+  const [error, setError] = useState('');
+  const [copiedPortal, setCopiedPortal] = useState(false);
 
-  const canViewPii = ROLE_META[effectiveRole].canViewPii;
-  const canViewSalary = ROLE_META[effectiveRole].canViewSalary;
-  const isTrueAdmin = actor.role === 'hr_admin';
+  // Stage 3-4 Screening
+  const [screeningRemarks, setScreeningRemarks] = useState(candidate.screening_remarks || '');
+
+  // Stage 5-8 Docs & Qualification
+  const [discProfile, setDiscProfile] = useState(candidate.disc_profile || '');
+  const [docFlags, setDocFlags] = useState<
+    Record<DocType, { completed: boolean; verified: boolean; not_applicable: boolean }>
+  >(() => buildDocFlags(candidate));
+  const [qualRemarks, setQualRemarks] = useState(candidate.qualification_remarks || '');
+
+  // Stage 9-12 Interview
+  const [selectedSlotId, setSelectedSlotId] = useState<number | ''>('');
+  const [interviewFeedback, setInterviewFeedback] = useState(candidate.interview_feedback || '');
+  const [interviewRating, setInterviewRating] = useState<number>(candidate.interview_rating || 4);
+  const [finalNotes, setFinalNotes] = useState(candidate.final_decision_notes || '');
+
+  // Stage 13-15 Offer
+  const [offerSalary, setOfferSalary] = useState<number>(candidate.offer?.salary_myr ?? 7500);
+  const [offerAllowance, setOfferAllowance] = useState<number>(candidate.offer?.allowance_myr ?? 500);
+  const [offerProbation, setOfferProbation] = useState<number>(candidate.offer?.probation_months ?? 3);
+  const [offerStartDate, setOfferStartDate] = useState<string>(
+    candidate.offer?.start_date || new Date(Date.now() + 21 * 86400000).toISOString().slice(0, 10)
+  );
+  const [offerDeadline, setOfferDeadline] = useState<string>(
+    candidate.offer?.deadline_date || new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
+  );
+  const [offerTerms, setOfferTerms] = useState<string>(
+    candidate.offer?.offer_terms_summary ||
+      'EPF (13% employer), SOCSO & EIS statutory contributions, Outpatient & Hospitalization Medical Coverage, 14 Days Annual Leave.'
+  );
+  const [offerLetterFile, setOfferLetterFile] = useState<File | null>(null);
+  const [offerResponseNote, setOfferResponseNote] = useState<string>(
+    candidate.offer?.candidate_response_note || ''
+  );
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
-    setScreeningDecision(candidate.screeningDecision);
-    setRejectionReason(candidate.screeningRejectionReason);
-    setEmpFormDone(candidate.employmentFormCompleted);
-    setDiscFormDone(candidate.discFormCompleted);
-    setDiscProfile(candidate.discProfile);
-    setDocSpm(candidate.docSpmStatus);
-    setDocUec(candidate.docUecStatus);
-    setDocDegree(candidate.docDegreeStatus);
-    setDocTranscript(candidate.docTranscriptStatus);
-    setQualDecision(candidate.qualificationDecision);
-    setQualRemarks(candidate.qualificationRemarks);
-    setInterviewFeedback(candidate.interviewFeedback);
-    setInterviewRating(candidate.interviewRating || 4);
-    setPostDecision(candidate.postInterviewDecision);
-    setFinalNotes(candidate.finalDecisionNotes);
-    setOfferStatusInput(candidate.offerStatus === 'none' ? 'offer_sent' : candidate.offerStatus);
+    setScreeningRemarks(candidate.screening_remarks || '');
+    setDiscProfile(candidate.disc_profile || '');
+    setDocFlags(buildDocFlags(candidate));
+    setQualRemarks(candidate.qualification_remarks || '');
+    setInterviewFeedback(candidate.interview_feedback || '');
+    setInterviewRating(candidate.interview_rating || 4);
+    setFinalNotes(candidate.final_decision_notes || '');
+    if (candidate.offer) {
+      if (candidate.offer.salary_myr !== null) setOfferSalary(candidate.offer.salary_myr);
+      if (candidate.offer.allowance_myr !== null) setOfferAllowance(candidate.offer.allowance_myr);
+      setOfferProbation(candidate.offer.probation_months);
+      setOfferStartDate(candidate.offer.start_date);
+      setOfferDeadline(candidate.offer.deadline_date);
+      setOfferTerms(candidate.offer.offer_terms_summary);
+      setOfferResponseNote(candidate.offer.candidate_response_note || '');
+    }
   }, [candidate]);
 
-  useEffect(() => {
-    let active = true;
-    async function loadSplitPrivateDocs() {
-      setLoadingPrivate(true);
-      try {
-        if (canViewPii && (actor.role === 'hr_admin' || actor.role === 'recruiter')) {
-          const piiData = await fetchCandidatePrivatePii(candidate.id, { ...actor, role: effectiveRole }, true);
-          if (active) setPii(piiData);
-        } else if (active) {
-          setPii(null);
-        }
+  const portalUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/?portal=${candidate.portal_token}`
+      : `/?portal=${candidate.portal_token}`;
 
-        if (canViewSalary && isTrueAdmin) {
-          const compData = await fetchCandidateCompensation(candidate.id, { ...actor, role: effectiveRole }, true);
-          if (active) {
-            setComp(compData);
-            if (compData) {
-              setPositionOffered(compData.positionOffered || candidate.positionApplied);
-              setDepartmentOffered(compData.departmentOffered || candidate.department);
-              setMonthlySalaryMYR(compData.monthlySalaryMYR || 7500);
-              setAllowanceMYR(compData.allowanceMYR || 0);
-              setProbationMonths(compData.probationMonths || 3);
-              if (compData.startDate) setStartDate(compData.startDate);
-              if (compData.offerDeadline) setOfferDeadline(compData.offerDeadline);
-              if (compData.offerTermsSummary) setOfferTermsSummary(compData.offerTermsSummary);
-              if (compData.candidateResponseNote) setOfferResponseNote(compData.candidateResponseNote);
-            }
-          }
-        } else if (active) {
-          setComp(null);
-        }
-      } catch (err) {
-        console.error('Private subcollection fetch error:', err);
-      } finally {
-        if (active) setLoadingPrivate(false);
-      }
-    }
-    void loadSplitPrivateDocs();
-    return () => {
-      active = false;
-    };
-  }, [candidate.id, canViewPii, canViewSalary, effectiveRole, actor, isTrueAdmin, candidate.positionApplied, candidate.department]);
-
-  const availableSlots = slots.filter((s) => s.status === 'available');
+  const resumeDoc = getDoc(candidate, 'RESUME');
   const missingDocs = getMissingMandatoryDocs(candidate);
+  const availableSlots = slots.filter(
+    (s) => s.status === 'ACTIVE' && s.booked_count < s.capacity
+  );
+  const statusMeta = STATUS_META[candidate.status] || { label: candidate.status, tone: 'neutral' };
 
-  const handleSaveScreening = async () => {
-    if (screeningDecision === 'reject' && !rejectionReason.trim()) {
-      setActionError('A mandatory rejection reason is required when rejecting a candidate at Stage 4.');
-      return;
-    }
-    setBusy(true);
-    setActionError(null);
+  const copyPortalLink = async () => {
     try {
-      await submitScreeningDecision({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        decision: screeningDecision,
-        rejectionReason,
-      });
+      await navigator.clipboard.writeText(portalUrl);
+      setCopiedPortal(true);
+      onNotify(`Copied candidate portal link for ${candidate.full_name}.`);
+      setTimeout(() => setCopiedPortal(false), 2000);
+    } catch {
+      onNotify(`Portal URL: ${portalUrl}`);
+    }
+  };
+
+  const handleScreening = async (decision: ScreeningDecision) => {
+    setBusy(true);
+    setError('');
+    try {
+      const updated = await submitScreeningDecision(candidate.id, decision, screeningRemarks);
+      await onUpdated(updated);
       onNotify(
-        screeningDecision === 'proceed'
-          ? `Shortlisted ${candidate.fullName} (Stage 5) & auto-sent Employment Form + DISC Assessment links.`
-          : screeningDecision === 'reject'
-            ? `Rejected ${candidate.fullName} with reason logged.`
-            : 'Updated screening decision to Pending Review.'
+        decision === 'proceed'
+          ? `Shortlisted ${candidate.full_name} — Forms & Academic Docs email dispatched.`
+          : `Recorded screening rejection for ${candidate.full_name}.`
       );
-      if (screeningDecision === 'proceed') setActiveTab('docs');
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to save screening decision.');
+      if (decision === 'proceed') setActiveTab('documents');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save screening decision.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleSaveDocsChecklist = async () => {
+  const handleSaveChecklist = async () => {
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await updateCandidateDocsAndForms({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        employmentFormCompleted: empFormDone,
-        discFormCompleted: discFormDone,
-        discProfile,
-        docSpmStatus: docSpm,
-        docUecStatus: docUec,
-        docDegreeStatus: docDegree,
-        docTranscriptStatus: docTranscript,
-      });
-      onNotify(`Saved Stage 6–7 forms & academic credential verification for ${candidate.fullName}.`);
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update documents checklist.');
+      const payload = DOC_META.map((m) => ({
+        doc_type: m.type,
+        completed: docFlags[m.type].completed,
+        verified: docFlags[m.type].verified,
+        not_applicable: docFlags[m.type].not_applicable,
+      }));
+      const updated = await updateCandidateDocsChecklist(candidate.id, payload, discProfile);
+      await onUpdated(updated);
+      onNotify(`Saved document & assessment verification checklist for ${candidate.full_name}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save checklist.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleSendDocReminder = async () => {
-    setBusy(true);
-    setActionError(null);
+  const handleFileUpload = async (docType: DocType, file: File) => {
+    setUploadingDoc(docType);
+    setError('');
     try {
-      await sendMissingDocsReminder({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-      });
-      onNotify(`Automated missing-document reminder dispatched to ${candidate.fullName}.`);
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to dispatch reminder.');
+      const updated = await uploadCandidateDocument(candidate.id, docType, file);
+      await onUpdated(updated);
+      onNotify(`Uploaded ${file.name} (${docType}) to secure local storage.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to upload document.');
+    } finally {
+      setUploadingDoc(null);
+    }
+  };
+
+  const handleSendReminder = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const updated = await sendDocReminder(candidate.id);
+      await onUpdated(updated);
+      onNotify(`Dispatched document submission reminder email to ${candidate.email}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to send reminder email.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleSaveQualification = async () => {
+  const handleQualification = async (status: QualificationStatus) => {
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await submitQualificationDecision({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        decision: qualDecision,
-        remarks: qualRemarks,
-      });
+      const updated = await submitQualificationDecision(candidate.id, status, qualRemarks);
+      await onUpdated(updated);
       onNotify(
-        qualDecision === 'qualified'
-          ? `${candidate.fullName} qualified (Stage 9) — interview self-scheduling invite dispatched.`
-          : `Qualification decision updated to ${qualDecision}.`
+        status === 'qualified'
+          ? `${candidate.full_name} marked Qualified — Interview invitation sent with portal link.`
+          : `${candidate.full_name} marked Not Qualified.`
       );
-      if (qualDecision === 'qualified') setActiveTab('interview');
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to submit qualification decision.');
+      if (status === 'qualified') setActiveTab('interview');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save qualification decision.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleAtomicBookSlot = async () => {
-    if (!selectedSlotId) {
-      setActionError('Select an available interview slot first.');
-      return;
-    }
+  const handleBookSlot = async () => {
+    if (!selectedSlotId) return;
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      const slot = await bookInterviewSlotAtomically({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        slotId: selectedSlotId,
-      });
-      onNotify(`Atomically locked ${slot.date} (${slot.startTime}) for ${candidate.fullName} & sent confirmation.`);
+      const res = await bookInterviewSlotAtomically(Number(selectedSlotId), candidate.id);
+      await onUpdated(res.candidate);
       setSelectedSlotId('');
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Slot reservation failed.');
+      onNotify(`Atomically booked interview slot for ${candidate.full_name} — confirmation emailed.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Slot could not be booked.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleMarkInterviewDone = async () => {
+  const handleMarkInterviewStatus = async (status: 'COMPLETED' | 'CANCELLED' | 'RESCHEDULED') => {
+    if (!candidate.active_booking) return;
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await markInterviewCompleted({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-      });
-      onNotify(`Marked Stage 11 interview completed for ${candidate.fullName}.`);
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to mark interview completed.');
+      await updateBookingStatus(candidate.active_booking.id, status);
+      await onUpdated();
+      onNotify(`Interview booking updated to ${status}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update booking status.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleSavePostInterview = async () => {
+  const handlePostInterview = async (decision: PostInterviewDecision) => {
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await submitPostInterviewEvaluation({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        feedback: interviewFeedback,
-        rating: interviewRating,
-        decision: postDecision,
-        notes: finalNotes,
-      });
-      onNotify(
-        postDecision === 'offer'
-          ? `Panel approved ${candidate.fullName} for Employment Offer (ready for Stage 13).`
-          : `Saved post-interview evaluation (${postDecision}).`
+      const updated = await submitPostInterviewDecision(
+        candidate.id,
+        interviewFeedback,
+        interviewRating,
+        decision,
+        finalNotes
       );
-      if (postDecision === 'offer' && canViewSalary) setActiveTab('offer');
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to save panel evaluation.');
+      await onUpdated(updated);
+      onNotify(
+        decision === 'offer'
+          ? `Approved ${candidate.full_name} for employment offer.`
+          : `Recorded post-interview rejection for ${candidate.full_name}.`
+      );
+      if (decision === 'offer') setActiveTab('offer');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to submit interview evaluation.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleSendOffer = async () => {
+  const handleSendOffer = async (e: React.FormEvent) => {
+    e.preventDefault();
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await sendEmploymentOffer({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        positionOffered,
-        departmentOffered,
-        monthlySalaryMYR,
-        allowanceMYR,
-        probationMonths,
-        startDate,
-        offerDeadline,
-        offerTermsSummary,
+      const updated = await sendEmploymentOffer(candidate.id, {
+        position: candidate.position,
+        department: candidate.department,
+        salary_myr: offerSalary,
+        allowance_myr: offerAllowance,
+        probation_months: offerProbation,
+        start_date: offerStartDate,
+        deadline_date: offerDeadline,
+        offer_terms_summary: offerTerms,
+        offerLetterFile,
       });
-      const updatedComp = await fetchCandidateCompensation(candidate.id, actor, false);
-      setComp(updatedComp);
-      onNotify(`Employment Offer dispatched to ${candidate.fullName} (${formatMYR(monthlySalaryMYR)}/mo).`);
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to send employment offer.');
+      setOfferLetterFile(null);
+      await onUpdated(updated);
+      onNotify(`Employment Offer (${formatMYR(offerSalary)}/mo) dispatched to ${candidate.email}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to dispatch offer.');
     } finally {
       setBusy(false);
     }
   };
 
-  const handleUpdateOfferResponse = async () => {
+  const handleUpdateOfferStatus = async (nextStatus: OfferStatus) => {
     setBusy(true);
-    setActionError(null);
+    setError('');
     try {
-      await updateOfferResponseStatus({
-        actor: { ...actor, role: effectiveRole },
-        candidate,
-        offerStatus: offerStatusInput,
-        responseNote: offerResponseNote,
-      });
-      onNotify(`Offer status updated to "${offerStatusInput.replace('_', ' ')}".`);
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update offer response.');
+      const updated = await updateOfferStatus(candidate.id, nextStatus, offerResponseNote);
+      await onUpdated(updated);
+      onNotify(`Offer status updated to "${nextStatus}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update offer status.');
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleDeleteCandidate = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await deleteCandidate(candidate.id);
+      await onUpdated();
+      onNotify(`Deleted candidate record ${candidate.candidate_code}.`);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete candidate.');
+      setBusy(false);
+    }
+  };
+
+  const handlePrintOfferLetter = () => {
+    window.print();
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/50 flex justify-end">
-      <div className="bg-white w-full max-w-4xl h-full flex flex-col border-l border-slate-200 overflow-hidden">
-        {/* Top Candidate Header */}
-        <div className="px-6 py-4 border-b border-slate-200 flex items-start justify-between gap-4 no-print">
+    <div className="fixed inset-0 z-50 flex justify-end bg-[#0F172A]/45 backdrop-blur-[2px]">
+      <div className="flex h-full w-full max-w-3xl flex-col bg-white shadow-2xl border-l border-[#E2E8F0]">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 border-b border-[#E2E8F0] px-6 py-4 bg-[#FAFBFC]">
           <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-              <h2 className="font-display text-lg font-bold text-slate-900 truncate">
-                {candidate.fullName}
-              </h2>
-              <span className="font-mono tabular-nums text-xs text-slate-500">
-                {candidate.candidateCode}
+            <div className="flex flex-wrap items-center gap-2 text-xs text-[#64748B]">
+              <span className="font-mono font-semibold text-[#0F172A]">{candidate.candidate_code}</span>
+              <span>·</span>
+              <span>Stage {candidate.stage} of 15</span>
+              <span>·</span>
+              <span
+                className={
+                  statusMeta.tone === 'green'
+                    ? 'font-semibold text-[#15803D]'
+                    : statusMeta.tone === 'red'
+                    ? 'font-semibold text-[#DC2626]'
+                    : statusMeta.tone === 'amber'
+                    ? 'font-semibold text-[#B45309]'
+                    : statusMeta.tone === 'teal'
+                    ? 'font-semibold text-[#0F766E]'
+                    : 'font-semibold text-[#475569]'
+                }
+              >
+                {statusMeta.label}
               </span>
             </div>
-            <div className="text-xs text-slate-500 mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <span className="font-medium text-slate-700">{candidate.positionApplied}</span>
-              <span aria-hidden="true">·</span>
-              <span>{candidate.department}</span>
-              <span aria-hidden="true">·</span>
-              <span>{candidate.source}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-semibold text-teal-700">
-                Stage {String(candidate.currentStage).padStart(2, '0')}: {getStageTitle(candidate.currentStage)}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>{STATUS_META[candidate.status].label}</span>
-            </div>
+            <h2 className="mt-1 truncate text-xl font-bold text-[#0F172A]">{candidate.full_name}</h2>
+            <p className="text-sm text-[#475569]">
+              {candidate.position} <span className="text-[#94A3B8]">/</span> {candidate.department}
+            </p>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={() => onOpenCandidatePortal(candidate.id)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 rounded-md transition-colors cursor-pointer whitespace-nowrap"
+              onClick={copyPortalLink}
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC] transition-colors"
+              title="Copy public candidate self-service portal URL"
             >
-              <ExternalLink className="w-3.5 h-3.5" />
-              <span>Candidate Portal</span>
+              {copiedPortal ? <Check className="h-3.5 w-3.5 text-[#15803D]" /> : <Copy className="h-3.5 w-3.5" />}
+              {copiedPortal ? 'Copied Link' : 'Portal Link'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenPortalPreview(candidate)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1.5 text-xs font-semibold text-[#0F766E] hover:bg-[#CCFBF1] transition-colors"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Portal View
             </button>
             <button
               type="button"
               onClick={onClose}
-              aria-label="Close dossier"
-              className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-md cursor-pointer"
+              className="rounded-md p-1.5 text-[#64748B] hover:bg-[#E2E8F0]/60 hover:text-[#0F172A]"
+              aria-label="Close drawer"
             >
-              <X className="w-5 h-5" />
+              <X className="h-5 w-5" />
             </button>
           </div>
         </div>
 
-        {/* 15-Stage Compact Progress Bar */}
-        <div className="px-6 py-3 bg-slate-50 border-b border-slate-200 no-print">
+        {/* 15-stage compact stepper bar */}
+        <div className="border-b border-[#E2E8F0] bg-white px-6 py-2.5">
+          <div className="flex items-center justify-between text-[11px] text-[#64748B] mb-1.5">
+            <span className="font-semibold text-[#334155]">
+              Current Milestone: {WORKFLOW_STAGES.find((s) => s.stage === candidate.stage)?.title}
+            </span>
+            <span className="font-mono tabular-nums">AI Fit {candidate.ai_score}%</span>
+          </div>
           <div className="grid grid-cols-15 gap-1">
-            {WORKFLOW_STAGES.map((s) => {
-              const reached = candidate.currentStage >= s.stage;
-              const current = candidate.currentStage === s.stage;
+            {WORKFLOW_STAGES.map((st) => {
+              const reached = candidate.stage >= st.stage;
+              const current = candidate.stage === st.stage;
               return (
-                <div key={s.stage} title={`Stage ${s.stage}: ${s.title}`} className="space-y-1">
-                  <div
-                    className={`h-1.5 rounded-sm ${
-                      current ? 'bg-teal-700' : reached ? 'bg-teal-500/70' : 'bg-slate-200'
-                    }`}
-                  />
-                  <div
-                    className={`font-mono tabular-nums text-[10px] text-center ${
-                      current ? 'font-bold text-teal-800' : 'text-slate-400'
-                    }`}
-                  >
-                    {s.stage}
-                  </div>
-                </div>
+                <div
+                  key={st.stage}
+                  title={`Stage ${st.stage}: ${st.title}`}
+                  className={`h-1.5 rounded-full transition-colors ${
+                    current
+                      ? 'bg-[#0F766E]'
+                      : reached
+                      ? 'bg-[#0F766E]/45'
+                      : 'bg-[#E2E8F0]'
+                  }`}
+                />
               );
             })}
           </div>
         </div>
 
-        {/* Phase Navigation Tabs */}
-        <div className="px-6 py-2.5 border-b border-slate-200 flex items-center gap-1 overflow-x-auto no-print">
+        {/* Tabs */}
+        <div className="flex border-b border-[#E2E8F0] bg-[#FAFBFC] px-6">
           {(
             [
-              { id: 'screening', label: '01. Screening (S1–S4)' },
-              { id: 'docs', label: '02. Forms & Docs (S5–S8)' },
-              { id: 'interview', label: '03. Interview & Panel (S9–S12)' },
-              { id: 'offer', label: '04. MYR Offer & Final (S13–S15)' },
-            ] as { id: PhaseTab; label: string }[]
-          ).map((tab) => (
+              { id: 'overview', label: '1. Profile & Screening' },
+              { id: 'documents', label: `2. Docs & Qualify${missingDocs.length > 0 ? ` (${missingDocs.length})` : ''}` },
+              { id: 'interview', label: '3. Interview & Panel' },
+              { id: 'offer', label: '4. Employment Offer' },
+            ] as const
+          ).map((t) => (
             <button
-              key={tab.id}
+              key={t.id}
               type="button"
-              onClick={() => {
-                setActiveTab(tab.id);
-                setActionError(null);
-              }}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                activeTab === tab.id
-                  ? 'bg-slate-900 text-white'
-                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              onClick={() => setActiveTab(t.id)}
+              className={`px-3.5 py-2.5 text-xs font-semibold border-b-2 transition-colors whitespace-nowrap ${
+                activeTab === t.id
+                  ? 'border-[#0F766E] text-[#0F766E] bg-white'
+                  : 'border-transparent text-[#64748B] hover:text-[#0F172A]'
               }`}
             >
-              {tab.label}
+              {t.label}
             </button>
           ))}
         </div>
 
-        {/* Drawer Content */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {actionError && (
-            <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md no-print">
-              {actionError}
-            </div>
-          )}
+        {/* Error banner */}
+        {error && (
+          <div className="mx-6 mt-4 flex items-center gap-2 rounded-md border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#B91C1C]">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
 
-          {/* PDPA Contact & Profile Bar */}
-          <section className="pb-5 border-b border-slate-200 grid sm:grid-cols-3 gap-4 text-xs no-print">
-            <div>
-              <div className="text-slate-400">Contact Email</div>
-              <div className="font-mono text-slate-900 mt-0.5 break-all">
-                {canViewPii ? (loadingPrivate ? 'Loading...' : pii?.email || candidate.maskedEmail) : `${candidate.maskedEmail} (Masked — PDPA)`}
-              </div>
-            </div>
-            <div>
-              <div className="text-slate-400">Phone Number</div>
-              <div className="font-mono text-slate-900 mt-0.5">
-                {canViewPii ? (loadingPrivate ? 'Loading...' : pii?.phone || candidate.maskedPhone) : `${candidate.maskedPhone} (Masked — PDPA)`}
-              </div>
-            </div>
-            <div>
-              <div className="text-slate-400">Location · Experience · AI Fit</div>
-              <div className="text-slate-900 mt-0.5 font-medium">
-                {canViewPii ? pii?.location || 'Malaysia' : 'Malaysia'} ·{' '}
-                <span className="font-mono tabular-nums">{candidate.yearsExperience} yrs</span> ·{' '}
-                <span className="font-mono tabular-nums font-bold text-teal-700">{candidate.aiMatchScore}% fit</span>
-              </div>
-            </div>
-          </section>
-
-          {/* TAB 1: STAGES 1-4 RESUME SCREENING */}
-          {activeTab === 'screening' && (
-            <div className="space-y-6">
-              <div className="space-y-4">
-                <div>
-                  <h3 className="text-xs font-semibold text-slate-500">Gemini AI Screening Scorecard</h3>
-                  <p className="text-sm text-slate-800 mt-1 leading-relaxed">{candidate.aiSummary}</p>
-                </div>
-
-                <div className="grid sm:grid-cols-2 gap-6 pt-3 border-t border-slate-100 text-xs">
-                  <div>
-                    <div className="font-semibold text-slate-700">Education (SPM / UEC / Degree)</div>
-                    <p className="text-slate-600 mt-1 leading-relaxed">{candidate.educationSummary}</p>
+        {/* Scrollable Content */}
+        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+          {/* TAB 1: OVERVIEW & SCREENING */}
+          {activeTab === 'overview' && (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                <div className="space-y-2 border border-[#E2E8F0] rounded-lg p-4">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-[#64748B]">
+                    Contact & Source
                   </div>
-                  <div>
-                    <div className="font-semibold text-slate-700">Relevant Work Experience</div>
-                    <p className="text-slate-600 mt-1 leading-relaxed">{candidate.experienceSummary}</p>
+                  <div className="flex items-center gap-2 text-[#0F172A]">
+                    <Mail className="h-4 w-4 text-[#64748B]" />
+                    <span className="truncate">{candidate.email}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[#0F172A]">
+                    <Phone className="h-4 w-4 text-[#64748B]" />
+                    <span className="font-mono text-xs">{candidate.phone}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[#475569]">
+                    <MapPin className="h-4 w-4 text-[#64748B]" />
+                    <span>{candidate.location || 'Malaysia'}</span>
+                  </div>
+                  <div className="pt-1 flex items-center justify-between text-xs text-[#64748B] border-t border-[#F1F5F9]">
+                    <span>Source: <strong className="text-[#0F172A]">{candidate.source}</strong></span>
+                    <span className="font-mono">Applied {candidate.applied_date}</span>
                   </div>
                 </div>
 
-                <div className="pt-3 border-t border-slate-100">
-                  <div className="text-xs font-semibold text-slate-700">Extracted Competencies</div>
-                  <div className="text-xs text-slate-600 mt-1">
-                    {candidate.skills.length > 0 ? candidate.skills.join(' · ') : 'No skills extracted'}
+                <div className="space-y-2 border border-[#E2E8F0] rounded-lg p-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-[#64748B]">
+                      AI Resume Assessment
+                    </span>
+                    <span className="font-mono text-sm font-bold text-[#0F766E] tabular-nums">
+                      {candidate.ai_score}% Fit
+                    </span>
                   </div>
+                  <p className="text-xs leading-relaxed text-[#334155]">
+                    {candidate.ai_summary || 'Resume registered and queued for HR screening.'}
+                  </p>
+                  {resumeDoc && (
+                    <div className="pt-2 border-t border-[#F1F5F9] flex items-center justify-between text-xs">
+                      <span className="flex items-center gap-1.5 text-[#334155] truncate">
+                        <FileText className="h-3.5 w-3.5 text-[#0F766E] shrink-0" />
+                        <span className="truncate">{resumeDoc.file_name || 'Resume file'}</span>
+                      </span>
+                      {resumeDoc.file_path ? (
+                        <a
+                          href={getProtectedFileUrl(resumeDoc.file_path)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-semibold text-[#0F766E] hover:underline shrink-0 ml-2"
+                        >
+                          Download
+                        </a>
+                      ) : (
+                        <label className="cursor-pointer font-semibold text-[#0F766E] hover:underline shrink-0 ml-2">
+                          {uploadingDoc === 'RESUME' ? 'Uploading...' : 'Attach PDF'}
+                          <input
+                            type="file"
+                            accept=".pdf,.doc,.docx,.txt"
+                            className="hidden"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) void handleFileUpload('RESUME', file);
+                            }}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Stage 4 Decision Controls */}
-              <div className="pt-5 border-t border-slate-200 space-y-4">
-                <div>
-                  <h3 className="font-display text-sm font-bold text-slate-900">
-                    Stage 4 · HR Initial Screening Decision
-                  </h3>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Selecting <strong>Proceed to Next Stage</strong> automatically advances the candidate to Stage 5 and
-                    dispatches the official Employment Application Form and DISC Personality Assessment links.
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                <div className="border border-[#E2E8F0] rounded-lg p-4">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-[#64748B] mb-2">
+                    <GraduationCap className="h-4 w-4 text-[#0F766E]" />
+                    Education Background
+                  </div>
+                  <p className="text-xs leading-relaxed text-[#334155]">
+                    {candidate.education || 'Not extracted.'}
                   </p>
                 </div>
 
-                {effectiveRole === 'hiring_manager' ? (
-                  <div className="p-3 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-md flex items-center gap-2">
-                    <Lock className="w-4 h-4 text-slate-400 shrink-0" />
-                    <span>Initial screening decisions are restricted to HR Admin and Recruiter roles.</span>
+                <div className="border border-[#E2E8F0] rounded-lg p-4">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-[#64748B] mb-2">
+                    <Briefcase className="h-4 w-4 text-[#0F766E]" />
+                    Experience ({candidate.years_experience} yrs)
                   </div>
-                ) : (
-                  <div className="space-y-3">
-                    <div className="flex flex-wrap gap-2">
-                      {(
-                        [
-                          { value: 'proceed', label: 'Proceed to Next Stage (Auto-Send Forms)' },
-                          { value: 'pending', label: 'Pending Review' },
-                          { value: 'reject', label: 'Reject Candidate' },
-                        ] as { value: ScreeningDecision; label: string }[]
-                      ).map((opt) => (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          onClick={() => setScreeningDecision(opt.value)}
-                          className={`px-3.5 py-2 text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
-                            screeningDecision === opt.value
-                              ? opt.value === 'reject'
-                                ? 'bg-red-700 text-white border-red-700'
-                                : 'bg-teal-700 text-white border-teal-700'
-                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      ))}
-                    </div>
-
-                    {screeningDecision === 'reject' && (
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-700 mb-1">
-                          Mandatory Rejection Reason *
-                        </label>
-                        <textarea
-                          rows={2}
-                          value={rejectionReason}
-                          onChange={(e) => setRejectionReason(e.target.value)}
-                          placeholder="Provide objective screening rejection reason for audit compliance..."
-                          className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        />
-                      </div>
-                    )}
-
-                    <div>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={handleSaveScreening}
-                        className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors cursor-pointer"
-                      >
-                        <Send className="w-3.5 h-3.5" />
-                        <span>{busy ? 'Saving Decision...' : 'Confirm Screening Decision'}</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* TAB 2: STAGES 5-8 GOOGLE APPS SCRIPT FORMS, ACADEMIC DOCS & QUALIFICATION */}
-          {activeTab === 'docs' && (
-            <div className="space-y-6">
-              {/* Official Google Apps Script Links */}
-              <div className="pb-5 border-b border-slate-200 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="font-display text-sm font-bold text-slate-900">
-                      Stage 5 · Integrated Google Apps Script Assessment Forms
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Automatically dispatched upon shortlisting. Verify completion and record candidate DISC profile.
-                    </p>
-                  </div>
-                  {missingDocs.length > 0 && effectiveRole !== 'hiring_manager' && (
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleSendDocReminder}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-md cursor-pointer whitespace-nowrap"
-                    >
-                      <BellRing className="w-3.5 h-3.5" />
-                      <span>Send 48h Missing-Docs Reminder ({missingDocs.length})</span>
-                    </button>
-                  )}
-                </div>
-
-                <div className="grid sm:grid-cols-2 gap-4 pt-1 text-xs">
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-md space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-semibold text-slate-900">A. Employment Application Form</span>
-                      <a
-                        href={GOOGLE_APPS_SCRIPT_URLS.employmentApplicationForm}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-teal-700 hover:text-teal-800 font-medium"
-                      >
-                        <span>Open Link</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    </div>
-                    <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        disabled={effectiveRole === 'hiring_manager'}
-                        checked={empFormDone}
-                        onChange={(e) => setEmpFormDone(e.target.checked)}
-                        className="rounded border-slate-300 text-teal-700"
-                      />
-                      <span>Verified Completed by HR</span>
-                    </label>
-                  </div>
-
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-md space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-semibold text-slate-900">B. DISC Personality Assessment</span>
-                      <a
-                        href={GOOGLE_APPS_SCRIPT_URLS.discPersonalityAssessment}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-teal-700 hover:text-teal-800 font-medium"
-                      >
-                        <span>Open Link</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          disabled={effectiveRole === 'hiring_manager'}
-                          checked={discFormDone}
-                          onChange={(e) => setDiscFormDone(e.target.checked)}
-                          className="rounded border-slate-300 text-teal-700"
-                        />
-                        <span>DISC Completed</span>
-                      </label>
-                      <input
-                        type="text"
-                        disabled={effectiveRole === 'hiring_manager'}
-                        value={discProfile}
-                        onChange={(e) => setDiscProfile(e.target.value)}
-                        placeholder="DISC Profile (e.g. D/I, C/S)"
-                        className="flex-1 min-w-[140px] px-2 py-1 text-xs bg-white border border-slate-200 rounded focus:outline-none focus:border-teal-700"
-                      />
-                    </div>
-                  </div>
+                  <p className="text-xs leading-relaxed text-[#334155]">
+                    {candidate.experience || 'Not extracted.'}
+                  </p>
                 </div>
               </div>
 
-              {/* Stage 6-7 Malaysian Academic Document Checklist */}
-              <div className="pb-5 border-b border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="font-display text-sm font-bold text-slate-900">
-                      Stages 6–7 · Malaysian Academic Document Verification
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Mandatory SPM, University Degree Certificate, Academic Transcript, and UEC (if applicable).
-                    </p>
+              {candidate.skills.length > 0 && (
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wider text-[#64748B] mb-2">
+                    Extracted Skills & Certifications
                   </div>
-                  {candidate.lastDocReminderAt && (
-                    <span className="font-mono tabular-nums text-[11px] text-slate-500">
-                      Last reminder: {candidate.lastDocReminderAt.slice(0, 10)}
-                    </span>
-                  )}
-                </div>
-
-                {!canViewPii ? (
-                  <div className="p-4 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-md flex items-center gap-2">
-                    <Lock className="w-4 h-4 text-slate-400 shrink-0" />
-                    <span>
-                      Raw academic certificates and transcript filenames are masked for Hiring Managers per Malaysian PDPA policy.
-                      Checklist summary: SPM ({candidate.docSpmStatus}) · UEC ({candidate.docUecStatus}) · Degree ({candidate.docDegreeStatus}) · Transcript ({candidate.docTranscriptStatus}).
-                    </span>
-                  </div>
-                ) : (
-                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-md text-xs">
-                    {[
-                      {
-                        label: '1. SPM Examination Results (Mandatory)',
-                        file: pii?.spmFileName,
-                        value: docSpm,
-                        onChange: (v: string) => setDocSpm(v as DocStatus),
-                        options: ['missing', 'submitted', 'verified'],
-                      },
-                      {
-                        label: '2. UEC Examination Results (If Applicable)',
-                        file: pii?.uecFileName,
-                        value: docUec,
-                        onChange: (v: string) => setDocUec(v as UecDocStatus),
-                        options: ['not_applicable', 'missing', 'submitted', 'verified'],
-                      },
-                      {
-                        label: '3. University Degree Certificate (Mandatory)',
-                        file: pii?.degreeFileName,
-                        value: docDegree,
-                        onChange: (v: string) => setDocDegree(v as DocStatus),
-                        options: ['missing', 'submitted', 'verified'],
-                      },
-                      {
-                        label: '4. University Academic Transcript (Mandatory)',
-                        file: pii?.transcriptFileName,
-                        value: docTranscript,
-                        onChange: (v: string) => setDocTranscript(v as DocStatus),
-                        options: ['missing', 'submitted', 'verified'],
-                      },
-                    ].map((row) => (
-                      <div key={row.label} className="px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-                        <div>
-                          <div className="font-medium text-slate-900">{row.label}</div>
-                          <div className="font-mono text-[11px] text-slate-500 mt-0.5">
-                            {row.file ? `Uploaded PDF: ${row.file}` : 'No document file uploaded yet'}
-                          </div>
-                        </div>
-                        <select
-                          value={row.value}
-                          onChange={(e) => row.onChange(e.target.value)}
-                          className="px-2.5 py-1.5 text-xs font-medium bg-white border border-slate-300 rounded focus:outline-none focus:border-teal-700"
-                        >
-                          {row.options.map((o) => (
-                            <option key={o} value={o}>
-                              {o.replace('_', ' ')}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {candidate.skills.map((skill) => (
+                      <span
+                        key={skill}
+                        className="rounded border border-[#E2E8F0] bg-[#F8FAFC] px-2 py-0.5 text-xs text-[#334155]"
+                      >
+                        {skill}
+                      </span>
                     ))}
                   </div>
-                )}
+                </div>
+              )}
 
-                {effectiveRole !== 'hiring_manager' && (
+              {/* Stage 3-4 Screening Decision */}
+              <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-bold text-[#0F172A]">Stage 3–4 · HR Screening Decision</h3>
+                    <p className="text-xs text-[#64748B]">
+                      Selecting &ldquo;Proceed to Next Stage&rdquo; automatically sends the Employment Application Form, DISC Assessment, and Academic Docs instructions via email.
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs font-semibold uppercase text-[#475569]">
+                    Current: {candidate.screening_decision}
+                  </span>
+                </div>
+
+                <textarea
+                  value={screeningRemarks}
+                  onChange={(e) => setScreeningRemarks(e.target.value)}
+                  rows={3}
+                  placeholder="Enter HR initial resume screening notes (e.g., relevant Malaysian statutory experience, technical fit, salary expectations)..."
+                  className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                />
+
+                <div className="flex flex-wrap items-center gap-2.5">
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={handleSaveDocsChecklist}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md cursor-pointer"
+                    onClick={() => handleScreening('proceed')}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
                   >
-                    <FileCheck2 className="w-3.5 h-3.5" />
-                    <span>{busy ? 'Saving...' : 'Save Forms & Document Verification'}</span>
+                    <Send className="h-3.5 w-3.5" />
+                    Proceed to Next Stage &amp; Auto-Send Forms
                   </button>
-                )}
-              </div>
-
-              {/* Stage 8 Qualification Decision */}
-              <div className="space-y-3">
-                <div>
-                  <h3 className="font-display text-sm font-bold text-slate-900">
-                    Stage 8–9 · Qualification Decision & Interview Invite Dispatch
-                  </h3>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Marking a candidate as <strong>Qualified</strong> automatically sends the Stage 9 self-scheduling interview invitation.
-                  </p>
-                </div>
-
-                {effectiveRole === 'hiring_manager' ? (
-                  <div className="text-xs text-slate-600">
-                    Current Qualification: <strong>{candidate.qualificationDecision}</strong>
-                    {candidate.qualificationRemarks ? ` — ${candidate.qualificationRemarks}` : ''}
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    <div className="flex flex-wrap gap-2">
-                      {(
-                        [
-                          { v: 'qualified', l: 'Qualified (Auto-Send Interview Invite)' },
-                          { v: 'pending', l: 'Pending Review' },
-                          { v: 'not_qualified', l: 'Not Qualified' },
-                        ] as { v: QualificationDecision; l: string }[]
-                      ).map((opt) => (
-                        <button
-                          key={opt.v}
-                          type="button"
-                          onClick={() => setQualDecision(opt.v)}
-                          className={`px-3.5 py-2 text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
-                            qualDecision === opt.v
-                              ? opt.v === 'not_qualified'
-                                ? 'bg-red-700 text-white border-red-700'
-                                : 'bg-teal-700 text-white border-teal-700'
-                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                          }`}
-                        >
-                          {opt.l}
-                        </button>
-                      ))}
-                    </div>
-
-                    <textarea
-                      rows={2}
-                      value={qualRemarks}
-                      onChange={(e) => setQualRemarks(e.target.value)}
-                      placeholder="Evaluation remarks on DISC profile, CGPA, SPM/UEC results..."
-                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                    />
-
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleSaveQualification}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md cursor-pointer"
-                    >
-                      <UserCheck className="w-3.5 h-3.5" />
-                      <span>{busy ? 'Submitting...' : 'Save Qualification Decision'}</span>
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* TAB 3: STAGES 9-12 INTERVIEW BOOKING & PANEL EVALUATION */}
-          {activeTab === 'interview' && (
-            <div className="space-y-6">
-              {/* Confirmed Slot or Atomic Booking */}
-              <div className="pb-5 border-b border-slate-200 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="font-display text-sm font-bold text-slate-900">
-                      Stages 9–11 · Interview Slot & Attendance
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Firestore atomic transactions lock interview slots on reservation to prevent double-booking.
-                    </p>
-                  </div>
                   <button
                     type="button"
-                    onClick={() => onOpenCandidatePortal(candidate.id)}
-                    className="text-xs font-semibold text-teal-700 hover:text-teal-800 underline cursor-pointer"
+                    disabled={busy}
+                    onClick={() => handleScreening('reject')}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
                   >
-                    Open Self-Service Slot Picker
+                    <XCircle className="h-3.5 w-3.5" />
+                    Reject at Screening
                   </button>
                 </div>
+              </div>
 
-                {candidate.interviewSlotId ? (
-                  <div className="p-4 bg-slate-50 border border-slate-200 rounded-md flex flex-wrap items-center justify-between gap-4">
-                    <div className="space-y-1 text-xs">
-                      <div className="font-semibold text-slate-900 flex items-center gap-2">
-                        <Calendar className="w-4 h-4 text-teal-700" />
-                        <span className="font-mono tabular-nums">
-                          {candidate.interviewDate} · {candidate.interviewTime}
-                        </span>
-                      </div>
-                      <div className="text-slate-600">
-                        {candidate.interviewMode} · Panelist: <strong>{candidate.interviewerName}</strong>
-                      </div>
-                    </div>
-
-                    {candidate.status === 'interview_confirmed' && (
+              {isHrAdmin && (
+                <div className="border-t border-[#E2E8F0] pt-4 flex items-center justify-between">
+                  <span className="text-xs text-[#64748B]">
+                    Record created {formatTimestamp(candidate.created_at)}
+                  </span>
+                  {!confirmDelete ? (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete(true)}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#DC2626] hover:underline"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Delete Candidate Record
+                    </button>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold text-[#DC2626]">Confirm permanent delete?</span>
                       <button
                         type="button"
                         disabled={busy}
-                        onClick={handleMarkInterviewDone}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md cursor-pointer"
+                        onClick={handleDeleteCandidate}
+                        className="rounded bg-[#DC2626] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[#B91C1C]"
                       >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Mark Interview Conducted (Stage 11)</span>
+                        Yes, Delete
                       </button>
-                    )}
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(false)}
+                        className="rounded border border-[#CBD5E1] px-2.5 py-1 text-xs text-[#475569]"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* TAB 2: DOCUMENTS, FORMS & QUALIFICATION */}
+          {activeTab === 'documents' && (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3 border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC]">
+                <div>
+                  <h3 className="text-sm font-bold text-[#0F172A]">
+                    Stage 5–7 · Forms, DISC &amp; Malaysian Academic Documents
+                  </h3>
+                  <p className="text-xs text-[#64748B]">
+                    {missingDocs.length === 0
+                      ? 'All mandatory forms and academic certificates are complete.'
+                      : `${missingDocs.length} mandatory item(s) still pending: ${missingDocs.join(', ')}`}
+                  </p>
+                  {candidate.last_doc_reminder_at && (
+                    <p className="mt-1 text-[11px] font-mono text-[#64748B]">
+                      Last reminder emailed: {formatTimestamp(candidate.last_doc_reminder_at)}
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleSendReminder}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-[#F59E0B] bg-[#FFFBEB] px-3 py-1.5 text-xs font-semibold text-[#B45309] hover:bg-[#FEF3C7] disabled:opacity-50"
+                >
+                  <BellRing className="h-3.5 w-3.5" />
+                  Send Document Reminder Email
+                </button>
+              </div>
+
+              {/* Checklist table */}
+              <div className="border border-[#E2E8F0] rounded-lg overflow-hidden">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[#64748B] uppercase tracking-wider text-[11px]">
+                    <tr>
+                      <th className="px-3.5 py-2.5 font-semibold">Requirement</th>
+                      <th className="px-3 py-2.5 font-semibold text-center">Submitted</th>
+                      <th className="px-3 py-2.5 font-semibold text-center">HR Verified</th>
+                      <th className="px-3 py-2.5 font-semibold text-center">N/A</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-right">File / Link</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E2E8F0]">
+                    {DOC_META.map((item) => {
+                      const doc = getDoc(candidate, item.type);
+                      const flag = docFlags[item.type];
+                      return (
+                        <tr key={item.type} className="hover:bg-[#FAFBFC]">
+                          <td className="px-3.5 py-3">
+                            <div className="font-semibold text-[#0F172A]">{item.label}</div>
+                            <div className="text-[11px] text-[#64748B]">{item.requiredLabel}</div>
+                            {doc?.file_name && (
+                              <div className="mt-0.5 font-mono text-[11px] text-[#0F766E] truncate max-w-[230px]">
+                                {doc.file_name}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-3 py-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={flag.completed}
+                              disabled={flag.not_applicable}
+                              onChange={(e) =>
+                                setDocFlags((prev) => ({
+                                  ...prev,
+                                  [item.type]: { ...prev[item.type], completed: e.target.checked },
+                                }))
+                              }
+                              className="h-4 w-4 accent-[#0F766E]"
+                            />
+                          </td>
+                          <td className="px-3 py-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={flag.verified}
+                              disabled={flag.not_applicable}
+                              onChange={(e) =>
+                                setDocFlags((prev) => ({
+                                  ...prev,
+                                  [item.type]: {
+                                    ...prev[item.type],
+                                    verified: e.target.checked,
+                                    completed: e.target.checked ? true : prev[item.type].completed,
+                                  },
+                                }))
+                              }
+                              className="h-4 w-4 accent-[#15803D]"
+                            />
+                          </td>
+                          <td className="px-3 py-3 text-center">
+                            {item.type === 'UEC' ? (
+                              <input
+                                type="checkbox"
+                                checked={flag.not_applicable}
+                                onChange={(e) =>
+                                  setDocFlags((prev) => ({
+                                    ...prev,
+                                    [item.type]: {
+                                      completed: false,
+                                      verified: false,
+                                      not_applicable: e.target.checked,
+                                    },
+                                  }))
+                                }
+                                className="h-4 w-4 accent-[#64748B]"
+                              />
+                            ) : (
+                              <span className="text-[#CBD5E1]">—</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-3 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-2">
+                              {item.externalUrl && (
+                                <a
+                                  href={item.externalUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
+                                >
+                                  <Link2 className="h-3 w-3" />
+                                  Open Form
+                                </a>
+                              )}
+                              {doc?.file_path && (
+                                <a
+                                  href={getProtectedFileUrl(doc.file_path)}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0F766E] hover:underline"
+                                >
+                                  View PDF
+                                </a>
+                              )}
+                              {item.allowUpload && !flag.not_applicable && (
+                                <label className="inline-flex cursor-pointer items-center gap-1 rounded border border-[#CBD5E1] bg-white px-2 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F8FAFC]">
+                                  <Upload className="h-3 w-3" />
+                                  {uploadingDoc === item.type ? 'Saving...' : 'Upload'}
+                                  <input
+                                    type="file"
+                                    accept=".pdf,.jpg,.jpeg,.png"
+                                    className="hidden"
+                                    onChange={(e) => {
+                                      const f = e.target.files?.[0];
+                                      if (f) void handleFileUpload(item.type, f);
+                                    }}
+                                  />
+                                </label>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <div className="flex-1 min-w-[220px]">
+                  <label className="block text-xs font-semibold text-[#334155] mb-1">
+                    DISC Personality Profile Result
+                  </label>
+                  <input
+                    type="text"
+                    value={discProfile}
+                    onChange={(e) => setDiscProfile(e.target.value)}
+                    placeholder="e.g., High D / C — Analytical Driver"
+                    className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleSaveChecklist}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E293B] disabled:opacity-50"
+                >
+                  <ClipboardCheck className="h-3.5 w-3.5" />
+                  Save Checklist Verification
+                </button>
+              </div>
+
+              {/* Stage 8 Qualification */}
+              <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-bold text-[#0F172A]">Stage 8 · Qualification Decision</h3>
+                    <p className="text-xs text-[#64748B]">
+                      Marking a candidate Qualified automatically dispatches the Interview Invitation email with their self-service slot booking link.
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs font-semibold uppercase text-[#475569]">
+                    Status: {candidate.qualification_status}
+                  </span>
+                </div>
+
+                <textarea
+                  value={qualRemarks}
+                  onChange={(e) => setQualRemarks(e.target.value)}
+                  rows={2}
+                  placeholder="Enter qualification review remarks (SPM/UEC/Degree verification, DISC team fit)..."
+                  className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                />
+
+                <div className="flex flex-wrap gap-2.5">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => handleQualification('qualified')}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                  >
+                    <UserCheck className="h-3.5 w-3.5" />
+                    Mark Qualified &amp; Send Interview Invite
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => handleQualification('not_qualified')}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                  >
+                    <XCircle className="h-3.5 w-3.5" />
+                    Mark Not Qualified
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* TAB 3: INTERVIEW & PANEL EVALUATION */}
+          {activeTab === 'interview' && (
+            <>
+              <div className="border border-[#E2E8F0] rounded-lg p-4 space-y-3">
+                <h3 className="text-sm font-bold text-[#0F172A]">
+                  Stage 9–10 · Interview Slot Booking
+                </h3>
+
+                {candidate.active_booking ? (
+                  <div className="rounded-md border border-[#99F6E4] bg-[#F0FDFA] p-3.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-bold text-[#0F766E]">
+                        <Calendar className="h-4 w-4" />
+                        {candidate.active_booking.date} · {candidate.active_booking.start_time} – {candidate.active_booking.end_time}
+                      </span>
+                      <span className="font-mono text-xs font-semibold text-[#0F766E]">
+                        {candidate.active_booking.status}
+                      </span>
+                    </div>
+                    <div className="text-xs text-[#334155]">
+                      Panelist: <strong>{candidate.active_booking.interviewer_name}</strong> ·{' '}
+                      {candidate.active_booking.mode}
+                    </div>
+                    <div className="text-xs text-[#475569] break-all">
+                      Location / Link: {candidate.active_booking.location_or_link}
+                    </div>
+
+                    <div className="pt-2 flex flex-wrap gap-2 border-t border-[#CCFBF1]">
+                      {candidate.active_booking.status !== 'COMPLETED' && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleMarkInterviewStatus('COMPLETED')}
+                          className="rounded bg-[#0F766E] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[#115E59]"
+                        >
+                          Mark Interview Conducted
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleMarkInterviewStatus('RESCHEDULED')}
+                        className="rounded border border-[#CBD5E1] bg-white px-2.5 py-1 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
+                      >
+                        Release Slot (Reschedule)
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleMarkInterviewStatus('CANCELLED')}
+                        className="rounded border border-[#FECACA] bg-white px-2.5 py-1 text-xs font-medium text-[#DC2626] hover:bg-[#FEF2F2]"
+                      >
+                        Cancel Booking
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {availableSlots.length === 0 ? (
-                      <p className="text-xs text-slate-500">
-                        No open interview slots available. Add available slots in the Interview Calendar view.
-                      </p>
-                    ) : effectiveRole !== 'hiring_manager' ? (
-                      <div className="flex flex-wrap items-center gap-2">
-                        <select
-                          value={selectedSlotId}
-                          onChange={(e) => setSelectedSlotId(e.target.value)}
-                          className="flex-1 min-w-[260px] px-3 py-2 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        >
-                          <option value="">Assign available interview slot (atomic lock)...</option>
-                          {availableSlots.map((slot) => (
-                            <option key={slot.id} value={slot.id}>
-                              {slot.date} ({slot.startTime}–{slot.endTime}) · {slot.mode} · {slot.interviewerName}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          disabled={busy || !selectedSlotId}
-                          onClick={handleAtomicBookSlot}
-                          className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md cursor-pointer whitespace-nowrap"
-                        >
-                          Lock Slot Atomically
-                        </button>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-500">
-                        Candidate has not booked an interview slot yet.
-                      </p>
-                    )}
+                    <p className="text-xs text-[#64748B]">
+                      No active booking yet. The candidate can book directly via their portal link, or HR can assign an open slot atomically below:
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={selectedSlotId}
+                        onChange={(e) => setSelectedSlotId(e.target.value ? Number(e.target.value) : '')}
+                        className="flex-1 min-w-[240px] rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
+                      >
+                        <option value="">Select available HR interview slot...</option>
+                        {availableSlots.map((slot) => (
+                          <option key={slot.id} value={slot.id}>
+                            {slot.date} ({slot.start_time}–{slot.end_time}) · {slot.interviewer_name} ·{' '}
+                            {slot.capacity - slot.booked_count} seat(s) left
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={busy || !selectedSlotId}
+                        onClick={handleBookSlot}
+                        className="rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                      >
+                        Confirm Slot
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
 
-              {/* Stage 12 Panel Feedback & Post-Interview Decision (Accessible by Hiring Manager, Recruiter, HR Admin) */}
-              <div className="space-y-4">
-                <div>
-                  <h3 className="font-display text-sm font-bold text-slate-900">
-                    Stage 12 · Post-Interview Panel Evaluation & Decision
+              {/* Stage 11-12 Post-Interview Evaluation */}
+              <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-bold text-[#0F172A]">
+                    Stage 11–12 · Panel Evaluation &amp; Post-Interview Decision
                   </h3>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Hiring Managers and HR panelists record interview scores, competency feedback, and hiring recommendations.
-                  </p>
+                  <span className="font-mono text-xs font-semibold uppercase text-[#475569]">
+                    Decision: {candidate.post_interview_decision}
+                  </span>
                 </div>
 
-                <div className="grid sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Interview Panel Rating (1–5)
-                    </label>
-                    <div className="flex items-center gap-1.5">
-                      {[1, 2, 3, 4, 5].map((star) => (
-                        <button
-                          key={star}
-                          type="button"
-                          onClick={() => setInterviewRating(star)}
-                          className={`w-9 h-9 font-mono tabular-nums text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
-                            interviewRating === star
-                              ? 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                          }`}
-                        >
-                          {star}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Post-Interview Decision
-                    </label>
-                    <div className="flex flex-wrap gap-1.5">
-                      {(
-                        [
-                          { v: 'offer', l: 'Offer Employment' },
-                          { v: 'pending', l: 'Pending Decision' },
-                          { v: 'reject', l: 'Reject Candidate' },
-                        ] as { v: PostInterviewDecision; l: string }[]
-                      ).map((opt) => (
-                        <button
-                          key={opt.v}
-                          type="button"
-                          onClick={() => setPostDecision(opt.v)}
-                          className={`px-3 py-2 text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
-                            postDecision === opt.v
-                              ? opt.v === 'reject'
-                                ? 'bg-red-700 text-white border-red-700'
-                                : 'bg-teal-700 text-white border-teal-700'
-                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                          }`}
-                        >
-                          {opt.l}
-                        </button>
-                      ))}
-                    </div>
+                <div>
+                  <label className="block text-xs font-semibold text-[#334155] mb-1">
+                    Panel Rating (1–5)
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    {[1, 2, 3, 4, 5].map((n) => (
+                      <button
+                        key={n}
+                        type="button"
+                        onClick={() => setInterviewRating(n)}
+                        className={`inline-flex items-center gap-1 rounded border px-2.5 py-1 text-xs font-semibold ${
+                          interviewRating === n
+                            ? 'border-[#0F766E] bg-[#0F766E] text-white'
+                            : 'border-[#CBD5E1] bg-white text-[#475569]'
+                        }`}
+                      >
+                        <Star className="h-3 w-3" />
+                        {n}
+                      </button>
+                    ))}
                   </div>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Panel Evaluation Feedback
+                  <label className="block text-xs font-semibold text-[#334155] mb-1">
+                    Interview Panel Feedback
                   </label>
                   <textarea
-                    rows={3}
                     value={interviewFeedback}
                     onChange={(e) => setInterviewFeedback(e.target.value)}
-                    placeholder="Technical depth, cultural alignment, salary expectations, notice period..."
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                    rows={3}
+                    placeholder="Document technical competency, leadership, communication, and cultural alignment..."
+                    className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Decision Remarks / Handover Notes
+                  <label className="block text-xs font-semibold text-[#334155] mb-1">
+                    Final Hiring Panel Notes
                   </label>
                   <input
                     type="text"
                     value={finalNotes}
                     onChange={(e) => setFinalNotes(e.target.value)}
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                    placeholder="Recommended band, notice period, or rejection summary..."
+                    className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] focus:border-[#0F766E] focus:outline-none"
                   />
                 </div>
 
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={handleSavePostInterview}
-                  className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md cursor-pointer"
-                >
-                  {busy ? 'Saving Evaluation...' : 'Record Post-Interview Decision'}
-                </button>
+                <div className="flex flex-wrap gap-2.5">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => handlePostInterview('offer')}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Approve for Employment Offer
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => handlePostInterview('reject')}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#FECACA] bg-white px-3.5 py-2 text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                  >
+                    <XCircle className="h-3.5 w-3.5" />
+                    Reject Post-Interview
+                  </button>
+                </div>
               </div>
-            </div>
+            </>
           )}
 
-          {/* TAB 4: STAGES 13-15 EMPLOYMENT OFFER & FINAL RESPONSE */}
+          {/* TAB 4: EMPLOYMENT OFFER */}
           {activeTab === 'offer' && (
-            <div className="space-y-6">
-              {!canViewSalary ? (
-                <div className="p-6 bg-slate-50 border border-slate-200 rounded-md space-y-2">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-                    <Lock className="w-4 h-4 text-amber-700" />
-                    <span>Confidential MYR Compensation Masked (RBAC & PDPA Policy)</span>
-                  </div>
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    Salary packages in MYR, allowances, and employment offer letters are strictly isolated in
-                    <code className="font-mono mx-1">/candidates/{candidate.id}/private/compensation</code>
-                    and restricted exclusively to <strong>HR Admin</strong> personnel.
+            <>
+              {!isHrAdmin ? (
+                <div className="rounded-lg border border-[#E2E8F0] bg-[#FAFBFC] p-5 space-y-2">
+                  <h3 className="text-sm font-bold text-[#0F172A]">
+                    Confidential Compensation &amp; Offer Management
+                  </h3>
+                  <p className="text-xs text-[#475569]">
+                    MYR salary packages, allowances, and offer letter issuance are restricted to{' '}
+                    <strong>HR Admin</strong> accounts.
                   </p>
-                  <div className="pt-2 text-xs text-slate-700">
-                    Current Offer Pipeline Status:{' '}
-                    <strong className="uppercase font-mono">{candidate.offerStatus.replace('_', ' ')}</strong>
-                  </div>
+                  {candidate.offer ? (
+                    <div className="pt-2 border-t border-[#E2E8F0] text-xs text-[#334155] space-y-1">
+                      <div>
+                        Offer Status: <strong>{candidate.offer.status}</strong>
+                      </div>
+                      <div>Start Date: {candidate.offer.start_date}</div>
+                      <div>Response Deadline: {candidate.offer.deadline_date}</div>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-[#64748B]">No employment offer has been issued yet.</p>
+                  )}
                 </div>
               ) : (
                 <>
-                  {/* Stage 13 MYR Offer Builder */}
-                  <div className="pb-5 border-b border-slate-200 space-y-4 no-print">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
+                  {/* Offer Builder / Revision Form */}
+                  <form
+                    onSubmit={handleSendOffer}
+                    className="border border-[#E2E8F0] rounded-lg p-4 space-y-4 bg-white"
+                  >
+                    <div className="flex items-center justify-between">
                       <div>
-                        <h3 className="font-display text-sm font-bold text-slate-900">
-                          Stage 13 · Generate & Send Employment Offer (MYR)
+                        <h3 className="text-sm font-bold text-[#0F172A]">
+                          Stage 13 · Malaysian Employment Offer Builder (MYR)
                         </h3>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          Compensation is stored in a PDPA-isolated Firestore subcollection accessible only to HR Admins.
+                        <p className="text-xs text-[#64748B]">
+                          Issuing an offer stores the record in SQLite, attaches the PDF to local storage, and emails the candidate portal link.
                         </p>
                       </div>
-                      {comp && (
+                      {candidate.offer && (
                         <button
                           type="button"
-                          onClick={() => setShowOfferLetterPreview((v) => !v)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md cursor-pointer"
+                          onClick={handlePrintOfferLetter}
+                          className="inline-flex items-center gap-1 rounded-md border border-[#CBD5E1] px-2.5 py-1.5 text-xs font-medium text-[#334155] hover:bg-[#F8FAFC]"
                         >
-                          <Printer className="w-3.5 h-3.5" />
-                          <span>{showOfferLetterPreview ? 'Hide Offer Letter' : 'Preview / Print Offer Letter PDF'}</span>
+                          <Printer className="h-3.5 w-3.5" />
+                          Print Offer
                         </button>
                       )}
                     </div>
 
-                    <div className="grid sm:grid-cols-2 gap-3 text-xs">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                       <div>
-                        <label className="block font-medium text-slate-700 mb-1">Offered Position</label>
-                        <input
-                          type="text"
-                          value={positionOffered}
-                          onChange={(e) => setPositionOffered(e.target.value)}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-medium text-slate-700 mb-1">Department</label>
-                        <input
-                          type="text"
-                          value={departmentOffered}
-                          onChange={(e) => setDepartmentOffered(e.target.value)}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-medium text-slate-700 mb-1">Monthly Base Salary (MYR)</label>
+                        <label className="block text-xs font-semibold text-[#334155] mb-1">
+                          Monthly Basic Salary (RM)
+                        </label>
                         <input
                           type="number"
-                          min={0}
+                          required
+                          min={1500}
                           step={100}
-                          value={monthlySalaryMYR}
-                          onChange={(e) => setMonthlySalaryMYR(Number(e.target.value))}
-                          className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                          value={offerSalary}
+                          onChange={(e) => setOfferSalary(Number(e.target.value))}
+                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
                         />
                       </div>
                       <div>
-                        <label className="block font-medium text-slate-700 mb-1">Monthly Fixed Allowance (MYR)</label>
+                        <label className="block text-xs font-semibold text-[#334155] mb-1">
+                          Monthly Allowance (RM)
+                        </label>
                         <input
                           type="number"
                           min={0}
                           step={50}
-                          value={allowanceMYR}
-                          onChange={(e) => setAllowanceMYR(Number(e.target.value))}
-                          className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                          value={offerAllowance}
+                          onChange={(e) => setOfferAllowance(Number(e.target.value))}
+                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
                         />
                       </div>
                       <div>
-                        <label className="block font-medium text-slate-700 mb-1">Proposed Start Date</label>
-                        <input
-                          type="date"
-                          value={startDate}
-                          onChange={(e) => setStartDate(e.target.value)}
-                          className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-medium text-slate-700 mb-1">Offer Response Deadline</label>
-                        <input
-                          type="date"
-                          value={offerDeadline}
-                          onChange={(e) => setOfferDeadline(e.target.value)}
-                          className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-medium text-slate-700 mb-1">Probation Period (Months)</label>
+                        <label className="block text-xs font-semibold text-[#334155] mb-1">
+                          Probation (Months)
+                        </label>
                         <input
                           type="number"
-                          min={0}
-                          max={24}
-                          value={probationMonths}
-                          onChange={(e) => setProbationMonths(Number(e.target.value))}
-                          className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                          min={1}
+                          max={12}
+                          value={offerProbation}
+                          onChange={(e) => setOfferProbation(Number(e.target.value))}
+                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A]"
                         />
                       </div>
-                      <div className="flex items-end pb-2">
-                        <div className="text-xs text-slate-600">
-                          Total Monthly Package:{' '}
-                          <strong className="font-mono tabular-nums text-slate-900 text-sm">
-                            {formatMYR(monthlySalaryMYR + allowanceMYR)}
-                          </strong>
-                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-semibold text-[#334155] mb-1">
+                          Commencement Date
+                        </label>
+                        <input
+                          type="date"
+                          required
+                          value={offerStartDate}
+                          onChange={(e) => setOfferStartDate(e.target.value)}
+                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-[#334155] mb-1">
+                          Offer Acceptance Deadline
+                        </label>
+                        <input
+                          type="date"
+                          required
+                          value={offerDeadline}
+                          onChange={(e) => setOfferDeadline(e.target.value)}
+                          className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
+                        />
                       </div>
                     </div>
 
                     <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Offer Terms & Statutory Malaysian Benefits (EPF / SOCSO / EIS)
+                      <label className="block text-xs font-semibold text-[#334155] mb-1">
+                        Statutory &amp; Benefits Terms Summary
                       </label>
                       <textarea
                         rows={2}
-                        value={offerTermsSummary}
-                        onChange={(e) => setOfferTermsSummary(e.target.value)}
-                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                        value={offerTerms}
+                        onChange={(e) => setOfferTerms(e.target.value)}
+                        className="w-full rounded-md border border-[#CBD5E1] px-3 py-2 text-xs text-[#0F172A]"
                       />
                     </div>
 
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleSendOffer}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md cursor-pointer"
-                    >
-                      <Send className="w-3.5 h-3.5" />
-                      <span>{busy ? 'Dispatching Offer...' : comp ? 'Update & Re-Send Employment Offer' : 'Generate & Send Employment Offer'}</span>
-                    </button>
-                  </div>
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-[#CBD5E1] bg-[#F8FAFC] px-3 py-2 text-xs font-medium text-[#334155] hover:bg-[#F1F5F9]">
+                        <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
+                        {offerLetterFile
+                          ? `Attached: ${offerLetterFile.name}`
+                          : candidate.offer?.offer_letter_path
+                          ? 'Replace Offer Letter PDF'
+                          : 'Attach Official Offer Letter (PDF)'}
+                        <input
+                          type="file"
+                          accept=".pdf,.doc,.docx"
+                          className="hidden"
+                          onChange={(e) => setOfferLetterFile(e.target.files?.[0] || null)}
+                        />
+                      </label>
 
-                  {/* Printable Official Offer Letter Preview */}
-                  {showOfferLetterPreview && comp && (
-                    <div className="p-8 bg-white border border-slate-300 rounded-md space-y-4 text-xs text-slate-800">
-                      <div className="flex items-start justify-between border-b border-slate-200 pb-4">
+                      <button
+                        type="submit"
+                        disabled={busy}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        {candidate.offer ? 'Update & Re-Send Offer' : 'Issue Employment Offer'}
+                      </button>
+                    </div>
+                  </form>
+
+                  {/* Stage 14-15 Offer Tracking */}
+                  {candidate.offer && (
+                    <div className="border border-[#E2E8F0] rounded-lg p-4 bg-[#FAFBFC] space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
-                          <div className="font-display text-lg font-bold text-slate-900">TalentFlow MY Sdn Bhd</div>
-                          <div className="text-slate-500">Private & Confidential — Letter of Employment Offer</div>
+                          <h3 className="text-sm font-bold text-[#0F172A]">
+                            Stage 14–15 · Offer Response Tracking
+                          </h3>
+                          <p className="text-xs text-[#64748B]">
+                            Package: <strong className="text-[#0F172A]">{formatMYR(candidate.offer.salary_myr)}</strong> basic +{' '}
+                            {formatMYR(candidate.offer.allowance_myr)} allowance · Start {candidate.offer.start_date}
+                          </p>
                         </div>
-                        <div className="text-right font-mono tabular-nums text-slate-500">
-                          <div>Ref: {comp.offerLetterRef}</div>
-                          <div>Deadline: {comp.offerDeadline}</div>
+                        <span className="font-mono text-xs font-bold text-[#0F766E]">
+                          {candidate.offer.status}
+                        </span>
+                      </div>
+
+                      {candidate.offer.offer_letter_path && (
+                        <div className="text-xs">
+                          <a
+                            href={getProtectedFileUrl(candidate.offer.offer_letter_path)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 font-semibold text-[#0F766E] hover:underline"
+                          >
+                            <FileText className="h-3.5 w-3.5" />
+                            Download Attached Offer Letter
+                          </a>
                         </div>
-                      </div>
-                      <p>Dear <strong>{candidate.fullName}</strong>,</p>
-                      <p className="leading-relaxed">
-                        We are pleased to offer you the position of <strong>{comp.positionOffered}</strong> in the{' '}
-                        <strong>{comp.departmentOffered}</strong> department, commencing on{' '}
-                        <strong className="font-mono">{comp.startDate}</strong>.
-                      </p>
-                      <div className="grid grid-cols-2 gap-3 py-3 border-y border-slate-200 font-mono tabular-nums">
-                        <div>Basic Monthly Salary: <strong>{formatMYR(comp.monthlySalaryMYR)}</strong></div>
-                        <div>Fixed Allowance: <strong>{formatMYR(comp.allowanceMYR)}</strong></div>
-                        <div>Total Monthly Package: <strong>{formatMYR(comp.monthlySalaryMYR + comp.allowanceMYR)}</strong></div>
-                        <div>Probation Period: <strong>{comp.probationMonths} months</strong></div>
-                      </div>
-                      <p className="leading-relaxed">{comp.offerTermsSummary}</p>
-                      <div className="pt-2 flex justify-end no-print">
-                        <button
-                          type="button"
-                          onClick={() => window.print()}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded cursor-pointer"
-                        >
-                          <Printer className="w-3.5 h-3.5" />
-                          <span>Print / Save as PDF</span>
-                        </button>
+                      )}
+
+                      <input
+                        type="text"
+                        value={offerResponseNote}
+                        onChange={(e) => setOfferResponseNote(e.target.value)}
+                        placeholder="Candidate response note (e.g., Signed offer received, notice period buyout)..."
+                        className="w-full rounded-md border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A]"
+                      />
+
+                      <div className="flex flex-wrap gap-2">
+                        {(
+                          ['Pending Response', 'Accepted', 'Rejected', 'Expired'] as OfferStatus[]
+                        ).map((st) => (
+                          <button
+                            key={st}
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handleUpdateOfferStatus(st)}
+                            className={`rounded-md px-3 py-1.5 text-xs font-semibold border transition-colors ${
+                              candidate.offer?.status === st
+                                ? 'border-[#0F766E] bg-[#0F766E] text-white'
+                                : st === 'Accepted'
+                                ? 'border-[#BBF7D0] bg-white text-[#15803D] hover:bg-[#F0FDF4]'
+                                : st === 'Rejected' || st === 'Expired'
+                                ? 'border-[#FECACA] bg-white text-[#DC2626] hover:bg-[#FEF2F2]'
+                                : 'border-[#CBD5E1] bg-white text-[#334155] hover:bg-[#F8FAFC]'
+                            }`}
+                          >
+                            Mark {st}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   )}
-
-                  {/* Stage 14-15 Track Offer Response & Final Status */}
-                  <div className="space-y-3 no-print">
-                    <h3 className="font-display text-sm font-bold text-slate-900">
-                      Stages 14–15 · Track Offer Response & Record Final Status
-                    </h3>
-                    <div className="flex flex-wrap gap-2">
-                      {(
-                        [
-                          { v: 'offer_sent', l: 'Offer Sent' },
-                          { v: 'pending_response', l: 'Pending Response' },
-                          { v: 'accepted', l: 'Accepted (Stage 15)' },
-                          { v: 'rejected', l: 'Rejected (Stage 15)' },
-                          { v: 'expired', l: 'Expired (Stage 15)' },
-                        ] as { v: OfferStatus; l: string }[]
-                      ).map((st) => (
-                        <button
-                          key={st.v}
-                          type="button"
-                          onClick={() => setOfferStatusInput(st.v)}
-                          className={`px-3 py-1.5 text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
-                            offerStatusInput === st.v
-                              ? st.v === 'accepted'
-                                ? 'bg-emerald-700 text-white border-emerald-700'
-                                : st.v === 'rejected' || st.v === 'expired'
-                                  ? 'bg-red-700 text-white border-red-700'
-                                  : 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                          }`}
-                        >
-                          {st.l}
-                        </button>
-                      ))}
-                    </div>
-
-                    <input
-                      type="text"
-                      value={offerResponseNote}
-                      onChange={(e) => setOfferResponseNote(e.target.value)}
-                      placeholder="Candidate response remarks / final onboarding notes..."
-                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                    />
-
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleUpdateOfferResponse}
-                      className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md cursor-pointer"
-                    >
-                      {busy ? 'Updating Status...' : 'Record Offer Status'}
-                    </button>
-                  </div>
                 </>
               )}
-            </div>
+            </>
           )}
         </div>
       </div>
     </div>
   );
 };
+
+function buildDocFlags(
+  candidate: CandidateRecord
+): Record<DocType, { completed: boolean; verified: boolean; not_applicable: boolean }> {
+  const types: DocType[] = ['RESUME', 'APP_FORM', 'DISC', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
+  const result = {} as Record<
+    DocType,
+    { completed: boolean; verified: boolean; not_applicable: boolean }
+  >;
+  for (const t of types) {
+    const found = candidate.documents.find((d) => d.doc_type === t);
+    result[t] = {
+      completed: Boolean(found?.completed),
+      verified: Boolean(found?.verified),
+      not_applicable: Boolean(found?.not_applicable),
+    };
+  }
+  return result;
+}

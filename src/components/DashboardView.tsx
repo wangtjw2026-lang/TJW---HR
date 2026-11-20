@@ -10,7 +10,6 @@ import {
 import {
   CandidateRecord,
   InterviewSlot,
-  StaffRole,
   STATUS_META,
   WORKFLOW_STAGES,
 } from '../types/ats';
@@ -19,7 +18,6 @@ import { computeDashboardKPIs, getMissingMandatoryDocs, hasPendingDocs } from '.
 interface DashboardViewProps {
   candidates: CandidateRecord[];
   slots: InterviewSlot[];
-  effectiveRole: StaffRole;
   seeding: boolean;
   onSeedSampleData: () => void;
   onOpenIntake: () => void;
@@ -32,7 +30,6 @@ interface DashboardViewProps {
 export const DashboardView: React.FC<DashboardViewProps> = ({
   candidates,
   slots,
-  effectiveRole,
   seeding,
   onSeedSampleData,
   onOpenIntake,
@@ -64,7 +61,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const stageCounts = useMemo(() => {
     const map = new Map<number, number>();
     for (const c of candidates) {
-      map.set(c.currentStage, (map.get(c.currentStage) ?? 0) + 1);
+      map.set(c.stage, (map.get(c.stage) ?? 0) + 1);
     }
     return WORKFLOW_STAGES.map((s) => ({
       ...s,
@@ -85,7 +82,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   );
 
   const upcomingBookedSlots = useMemo(
-    () => slots.filter((s) => s.status === 'booked').slice(0, 5),
+    () => slots.filter((s) => s.booked_count > 0 && s.status === 'ACTIVE').slice(0, 5),
     [slots]
   );
 
@@ -96,22 +93,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           Ready to launch your Malaysian hiring pipeline
         </h2>
         <p className="text-sm text-slate-600 mt-2 leading-relaxed max-w-2xl">
-          Your Cloud Firestore workspace is connected and protected by PDPA 2010 security rules.
-          Register your first candidate using Gemini AI resume screening, or populate a complete
-          8-candidate Malaysian sample pipeline across Stages 3–15 to explore every workflow milestone.
+          Your self-contained Express + SQLite database is running in WAL mode with local protected document storage.
+          Register your first candidate using server-side Gemini AI resume screening, or populate a complete
+          8-candidate Malaysian sample pipeline across Stages 3–15.
         </p>
 
         <div className="flex flex-wrap items-center gap-3 mt-7">
-          {effectiveRole !== 'hiring_manager' && (
-            <button
-              type="button"
-              onClick={onOpenIntake}
-              className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <UserPlus className="w-4 h-4" />
-              Register First Candidate
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onOpenIntake}
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <UserPlus className="w-4 h-4" />
+            Register First Candidate
+          </button>
           <button
             type="button"
             onClick={onSeedSampleData}
@@ -119,7 +114,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             <Database className="w-4 h-4 text-teal-700" />
-            {seeding ? 'Populating Firestore Workspace...' : 'Load Sample Malaysian Pipeline (8 Candidates)'}
+            {seeding ? 'Populating SQLite Database...' : 'Load Sample Malaysian Pipeline (8 Candidates)'}
           </button>
         </div>
 
@@ -130,11 +125,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div>
             <p className="font-semibold text-slate-900">Stages 5–8 · Forms & Docs</p>
-            <p className="mt-1">Google Apps Script Employment & DISC dispatch, SPM/UEC/Degree/Transcript verification.</p>
+            <p className="mt-1">Google Apps Script Employment & DISC dispatch, SPM/UEC/Degree/Transcript local file vault.</p>
           </div>
           <div>
             <p className="font-semibold text-slate-900">Stages 9–15 · Interview & MYR Offer</p>
-            <p className="mt-1">Atomic Firestore slot locking, panel scorecards, MYR offer builder & candidate acceptance.</p>
+            <p className="mt-1">Atomic SQLite slot transactions, panel scorecards, MYR offer builder & candidate portal.</p>
           </div>
         </div>
       </div>
@@ -143,7 +138,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* All 15 Real-Time Executive KPIs in a clean unified hairline grid (Zero nested card clutter) */}
+      {/* All 15 Real-Time Executive KPIs */}
       <section className="bg-white border border-slate-200 rounded-lg">
         <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
           <div>
@@ -151,7 +146,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Executive Recruitment KPIs
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Real-time metrics across all 15 recruitment milestones synced with Cloud Firestore
+              Real-time metrics across all 15 recruitment milestones stored in SQLite
             </p>
           </div>
           <button
@@ -181,7 +176,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
       {/* Main Split: 15-Stage Pipeline Distribution + Operational Action Queues */}
       <div className="grid lg:grid-cols-12 gap-6 items-start">
-        {/* 15-Stage Workflow Distribution */}
         <section className="lg:col-span-7 bg-white border border-slate-200 rounded-lg">
           <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
             <div>
@@ -229,7 +223,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </section>
 
-        {/* Right Actionable HR Queues */}
         <div className="lg:col-span-5 space-y-6">
           {/* Pending Academic Docs & 48h Reminder Queue */}
           <section className="bg-white border border-slate-200 rounded-lg">
@@ -240,7 +233,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   Stage 5–6 · Pending Forms & Academic Docs
                 </h3>
               </div>
-              {pendingDocsQueue.length > 0 && effectiveRole !== 'hiring_manager' && (
+              {pendingDocsQueue.length > 0 && (
                 <button
                   type="button"
                   disabled={sendingBatchReminders}
@@ -248,7 +241,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 disabled:opacity-50 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
                   <BellRing className="w-3.5 h-3.5" />
-                  <span>{sendingBatchReminders ? 'Sending...' : 'Send 48h Reminders'}</span>
+                  <span>{sendingBatchReminders ? 'Sending...' : 'Send Reminders'}</span>
                 </button>
               )}
             </div>
@@ -269,13 +262,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       className="w-full px-5 py-3.5 text-left hover:bg-slate-50 transition-colors cursor-pointer"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-sm font-semibold text-slate-900 truncate">{c.fullName}</span>
+                        <span className="text-sm font-semibold text-slate-900 truncate">{c.full_name}</span>
                         <span className="font-mono tabular-nums text-xs text-amber-700 shrink-0">
                           {missing.length} missing
                         </span>
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5 truncate">
-                        {c.positionApplied} · {missing.slice(0, 3).join(', ')}
+                        {c.position} · {missing.slice(0, 3).join(', ')}
                         {missing.length > 3 ? ` +${missing.length - 3}` : ''}
                       </div>
                     </button>
@@ -309,14 +302,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     className="w-full px-5 py-3.5 text-left hover:bg-slate-50 transition-colors cursor-pointer flex items-center justify-between gap-3"
                   >
                     <div className="min-w-0">
-                      <div className="text-sm font-semibold text-slate-900 truncate">{c.fullName}</div>
+                      <div className="text-sm font-semibold text-slate-900 truncate">{c.full_name}</div>
                       <div className="text-xs text-slate-500 mt-0.5 truncate">
-                        {c.positionApplied} · {c.source} · {c.applicationDate}
+                        {c.position} · {c.source} · {c.applied_date}
                       </div>
                     </div>
                     <div className="text-right shrink-0">
                       <div className="font-mono tabular-nums text-sm font-semibold text-teal-700">
-                        {c.aiMatchScore}%
+                        {c.ai_score}%
                       </div>
                       <div className="text-[11px] text-slate-400">AI Fit</div>
                     </div>
@@ -336,7 +329,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </h3>
               </div>
               <span className="font-mono tabular-nums text-xs text-slate-500">
-                {upcomingBookedSlots.length} booked
+                {upcomingBookedSlots.length} slot(s)
               </span>
             </div>
             {upcomingBookedSlots.length === 0 ? (
@@ -346,7 +339,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             ) : (
               <div className="divide-y divide-slate-100">
                 {upcomingBookedSlots.map((slot) => {
-                  const cand = candidates.find((c) => c.id === slot.bookedCandidateId);
+                  const activeBooking = slot.bookings.find((b) => b.status === 'CONFIRMED' || b.status === 'COMPLETED');
+                  const cand = activeBooking ? candidates.find((c) => c.id === activeBooking.candidate_id) : undefined;
                   return (
                     <button
                       key={slot.id}
@@ -356,14 +350,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-sm font-semibold text-slate-900 truncate">
-                          {slot.bookedCandidateName}
+                          {activeBooking?.candidate_name || `${slot.booked_count}/${slot.capacity} Booked`}
                         </span>
                         <span className="font-mono tabular-nums text-xs font-medium text-teal-700 shrink-0">
-                          {slot.date} · {slot.startTime}
+                          {slot.date} · {slot.start_time}
                         </span>
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5 truncate">
-                        {slot.mode} · {slot.interviewerName}
+                        {slot.mode} · {slot.interviewer_name}
                         {cand ? ` · ${STATUS_META[cand.status].label}` : ''}
                       </div>
                     </button>

@@ -21,7 +21,7 @@ interface CandidateTableViewProps {
   onSelectCandidate: (candidate: CandidateRecord) => void;
   onExportCsv: (filtered: CandidateRecord[]) => Promise<void>;
   exportingCsv: boolean;
-  effectiveRole: StaffRole;
+  role: StaffRole;
 }
 
 const TONE_CLASS: Record<'neutral' | 'teal' | 'amber' | 'green' | 'red', string> = {
@@ -40,12 +40,12 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
   onSelectCandidate,
   onExportCsv,
   exportingCsv,
-  effectiveRole,
+  role,
 }) => {
   const filtered = useMemo(() => filterCandidates(candidates, filters), [candidates, filters]);
 
   const dynamicPositions = useMemo(() => {
-    const set = new Set<string>([...POSITIONS, ...candidates.map((c) => c.positionApplied)]);
+    const set = new Set<string>([...POSITIONS, ...candidates.map((c) => c.position)]);
     return Array.from(set).sort();
   }, [candidates]);
 
@@ -54,7 +54,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
     return Array.from(set).sort();
   }, [candidates]);
 
-  const canExport = ROLE_META[effectiveRole].canExportCsv;
+  const canExport = ROLE_META[role].canExportCsv;
 
   return (
     <div className="space-y-4">
@@ -67,7 +67,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
               type="text"
               value={filters.search}
               onChange={(e) => onChangeFilters({ ...filters, search: e.target.value })}
-              placeholder="Search name, code, skill, or role..."
+              placeholder="Search name, code, email, skill, or role..."
               className="w-full pl-9 pr-3 py-2 text-sm bg-slate-50 border border-slate-200 rounded-md focus:bg-white focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
             />
           </div>
@@ -94,7 +94,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
               </button>
             ) : (
               <div
-                title="Excel/CSV exports containing candidate PII & MYR salaries require HR Admin role per PDPA policy."
+                title="Excel/CSV exports containing MYR salaries require HR Admin role."
                 className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-500 bg-slate-100 border border-slate-200 rounded-md whitespace-nowrap shrink-0"
               >
                 <Lock className="w-3.5 h-3.5" />
@@ -202,17 +202,20 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
             <select
               value={filters.offerStatus}
               onChange={(e) =>
-                onChangeFilters({ ...filters, offerStatus: e.target.value as '' | OfferStatus })
+                onChangeFilters({
+                  ...filters,
+                  offerStatus: e.target.value as '' | OfferStatus | 'NONE',
+                })
               }
               className="w-full px-2 py-1.5 text-xs bg-white border border-slate-200 rounded focus:outline-none focus:border-teal-700"
             >
               <option value="">All Offers</option>
-              <option value="offer_sent">Offer Sent</option>
-              <option value="pending_response">Pending Response</option>
-              <option value="accepted">Accepted</option>
-              <option value="rejected">Rejected</option>
-              <option value="expired">Expired</option>
-              <option value="none">No Offer Yet</option>
+              <option value="Offer Sent">Offer Sent</option>
+              <option value="Pending Response">Pending Response</option>
+              <option value="Accepted">Accepted</option>
+              <option value="Rejected">Rejected</option>
+              <option value="Expired">Expired</option>
+              <option value="NONE">No Offer Yet</option>
             </select>
           </div>
         </div>
@@ -226,7 +229,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
             <span className="font-mono tabular-nums">{candidates.length}</span> candidates
           </span>
           <span>
-            Active PDPA Visibility: <strong className="text-slate-700">{ROLE_META[effectiveRole].label}</strong>
+            Active Role: <strong className="text-slate-700">{ROLE_META[role].label}</strong>
           </span>
         </div>
 
@@ -252,7 +255,7 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
                 </tr>
               ) : (
                 filtered.map((c) => {
-                  const statusInfo = STATUS_META[c.status];
+                  const statusInfo = STATUS_META[c.status] || { label: c.status, tone: 'neutral' as const };
                   return (
                     <tr
                       key={c.id}
@@ -260,39 +263,39 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
                       className="hover:bg-slate-50/90 transition-colors cursor-pointer"
                     >
                       <td className="py-3 px-4 align-middle">
-                        <div className="font-semibold text-slate-900 text-[13px]">{c.fullName}</div>
+                        <div className="font-semibold text-slate-900 text-[13px]">{c.full_name}</div>
                         <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                          {c.candidateCode} · {c.maskedEmail}
+                          {c.candidate_code} · {c.email}
                         </div>
                       </td>
                       <td className="py-3 px-4 align-middle">
-                        <div className="font-medium text-slate-800">{c.positionApplied}</div>
+                        <div className="font-medium text-slate-800">{c.position}</div>
                         <div className="text-[11px] text-slate-500 mt-0.5">{c.department}</div>
                       </td>
                       <td className="py-3 px-4 align-middle whitespace-nowrap">
                         <div className="text-slate-700 font-medium">{c.source}</div>
                         <div className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
-                          {c.applicationDate}
+                          {c.applied_date}
                         </div>
                       </td>
                       <td className="py-3 px-4 align-middle text-right whitespace-nowrap">
                         <span
                           className={`font-mono tabular-nums font-semibold ${
-                            c.aiMatchScore >= 85
+                            c.ai_score >= 85
                               ? 'text-emerald-700'
-                              : c.aiMatchScore >= 70
+                              : c.ai_score >= 70
                                 ? 'text-teal-700'
                                 : 'text-amber-700'
                           }`}
                         >
-                          {c.aiMatchScore}%
+                          {c.ai_score}%
                         </span>
                       </td>
                       <td className="py-3 px-4 align-middle whitespace-nowrap">
                         <span className="font-mono tabular-nums text-slate-500 mr-1.5">
-                          S{String(c.currentStage).padStart(2, '0')}
+                          S{String(c.stage).padStart(2, '0')}
                         </span>
-                        <span className="font-medium text-slate-800">{getStageTitle(c.currentStage)}</span>
+                        <span className="font-medium text-slate-800">{getStageTitle(c.stage)}</span>
                       </td>
                       <td className="py-3 px-4 align-middle whitespace-nowrap">
                         <span className={`font-medium ${TONE_CLASS[statusInfo.tone]}`}>
@@ -300,13 +303,11 @@ export const CandidateTableView: React.FC<CandidateTableViewProps> = ({
                         </span>
                       </td>
                       <td className="py-3 px-4 align-middle whitespace-nowrap text-slate-600">
-                        {c.offerStatus !== 'none' ? (
-                          <span className="font-medium text-slate-800">
-                            Offer: {c.offerStatus.replace('_', ' ')}
-                          </span>
-                        ) : c.interviewDate ? (
+                        {c.offer ? (
+                          <span className="font-medium text-slate-800">Offer: {c.offer.status}</span>
+                        ) : c.active_booking ? (
                           <span className="font-mono tabular-nums">
-                            {c.interviewDate} · {c.interviewTime}
+                            {c.active_booking.date} · {c.active_booking.start_time}
                           </span>
                         ) : (
                           <span className="text-slate-400">—</span>
