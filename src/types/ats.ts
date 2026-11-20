@@ -177,19 +177,27 @@ export interface AuditLogRecord {
 }
 
 export interface ParsedResumeResult {
-  fullName: string;
+  full_name: string;
   email: string;
   phone: string;
   location: string;
-  educationSummary: string;
-  experienceSummary: string;
-  yearsExperience: number;
+  education: string;
+  experience: string;
   skills: string[];
-  aiMatchScore: number;
-  aiSummary: string;
-  detectedSpmMention: boolean;
-  detectedUecMention: boolean;
-  detectedDegreeMention: boolean;
+  ai_score: number;
+  ai_summary: string;
+  years_experience?: number;
+  detected_uec_mention?: boolean;
+  // Defensive optional aliases
+  fullName?: string;
+  name?: string;
+  contact_number?: string;
+  educationSummary?: string;
+  experienceSummary?: string;
+  yearsExperience?: number;
+  aiMatchScore?: number;
+  aiSummary?: string;
+  detectedUecMention?: boolean;
 }
 
 export interface CandidateFilters {

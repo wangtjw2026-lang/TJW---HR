@@ -37,7 +37,12 @@ export function setStoredToken(token: string | null): void {
   }
 }
 
-async function apiFetch<T>(url: string, options: RequestInit = {}, auth = true): Promise<T> {
+async function apiFetch<T>(
+  url: string,
+  options: RequestInit = {},
+  auth = true,
+  timeoutMs?: number
+): Promise<T> {
   const headers = new Headers(options.headers || {});
   if (auth) {
     const token = getStoredToken();
@@ -49,27 +54,47 @@ async function apiFetch<T>(url: string, options: RequestInit = {}, auth = true):
     headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(url, { ...options, headers });
-  const text = await res.text();
-  let data: unknown = {};
+  let controller: AbortController | null = null;
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs && timeoutMs > 0 && !options.signal) {
+    controller = new AbortController();
+    timerId = setTimeout(() => controller?.abort(), timeoutMs);
+  }
+
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { error: text || `HTTP ${res.status}` };
-  }
-
-  if (!res.ok) {
-    const errMsg =
-      typeof data === 'object' && data !== null && 'error' in data
-        ? String((data as { error: unknown }).error)
-        : `Request failed with status ${res.status}`;
-    if (res.status === 401 && auth) {
-      setStoredToken(null);
+    const res = await fetch(url, {
+      ...options,
+      headers,
+      signal: options.signal ?? controller?.signal,
+    });
+    const text = await res.text();
+    let data: unknown = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { error: text || `HTTP ${res.status}` };
     }
-    throw new Error(errMsg);
-  }
 
-  return data as T;
+    if (!res.ok) {
+      const errMsg =
+        typeof data === 'object' && data !== null && 'error' in data
+          ? String((data as { error: unknown }).error)
+          : `Request failed with status ${res.status}`;
+      if (res.status === 401 && auth) {
+        setStoredToken(null);
+      }
+      throw new Error(errMsg);
+    }
+
+    return data as T;
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('Request timed out while waiting for the server. Please try again.');
+    }
+    throw err;
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
 }
 
 export function getProtectedFileUrl(filename: string, portalToken?: string): string {
@@ -163,18 +188,50 @@ export async function deleteStaffUser(id: number): Promise<void> {
 // GEMINI AI RESUME PARSER
 // =============================================================================
 export async function parseResumeWithAi(payload: {
+  file?: File | null;
   resumeText?: string;
-  fileBase64?: string;
-  fileMimeType?: string;
-  fileName?: string;
-  positionApplied: string;
-  department: string;
-  jobRequirements?: string;
+  position: string;
+  department?: string;
+  rubric?: string;
 }): Promise<ParsedResumeResult> {
-  return apiFetch<ParsedResumeResult>('/api/ai/parse-resume', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+  if (payload.file) {
+    const form = new FormData();
+    form.append('file', payload.file);
+    if (payload.resumeText?.trim()) {
+      form.append('resumeText', payload.resumeText.trim());
+    }
+    form.append('position', payload.position);
+    if (payload.department) {
+      form.append('department', payload.department);
+    }
+    if (payload.rubric?.trim()) {
+      form.append('rubric', payload.rubric.trim());
+    }
+    return apiFetch<ParsedResumeResult>(
+      '/api/ai/parse-resume',
+      {
+        method: 'POST',
+        body: form,
+      },
+      true,
+      65_000
+    );
+  }
+
+  return apiFetch<ParsedResumeResult>(
+    '/api/ai/parse-resume',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        resumeText: payload.resumeText?.trim() || '',
+        position: payload.position,
+        department: payload.department || '',
+        rubric: payload.rubric?.trim() || '',
+      }),
+    },
+    true,
+    65_000
+  );
 }
 
 // =============================================================================
