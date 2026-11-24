@@ -44,6 +44,7 @@ import {
   CandidateRecord,
   DEPARTMENTS,
   EmailLogRecord,
+  PublicPortalUrlStatus,
   ROLE_META,
   SmtpConfigStatus,
   StaffRole,
@@ -167,6 +168,7 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [smtpStatus, setSmtpStatus] = useState<SmtpConfigStatus | null>(null);
+  const [portalUrlStatus, setPortalUrlStatus] = useState<PublicPortalUrlStatus | null>(null);
   const [verifyingSmtp, setVerifyingSmtp] = useState(false);
   const [smtpCheckBanner, setSmtpCheckBanner] = useState<{
     ok: boolean;
@@ -252,7 +254,10 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
     let active = true;
     void fetchEmailLogsWithStatus()
       .then((res) => {
-        if (active) setSmtpStatus(res.smtpStatus);
+        if (active) {
+          setSmtpStatus(res.smtpStatus);
+          setPortalUrlStatus(res.portalUrlStatus);
+        }
       })
       .catch(() => {
         // Ignore non-critical status load error
@@ -526,6 +531,33 @@ export const CommunicationsAndAuditView: React.FC<CommunicationsAndAuditViewProp
             </div>
           </div>
         )}
+
+        {/* Outbound Candidate Portal URL Warning Banner (PUBLIC_APP_URL unset or private ais-dev- preview) */}
+        {portalUrlStatus &&
+          (!portalUrlStatus.configured ||
+            portalUrlStatus.isPrivatePreview ||
+            /ais-dev-/i.test(portalUrlStatus.publicAppUrl || portalUrlStatus.effectiveBaseUrl)) && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-[#F59E0B] bg-[#FFFBEB] px-4 py-3 text-xs text-[#92400E]">
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-[#D97706]" />
+              <div className="min-w-0 space-y-1">
+                <p className="font-semibold text-[#78350F]">
+                  {!portalUrlStatus.configured
+                    ? 'PUBLIC_APP_URL is not configured — external candidates cannot open private AI Studio preview links'
+                    : 'PUBLIC_APP_URL points to a private AI Studio preview host (ais-dev-) — external candidates cannot open it'}
+                </p>
+                <p className="leading-relaxed text-[#92400E]">
+                  Outbound Candidate Self-Service Portal links in emails and WhatsApp messages currently resolve to{' '}
+                  <span className="rounded bg-[#FEF3C7] px-1.5 py-0.5 font-mono text-[11px] font-medium text-[#78350F]">
+                    {portalUrlStatus.effectiveBaseUrl}
+                  </span>
+                  . Private AI Studio preview links (<span className="font-mono">ais-dev-</span>) require your Google
+                  session and cannot be opened by external candidates. Set{' '}
+                  <span className="font-mono font-semibold">PUBLIC_APP_URL</span> in your environment configuration to
+                  your publicly shared app URL before sending candidate invitations.
+                </p>
+              </div>
+            </div>
+          )}
 
         {smtpCheckBanner && (
           <div

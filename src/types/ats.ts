@@ -247,6 +247,7 @@ export interface CandidateRecord {
   post_interview_decision: PostInterviewDecision;
   final_decision_notes: string;
   portal_token: string;
+  portal_url?: string;
   created_at: string;
   updated_at: string;
   documents: CandidateDocument[];
@@ -295,6 +296,14 @@ export interface SmtpConfigStatus {
   from: string;
   userMasked: string;
   reason?: string;
+}
+
+export interface PublicPortalUrlStatus {
+  configured: boolean;
+  publicAppUrl: string;
+  effectiveBaseUrl: string;
+  isPrivatePreview: boolean;
+  warning: string;
 }
 
 export interface EmailDeliveryResult {

@@ -13,10 +13,12 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   db,
   ensureCandidateDocumentRows,
+  ensureDirectories,
   formatAuditTimestamp,
   generateCandidateCode,
   generatePortalToken,
   getMalaysiaDateStamp,
+  initializeDatabase,
   UPLOADS_ROOT,
 } from './src/db/database.ts';
 
@@ -115,32 +117,295 @@ interface AuthedRequest extends Request {
 }
 
 // =============================================================================
-// MULTER LOCAL DISK FILE STORAGE (uploads/)
+// UNIFIED FILE STORAGE ADAPTER (Google Drive Webhook + Local uploads/ Fallback)
 // =============================================================================
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOADS_ROOT);
-  },
-  filename: (_req, file, cb) => {
-    const safeExt = path.extname(file.originalname).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10);
-    const safeBase = path
-      .basename(file.originalname, path.extname(file.originalname))
-      .replace(/[^a-zA-Z0-9_-]/g, '_')
-      .slice(0, 48);
-    const unique = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    cb(null, `${unique}_${safeBase || 'file'}${safeExt}`);
-  },
-});
+function cleanEnvValue(val: unknown): string {
+  return String(val ?? '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
 
 const upload = multer({
-  storage,
-  limits: { fileSize: 15 * 1024 * 1024 },
-});
-
-const memoryUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 },
 });
+
+const memoryUpload = upload;
+
+const GDRIVE_PREFIX = 'gdrive://';
+const VALID_GDRIVE_FILE_ID = /^[a-zA-Z0-9_-]{3,160}$/;
+
+function getGoogleDriveWebhookUrl(): string {
+  const raw = cleanEnvValue(process.env.GOOGLE_DRIVE_WEBHOOK_URL);
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:') {
+      console.warn('[Storage] Ignoring GOOGLE_DRIVE_WEBHOOK_URL because it must use https://.');
+      return '';
+    }
+    return parsed.toString();
+  } catch {
+    console.warn('[Storage] Ignoring invalid GOOGLE_DRIVE_WEBHOOK_URL.');
+    return '';
+  }
+}
+
+function isGoogleDriveStorageEnabled(): boolean {
+  return Boolean(getGoogleDriveWebhookUrl());
+}
+
+function isGoogleDriveRef(fileRef: string): boolean {
+  return String(fileRef || '').trim().startsWith(GDRIVE_PREFIX);
+}
+
+function extractGoogleDriveFileId(fileRef: string): string | null {
+  const trimmed = String(fileRef || '').trim();
+  if (!trimmed.startsWith(GDRIVE_PREFIX)) return null;
+  const fileId = trimmed.slice(GDRIVE_PREFIX.length).trim();
+  if (!VALID_GDRIVE_FILE_ID.test(fileId)) return null;
+  return fileId;
+}
+
+function normalizeStoredFileRef(rawRef: string): string {
+  const trimmed = String(rawRef || '').trim();
+  if (!trimmed) return '';
+  if (isGoogleDriveRef(trimmed)) return trimmed;
+  return path.basename(trimmed);
+}
+
+function buildUniqueLocalFileName(originalName: string): string {
+  const safeExt = path.extname(originalName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10);
+  const safeBase = path
+    .basename(originalName, path.extname(originalName))
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 48);
+  const unique = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${unique}_${safeBase || 'file'}${safeExt}`;
+}
+
+function resolveConfinedLocalPath(fileName: string): string | null {
+  const safeName = path.basename(String(fileName || '').trim());
+  if (!safeName || safeName === '.' || safeName === '..') return null;
+  const baseDir = path.resolve(UPLOADS_ROOT);
+  const resolved = path.resolve(baseDir, safeName);
+  if (!resolved.startsWith(baseDir + path.sep)) return null;
+  return resolved;
+}
+
+function sanitizeDownloadMimeType(rawMime: string, fallbackFileName = ''): string {
+  const inferred = inferResumeMimeType(rawMime, fallbackFileName);
+  const cleaned = String(inferred || rawMime || '').toLowerCase().split(';')[0].trim();
+  if (/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(cleaned)) {
+    return cleaned;
+  }
+  return 'application/octet-stream';
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 30_000): Promise<globalThis.Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function saveUploadedFile(file: {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+}): Promise<{ filePath: string; fileName: string; storage: 'gdrive' | 'local' }> {
+  const originalName = String(file.originalname || 'document').trim() || 'document';
+  const resolvedMime = sanitizeDownloadMimeType(file.mimetype, originalName);
+  const webhookUrl = getGoogleDriveWebhookUrl();
+
+  if (webhookUrl) {
+    const base64Data = file.buffer.toString('base64');
+    const resp = await fetchWithTimeout(
+      webhookUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName: originalName,
+          mimeType: resolvedMime,
+          base64Data,
+        }),
+      },
+      35_000
+    );
+
+    const rawBody = await resp.text();
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+
+    if (!resp.ok) {
+      throw new Error(
+        `Google Drive upload failed (HTTP ${resp.status}): ${String(parsed.error || rawBody.slice(0, 180) || 'Webhook error')}`
+      );
+    }
+
+    const nestedData =
+      parsed.data && typeof parsed.data === 'object' ? (parsed.data as Record<string, unknown>) : undefined;
+    const rawFileId = String(
+      parsed.fileId ?? parsed.id ?? nestedData?.fileId ?? nestedData?.id ?? ''
+    ).trim();
+
+    if (!rawFileId || !VALID_GDRIVE_FILE_ID.test(rawFileId)) {
+      throw new Error(
+        `Google Drive webhook did not return a valid fileId.${parsed.error ? ` Error: ${String(parsed.error)}` : ''}`
+      );
+    }
+
+    return {
+      filePath: `${GDRIVE_PREFIX}${rawFileId}`,
+      fileName: originalName,
+      storage: 'gdrive',
+    };
+  }
+
+  ensureDirectories();
+  const uniqueName = buildUniqueLocalFileName(originalName);
+  const diskPath = resolveConfinedLocalPath(uniqueName);
+  if (!diskPath) {
+    throw new Error('Failed to resolve safe local upload path.');
+  }
+  await fs.promises.writeFile(diskPath, file.buffer);
+  return {
+    filePath: uniqueName,
+    fileName: originalName,
+    storage: 'local',
+  };
+}
+
+async function readStoredFile(
+  fileRef: string,
+  fallbackFileName = ''
+): Promise<{ buffer: Buffer; mimeType: string; fileName: string } | null> {
+  const normalized = normalizeStoredFileRef(fileRef);
+  if (!normalized) return null;
+
+  if (isGoogleDriveRef(normalized)) {
+    const fileId = extractGoogleDriveFileId(normalized);
+    if (!fileId) return null;
+    const webhookUrl = getGoogleDriveWebhookUrl();
+    if (!webhookUrl) {
+      throw new Error(
+        'GOOGLE_DRIVE_WEBHOOK_URL is not configured on the server, so Google Drive files cannot be retrieved.'
+      );
+    }
+
+    const targetUrl = new URL(webhookUrl);
+    targetUrl.searchParams.set('fileId', fileId);
+
+    const resp = await fetchWithTimeout(targetUrl.toString(), { method: 'GET' }, 35_000);
+    if (resp.status === 404) return null;
+
+    const rawBody = await resp.text();
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+
+    if (!resp.ok) {
+      throw new Error(
+        `Google Drive fetch failed (HTTP ${resp.status}): ${String(parsed.error || rawBody.slice(0, 180) || 'Webhook error')}`
+      );
+    }
+
+    const nestedData =
+      parsed.data && typeof parsed.data === 'object' ? (parsed.data as Record<string, unknown>) : undefined;
+    const rawBase64 = String(
+      parsed.base64Data ?? parsed.dataBase64 ?? nestedData?.base64Data ?? ''
+    ).trim();
+    if (!rawBase64) {
+      return null;
+    }
+
+    const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
+    const fileName = String(parsed.fileName ?? nestedData?.fileName ?? fallbackFileName ?? fileId).trim() || fileId;
+    const rawMime = String(parsed.mimeType ?? nestedData?.mimeType ?? '').trim();
+    const mimeType = sanitizeDownloadMimeType(rawMime, fileName);
+
+    return {
+      buffer: Buffer.from(cleanBase64, 'base64'),
+      mimeType,
+      fileName,
+    };
+  }
+
+  const diskPath = resolveConfinedLocalPath(normalized);
+  if (!diskPath) return null;
+  try {
+    const stat = await fs.promises.stat(diskPath);
+    if (!stat.isFile()) return null;
+    const buffer = await fs.promises.readFile(diskPath);
+    const fileName = fallbackFileName || path.basename(diskPath);
+    return {
+      buffer,
+      mimeType: sanitizeDownloadMimeType('', fileName),
+      fileName,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function deleteStoredFile(fileRef: string): Promise<boolean> {
+  const normalized = normalizeStoredFileRef(fileRef);
+  if (!normalized) return false;
+
+  if (isGoogleDriveRef(normalized)) {
+    const fileId = extractGoogleDriveFileId(normalized);
+    const webhookUrl = getGoogleDriveWebhookUrl();
+    if (!fileId || !webhookUrl) return false;
+
+    const targetUrl = new URL(webhookUrl);
+    targetUrl.searchParams.set('action', 'delete');
+    targetUrl.searchParams.set('fileId', fileId);
+
+    try {
+      const resp = await fetchWithTimeout(targetUrl.toString(), { method: 'GET' }, 20_000);
+      return resp.ok;
+    } catch (err) {
+      console.warn(`[Storage] Failed to trash Google Drive file ${fileId}:`, err);
+      return false;
+    }
+  }
+
+  const diskPath = resolveConfinedLocalPath(normalized);
+  if (!diskPath) return false;
+  try {
+    const stat = await fs.promises.stat(diskPath);
+    if (stat.isFile()) {
+      await fs.promises.unlink(diskPath);
+      return true;
+    }
+  } catch {
+    // ignore missing file
+  }
+  return false;
+}
+
+function asyncHandler<TReq extends Request = Request>(
+  fn: (req: TReq, res: Response, next: NextFunction) => Promise<void> | void
+) {
+  return (req: TReq, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
 
 // =============================================================================
 // LIVE GMAIL / SMTP EMAIL AUTOMATION (Nodemailer + SQLite email_logs)
@@ -164,12 +429,6 @@ interface EmailDeliveryResult {
   recipient_email: string;
   subject: string;
   template_type: string;
-}
-
-function cleanEnvValue(val: unknown): string {
-  return String(val ?? '')
-    .replace(/^["']|["']$/g, '')
-    .trim();
 }
 
 function maskEmailUser(email: string): string {
@@ -339,7 +598,7 @@ function formatActorDisplay(actor?: AuthPayload | null, fallbackName?: string): 
   return String(fallbackName || 'System').trim() || 'System';
 }
 
-function logAudit(params: {
+async function logAudit(params: {
   req?: Request;
   actor?: AuthPayload | null;
   actorId?: number | null;
@@ -349,14 +608,14 @@ function logAudit(params: {
   actionTaken: string;
   targetEntity?: string;
   details: string;
-}) {
+}): Promise<void> {
   const { ipAddress, userAgent } = extractClientContext(params.req);
   const timestamp = formatAuditTimestamp(new Date());
   const actorId = params.actor?.id ?? params.actorId ?? null;
   const actorName = formatActorDisplay(params.actor, params.actorName);
   const actorRole: AuditActorRole = params.actor?.role ?? params.actorRole ?? 'system';
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO audit_logs (
       timestamp, actor_id, actor_name, actor_role, page_visited,
       action_taken, target_entity, details, ip_address, user_agent
@@ -485,7 +744,7 @@ async function dispatchEmail(params: {
     );
   }
 
-  const insertInfo = db.prepare(`
+  const insertInfo = await db.prepare(`
     INSERT INTO email_logs (
       candidate_id, candidate_name, recipient_email, template_type,
       subject, body_preview, stage_triggered, delivery_status, smtp_error, message_id, triggered_by
@@ -507,7 +766,7 @@ async function dispatchEmail(params: {
   const logId = Number(insertInfo.lastInsertRowid);
 
   if (!params.skipAuditLog) {
-    logAudit({
+    await logAudit({
       req: params.req,
       actor: params.actor,
       actorName: params.actorName || params.triggeredBy,
@@ -535,11 +794,39 @@ async function dispatchEmail(params: {
   };
 }
 
+function getConfiguredPublicAppUrl(): string {
+  return cleanEnvValue(process.env.PUBLIC_APP_URL).replace(/\/+$/, '');
+}
+
 function getAppBaseUrl(req: Request): string {
-  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, '');
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`;
-  return `${proto}://${host}`;
+  const configuredPublicUrl = getConfiguredPublicAppUrl();
+  if (configuredPublicUrl) return configuredPublicUrl;
+  const host = req.get('host') || `localhost:${PORT}`;
+  return `${req.protocol}://${host}`.replace(/\/+$/, '');
+}
+
+function getPublicPortalUrlStatus(req: Request) {
+  const publicAppUrl = getConfiguredPublicAppUrl();
+  const effectiveBaseUrl = getAppBaseUrl(req);
+  const containsPrivatePreview =
+    /ais-dev-/i.test(publicAppUrl) || (!publicAppUrl && /ais-dev-/i.test(effectiveBaseUrl));
+
+  let warning = '';
+  if (!publicAppUrl) {
+    warning =
+      'PUBLIC_APP_URL is not configured. Outbound Candidate Self-Service Portal links are falling back to the current server host, and private AI Studio preview links (ais-dev-) cannot be opened by external candidates.';
+  } else if (/ais-dev-/i.test(publicAppUrl)) {
+    warning =
+      'PUBLIC_APP_URL contains a private AI Studio preview host ("ais-dev-"), which cannot be opened by external candidates.';
+  }
+
+  return {
+    configured: Boolean(publicAppUrl),
+    publicAppUrl,
+    effectiveBaseUrl,
+    isPrivatePreview: !publicAppUrl || containsPrivatePreview,
+    warning,
+  };
 }
 
 function normalizePhone(phone: string): string {
@@ -1543,7 +1830,8 @@ async function runAndPersistDocumentExtraction(params: {
   position?: string;
   department?: string;
   docType: ExtractableDocType;
-  filePath: string;
+  filePath?: string;
+  fileBuffer?: Buffer;
   fileName: string;
   mimeType?: string;
   isReanalysis?: boolean;
@@ -1553,15 +1841,23 @@ async function runAndPersistDocumentExtraction(params: {
   modelUsed?: string;
   error?: string;
 }> {
-  const resolvedDiskPath = path.isAbsolute(params.filePath)
-    ? params.filePath
-    : path.join(UPLOADS_ROOT, path.basename(params.filePath));
-
   try {
+    let bufferToScan = params.fileBuffer;
+    let resolvedMime = params.mimeType;
+
+    if ((!bufferToScan || bufferToScan.length === 0) && params.filePath) {
+      const stored = await readStoredFile(params.filePath, params.fileName);
+      if (!stored || stored.buffer.length === 0) {
+        throw new Error(`Stored ${params.docType} file could not be loaded for Gemini AI analysis.`);
+      }
+      bufferToScan = stored.buffer;
+      resolvedMime = resolvedMime || stored.mimeType;
+    }
+
     const result = await extractDocumentWithGemini({
-      filePath: resolvedDiskPath,
+      fileBuffer: bufferToScan,
       fileName: params.fileName,
-      mimeType: params.mimeType,
+      mimeType: resolvedMime,
       docType: params.docType,
       candidateName: params.candidateName,
       position: params.position,
@@ -1575,7 +1871,7 @@ async function runAndPersistDocumentExtraction(params: {
     };
 
     // Never auto-set verified = 1; HR manual sign-off remains required
-    db.prepare(`
+    await db.prepare(`
       UPDATE candidate_documents
       SET ai_extracted_json = ?, ai_verified_status = ?
       WHERE candidate_id = ? AND doc_type = ?
@@ -1584,14 +1880,14 @@ async function runAndPersistDocumentExtraction(params: {
     if (params.docType === 'RESUME') {
       const score = Number(result.data.ai_score || 0);
       const summary = String(result.data.ai_summary || '').trim();
-      const candRow = db
+      const candRow = await db
         .prepare('SELECT ai_score, ai_summary FROM candidates WHERE id = ?')
-        .get(params.candidateId) as { ai_score: number; ai_summary: string } | undefined;
+        .get<{ ai_score: number; ai_summary: string }>(params.candidateId);
       if (
         candRow &&
         (params.isReanalysis || (!candRow.ai_summary && summary) || (candRow.ai_score === 0 && score > 0))
       ) {
-        db.prepare(`
+        await db.prepare(`
           UPDATE candidates
           SET ai_score = ?, ai_summary = ?, updated_at = datetime('now')
           WHERE id = ?
@@ -1600,11 +1896,11 @@ async function runAndPersistDocumentExtraction(params: {
     } else if (params.docType === 'DISC') {
       const extractedDisc = String(result.data.disc_profile_type || '').trim();
       if (extractedDisc) {
-        const candRow = db
+        const candRow = await db
           .prepare('SELECT disc_profile FROM candidates WHERE id = ?')
-          .get(params.candidateId) as { disc_profile: string } | undefined;
+          .get<{ disc_profile: string }>(params.candidateId);
         if (candRow && (!candRow.disc_profile || params.isReanalysis)) {
-          db.prepare(`UPDATE candidates SET disc_profile = ?, updated_at = datetime('now') WHERE id = ?`).run(
+          await db.prepare(`UPDATE candidates SET disc_profile = ?, updated_at = datetime('now') WHERE id = ?`).run(
             extractedDisc,
             params.candidateId
           );
@@ -1618,7 +1914,7 @@ async function runAndPersistDocumentExtraction(params: {
         ? `Job-Fit Score: ${result.data.ai_score ?? 0}%`
         : `Detected: "${detected}", Name Match: ${result.data.name_matches_candidate ? 'YES' : 'NO'}, Status: ${result.status}`;
 
-    logAudit({
+    await logAudit({
       req: params.req,
       actor: params.actor,
       actorName: params.actorName,
@@ -1641,13 +1937,13 @@ async function runAndPersistDocumentExtraction(params: {
       extracted_at: new Date().toISOString(),
     };
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE candidate_documents
       SET ai_extracted_json = ?, ai_verified_status = 'AI_FAILED'
       WHERE candidate_id = ? AND doc_type = ?
     `).run(JSON.stringify(errorPayload), params.candidateId, params.docType);
 
-    logAudit({
+    await logAudit({
       req: params.req,
       actor: params.actor,
       actorName: params.actorName,
@@ -1679,7 +1975,7 @@ interface ActiveSessionRecord {
 const sessionActivityMap = new Map<string, ActiveSessionRecord>();
 const recentIdleAuditByUser = new Map<number, number>();
 
-function registerActiveSession(userId: number): string {
+async function registerActiveSession(userId: number): Promise<string> {
   const sid = crypto.randomBytes(16).toString('hex');
   const now = Date.now();
   sessionActivityMap.set(sid, {
@@ -1688,17 +1984,17 @@ function registerActiveSession(userId: number): string {
     revoked: false,
     idleAuditLogged: false,
   });
-  db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), userId);
+  await db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), userId);
   return sid;
 }
 
-function recordIdleAutoLogoutOnce(params: {
+async function recordIdleAutoLogoutOnce(params: {
   req: Request;
   user: AuthPayload;
   sid?: string;
   pageVisited: string;
   details: string;
-}) {
+}): Promise<void> {
   const now = Date.now();
   if (params.sid) {
     const existing = sessionActivityMap.get(params.sid);
@@ -1715,7 +2011,7 @@ function recordIdleAutoLogoutOnce(params: {
   }
   recentIdleAuditByUser.set(params.user.id, now);
 
-  logAudit({
+  await logAudit({
     req: params.req,
     actor: params.user,
     pageVisited: params.pageVisited,
@@ -1733,11 +2029,11 @@ function verifyJwtToken(token: string): AuthPayload | null {
   }
 }
 
-function validateSessionAndIdle(
+async function validateSessionAndIdle(
   decoded: AuthPayload,
   req: Request,
   touchActivity: boolean
-):
+): Promise<
   | {
       ok: true;
       user: AuthPayload;
@@ -1747,13 +2043,14 @@ function validateSessionAndIdle(
       statusCode: number;
       error: string;
       code?: string;
-    } {
-  const dbUser = db
+    }
+> {
+  const dbUser = await db
     .prepare(
       `SELECT ${PUBLIC_USER_SELECT}, last_active_at, token_version FROM users WHERE id = ?`
     )
-    .get(decoded.id) as
-    | (Record<string, unknown> & {
+    .get<
+      Record<string, unknown> & {
         id: number;
         name: string;
         email: string;
@@ -1762,8 +2059,8 @@ function validateSessionAndIdle(
         status: UserApprovalStatus;
         last_active_at?: string;
         token_version?: number;
-      })
-    | undefined;
+      }
+    >(decoded.id);
 
   if (!dbUser) {
     return { ok: false, statusCode: 401, error: 'Account no longer exists.' };
@@ -1828,7 +2125,7 @@ function validateSessionAndIdle(
   if (lastActiveMs !== null && now - lastActiveMs > IDLE_TIMEOUT_MS) {
     const idleMinutes = Math.floor((now - lastActiveMs) / 60000);
     const pageHeader = String(req.headers['x-page-visited'] || 'Workspace Session').trim();
-    recordIdleAutoLogoutOnce({
+    await recordIdleAutoLogoutOnce({
       req,
       user: serializedUser,
       sid: sid || undefined,
@@ -1852,7 +2149,7 @@ function validateSessionAndIdle(
         idleAuditLogged: false,
       });
     }
-    db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), dbUser.id);
+    await db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(new Date(now).toISOString(), dbUser.id);
   }
 
   return {
@@ -1865,7 +2162,7 @@ function validateSessionAndIdle(
   };
 }
 
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+const requireAuth = asyncHandler<AuthedRequest>(async (req, res, next) => {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) {
@@ -1878,7 +2175,7 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     return;
   }
 
-  const sessionCheck = validateSessionAndIdle(decoded, req, true);
+  const sessionCheck = await validateSessionAndIdle(decoded, req, true);
   if (!sessionCheck.ok) {
     res.status(sessionCheck.statusCode).json({
       error: sessionCheck.error,
@@ -1890,7 +2187,7 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   req.user = sessionCheck.user;
   req.sessionId = sessionCheck.user.sid;
   next();
-}
+});
 
 function requireRole(...allowedRoles: StaffRole[]) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
@@ -1908,26 +2205,35 @@ function requireRole(...allowedRoles: StaffRole[]) {
 // =============================================================================
 // HYDRATION HELPERS
 // =============================================================================
-function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CANDIDATE') {
+async function hydrateCandidate(
+  row: Record<string, unknown>,
+  _role: StaffRole | 'CANDIDATE',
+  req?: Request
+) {
   const candidateId = Number(row.id);
-  const docs = db
-    .prepare('SELECT * FROM candidate_documents WHERE candidate_id = ? ORDER BY id ASC')
-    .all(candidateId) as Array<Record<string, unknown>>;
+  const isCandidatePortal = _role === 'CANDIDATE';
 
-  const bookingRow = db
-    .prepare(`
-      SELECT b.*, s.date, s.start_time, s.end_time, s.location_or_link, s.interviewer_name, s.mode
-      FROM interview_bookings b
-      JOIN interview_slots s ON s.id = b.slot_id
-      WHERE b.candidate_id = ? AND b.status IN ('CONFIRMED', 'COMPLETED')
-      ORDER BY b.id DESC
-      LIMIT 1
-    `)
-    .get(candidateId) as Record<string, unknown> | undefined;
-
-  const offerRow = db
-    .prepare('SELECT * FROM offers WHERE candidate_id = ? LIMIT 1')
-    .get(candidateId) as Record<string, unknown> | undefined;
+  const [docs, bookingRow, offerRow, recentEmails] = await Promise.all([
+    db
+      .prepare('SELECT * FROM candidate_documents WHERE candidate_id = ? ORDER BY id ASC')
+      .all<Record<string, unknown>>(candidateId),
+    db
+      .prepare(`
+        SELECT b.*, s.date, s.start_time, s.end_time, s.location_or_link, s.interviewer_name, s.mode
+        FROM interview_bookings b
+        JOIN interview_slots s ON s.id = b.slot_id
+        WHERE b.candidate_id = ? AND b.status IN ('CONFIRMED', 'COMPLETED')
+        ORDER BY b.id DESC
+        LIMIT 1
+      `)
+      .get<Record<string, unknown>>(candidateId),
+    db.prepare('SELECT * FROM offers WHERE candidate_id = ? LIMIT 1').get<Record<string, unknown>>(candidateId),
+    isCandidatePortal
+      ? Promise.resolve(undefined)
+      : db
+          .prepare('SELECT * FROM email_logs WHERE candidate_id = ? ORDER BY id DESC LIMIT 15')
+          .all<Record<string, unknown>>(candidateId),
+  ]);
 
   let skills: string[] = [];
   try {
@@ -1937,10 +2243,12 @@ function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CAND
     skills = [];
   }
 
-  const isCandidatePortal = _role === 'CANDIDATE';
+  const portalToken = String(row.portal_token || '');
+  const portalUrl = req && portalToken ? `${getAppBaseUrl(req)}/?portal=${portalToken}` : undefined;
 
   return {
     ...row,
+    portal_url: portalUrl,
     skills,
     documents: docs.map((d) => {
       const rawAiJson = String(d.ai_extracted_json || '');
@@ -2023,16 +2331,12 @@ function hydrateCandidate(row: Record<string, unknown>, _role: StaffRole | 'CAND
           created_at: String(offerRow.created_at),
         }
       : null,
-    recent_emails: isCandidatePortal
-      ? undefined
-      : (db
-          .prepare('SELECT * FROM email_logs WHERE candidate_id = ? ORDER BY id DESC LIMIT 15')
-          .all(candidateId) as Array<Record<string, unknown>>),
+    recent_emails: recentEmails,
   };
 }
 
-function hydrateSlot(slot: Record<string, unknown>) {
-  const bookings = db
+async function hydrateSlot(slot: Record<string, unknown>) {
+  const bookings = await db
     .prepare(`
       SELECT b.*, c.full_name as candidate_name, c.position as candidate_position
       FROM interview_bookings b
@@ -2047,7 +2351,7 @@ function hydrateSlot(slot: Record<string, unknown>) {
   };
 }
 
-function getMissingDocsForCandidate(candidateId: number): string[] {
+async function getMissingDocsForCandidate(candidateId: number): Promise<string[]> {
   const labels: Record<string, string> = {
     APPLICATION_FORM: 'Employment Application Form (Upload)',
     DISC: 'DISC Assessment Report / Sheet (Upload)',
@@ -2057,9 +2361,9 @@ function getMissingDocsForCandidate(candidateId: number): string[] {
     DEGREE: 'University Degree Certificate',
     TRANSCRIPT: 'University Academic Transcript',
   };
-  const rows = db
+  const rows = await db
     .prepare(`SELECT doc_type, completed, verified, not_applicable FROM candidate_documents WHERE candidate_id = ? AND doc_type != 'RESUME'`)
-    .all(candidateId) as Array<{ doc_type: string; completed: number; verified: number; not_applicable: number }>;
+    .all<{ doc_type: string; completed: number; verified: number; not_applicable: number }>(candidateId);
 
   const missing: string[] = [];
   for (const r of rows) {
@@ -2071,379 +2375,411 @@ function getMissingDocsForCandidate(candidateId: number): string[] {
   return missing;
 }
 
-// Atomic interview slot booking transaction (prevents double-booking)
-const reserveSlotTransaction = db.transaction((slotId: number, candidateId: number) => {
-  const slot = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as
-    | {
-        id: number;
-        date: string;
-        start_time: string;
-        end_time: string;
-        capacity: number;
-        booked_count: number;
-        location_or_link: string;
-        interviewer_name: string;
-        mode: string;
-        status: string;
-      }
-    | undefined;
+// Atomic interview slot booking transaction (prevents double-booking on both Turso and local SQLite)
+async function reserveSlotTransaction(slotId: number, candidateId: number) {
+  return db.transaction(async (tx) => {
+    const slot = await tx.prepare('SELECT * FROM interview_slots WHERE id = ?').get<{
+      id: number;
+      date: string;
+      start_time: string;
+      end_time: string;
+      capacity: number;
+      booked_count: number;
+      location_or_link: string;
+      interviewer_name: string;
+      mode: string;
+      status: string;
+    }>(slotId);
 
-  if (!slot) {
-    throw new Error('Interview slot not found.');
-  }
-  if (slot.status !== 'ACTIVE') {
-    throw new Error('This interview slot has been cancelled.');
-  }
-  if (slot.booked_count >= slot.capacity) {
-    throw new Error('This interview slot is already full. Atomic locking prevented double-booking.');
-  }
-
-  const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as
-    | { id: number; full_name: string; email: string; position: string; department: string }
-    | undefined;
-  if (!candidate) {
-    throw new Error('Candidate not found.');
-  }
-
-  // If candidate already had an active CONFIRMED booking, release it cleanly in the same transaction
-  const prevBooking = db
-    .prepare(`SELECT * FROM interview_bookings WHERE candidate_id = ? AND status = 'CONFIRMED' LIMIT 1`)
-    .get(candidateId) as { id: number; slot_id: number } | undefined;
-
-  if (prevBooking) {
-    if (prevBooking.slot_id === slotId) {
-      throw new Error('Candidate already holds a confirmed reservation for this slot.');
+    if (!slot) {
+      throw new Error('Interview slot not found.');
     }
-    db.prepare(`UPDATE interview_bookings SET status = 'RESCHEDULED' WHERE id = ?`).run(prevBooking.id);
-    db.prepare(`UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?`).run(
-      prevBooking.slot_id
-    );
-  }
+    if (slot.status !== 'ACTIVE') {
+      throw new Error('This interview slot has been cancelled.');
+    }
+    if (slot.booked_count >= slot.capacity) {
+      throw new Error('This interview slot is already full. Atomic locking prevented double-booking.');
+    }
 
-  const info = db
-    .prepare(`INSERT INTO interview_bookings (slot_id, candidate_id, status) VALUES (?, ?, 'CONFIRMED')`)
-    .run(slotId, candidateId);
+    const candidate = await tx.prepare('SELECT * FROM candidates WHERE id = ?').get<{
+      id: number;
+      full_name: string;
+      email: string;
+      position: string;
+      department: string;
+    }>(candidateId);
+    if (!candidate) {
+      throw new Error('Candidate not found.');
+    }
 
-  db.prepare(`UPDATE interview_slots SET booked_count = booked_count + 1 WHERE id = ?`).run(slotId);
+    // If candidate already had an active CONFIRMED booking, release it cleanly in the same transaction
+    const prevBooking = await tx
+      .prepare(`SELECT * FROM interview_bookings WHERE candidate_id = ? AND status = 'CONFIRMED' LIMIT 1`)
+      .get<{ id: number; slot_id: number }>(candidateId);
 
-  db.prepare(`
-    UPDATE candidates
-    SET stage = CASE WHEN stage < 10 THEN 10 ELSE stage END,
-        status = 'interview_confirmed',
-        updated_at = datetime('now')
-    WHERE id = ?
-  `).run(candidateId);
+    if (prevBooking) {
+      if (prevBooking.slot_id === slotId) {
+        throw new Error('Candidate already holds a confirmed reservation for this slot.');
+      }
+      await tx.prepare(`UPDATE interview_bookings SET status = 'RESCHEDULED' WHERE id = ?`).run(prevBooking.id);
+      await tx.prepare(`UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?`).run(
+        prevBooking.slot_id
+      );
+    }
 
-  return {
-    bookingId: Number(info.lastInsertRowid),
-    slot,
-    candidate,
-  };
-});
+    const info = await tx
+      .prepare(`INSERT INTO interview_bookings (slot_id, candidate_id, status) VALUES (?, ?, 'CONFIRMED')`)
+      .run(slotId, candidateId);
+
+    await tx.prepare(`UPDATE interview_slots SET booked_count = booked_count + 1 WHERE id = ?`).run(slotId);
+
+    await tx.prepare(`
+      UPDATE candidates
+      SET stage = CASE WHEN stage < 10 THEN 10 ELSE stage END,
+          status = 'interview_confirmed',
+          updated_at = datetime('now')
+      WHERE id = ?
+    `).run(candidateId);
+
+    return {
+      bookingId: Number(info.lastInsertRowid),
+      slot,
+      candidate,
+    };
+  });
+}
 
 async function startServer() {
+  await initializeDatabase();
+
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '15mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'talentflow-my-sqlite' });
+    res.json({
+      status: 'ok',
+      service: 'talentflow-my',
+      database: db.mode,
+      storage: isGoogleDriveStorageEnabled() ? 'gdrive' : 'local',
+    });
   });
 
   // ===========================================================================
   // 1. AUTHENTICATION, FIRST-RUN ADMIN SETUP, APPROVAL WORKFLOW & RBAC ROUTES
   // ===========================================================================
-  app.get('/api/auth/setup-status', (_req: Request, res: Response) => {
-    const row = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
-    res.json({ needsSetup: row.count === 0 });
-  });
+  app.get(
+    '/api/auth/setup-status',
+    asyncHandler(async (_req: Request, res: Response) => {
+      const row = await db.prepare('SELECT COUNT(*) as count FROM users').get<{ count: number }>();
+      res.json({ needsSetup: Number(row?.count ?? 0) === 0 });
+    })
+  );
 
-  app.post('/api/auth/setup', (req: Request, res: Response) => {
-    const name = String(req.body?.name || '').trim();
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
-    const department = normalizeDepartment(req.body?.department, 'HR');
+  app.post(
+    '/api/auth/setup',
+    asyncHandler(async (req: Request, res: Response) => {
+      const name = String(req.body?.name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+      const department = normalizeDepartment(req.body?.department, 'HR');
 
-    const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
-    if (existingCount > 0) {
-      res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
-      return;
-    }
-
-    if (!name || !email || !email.includes('@') || password.length < 8) {
-      res.status(400).json({
-        error: 'Full name, valid work email, and a password of at least 8 characters are required.',
-      });
-      return;
-    }
-
-    const hash = bcrypt.hashSync(password, 10);
-    const approvedAt = formatAuditTimestamp(new Date());
-    const nowIso = new Date().toISOString();
-    const createInitialAdmin = db.transaction(() => {
-      const countInsideTx = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
-      if (countInsideTx > 0) {
-        return null;
+      const existingCount = Number(
+        (await db.prepare('SELECT COUNT(*) as count FROM users').get<{ count: number }>())?.count ?? 0
+      );
+      if (existingCount > 0) {
+        res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
+        return;
       }
-      const info = db
-        .prepare(
-          `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
-           VALUES (?, ?, ?, 'administrator', ?, 'approved', 'Initial System Setup', ?, ?)`
-        )
-        .run(name, email, hash, department, approvedAt, nowIso);
-      return db
-        .prepare(`SELECT ${PUBLIC_USER_SELECT}, token_version FROM users WHERE id = ?`)
-        .get(info.lastInsertRowid) as (Record<string, unknown> & { token_version: number }) | undefined;
-    });
 
-    const createdUserRow = createInitialAdmin();
-    if (!createdUserRow) {
-      res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
-      return;
-    }
+      if (!name || !email || !email.includes('@') || password.length < 8) {
+        res.status(400).json({
+          error: 'Full name, valid work email, and a password of at least 8 characters are required.',
+        });
+        return;
+      }
 
-    const createdUser = serializePublicUser(createdUserRow);
-    const sid = registerActiveSession(createdUser.id);
-    const payload: AuthPayload = {
-      id: createdUser.id,
-      email: createdUser.email,
-      name: createdUser.name,
-      role: createdUser.role,
-      department: createdUser.department,
-      sid,
-      tv: Number(createdUserRow.token_version ?? 1),
-    };
+      const hash = bcrypt.hashSync(password, 10);
+      const approvedAt = formatAuditTimestamp(new Date());
+      const nowIso = new Date().toISOString();
+      const createdUserRow = await db.transaction(async (tx) => {
+        const countInsideTx = Number(
+          (await tx.prepare('SELECT COUNT(*) as count FROM users').get<{ count: number }>())?.count ?? 0
+        );
+        if (countInsideTx > 0) {
+          return null;
+        }
+        const info = await tx
+          .prepare(
+            `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+             VALUES (?, ?, ?, 'administrator', ?, 'approved', 'Initial System Setup', ?, ?)`
+          )
+          .run(name, email, hash, department, approvedAt, nowIso);
+        return tx
+          .prepare(`SELECT ${PUBLIC_USER_SELECT}, token_version FROM users WHERE id = ?`)
+          .get<Record<string, unknown> & { token_version: number }>(info.lastInsertRowid);
+      });
 
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
+      if (!createdUserRow) {
+        res.status(403).json({ error: 'Initial Administrator account already exists. Please sign in.' });
+        return;
+      }
 
-    logAudit({
-      req,
-      actor: payload,
-      pageVisited: 'Login Gate',
-      actionTaken: 'CREATE_USER',
-      targetEntity: `${createdUser.name} (${createdUser.email})`,
-      details: `Registered initial System Administrator account (${createdUser.email}, ${createdUser.department}). Approved by: Initial System Setup. 2FA enabled & locked (${createdUser.two_fa_method}).`,
-    });
+      const createdUser = serializePublicUser(createdUserRow);
+      const sid = await registerActiveSession(createdUser.id);
+      const payload: AuthPayload = {
+        id: createdUser.id,
+        email: createdUser.email,
+        name: createdUser.name,
+        role: createdUser.role,
+        department: createdUser.department,
+        sid,
+        tv: Number(createdUserRow.token_version ?? 1),
+      };
 
-    res.status(201).json({ token, user: createdUser });
-  });
+      const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
+
+      await logAudit({
+        req,
+        actor: payload,
+        pageVisited: 'Login Gate',
+        actionTaken: 'CREATE_USER',
+        targetEntity: `${createdUser.name} (${createdUser.email})`,
+        details: `Registered initial System Administrator account (${createdUser.email}, ${createdUser.department}). Approved by: Initial System Setup. 2FA enabled & locked (${createdUser.two_fa_method}).`,
+      });
+
+      res.status(201).json({ token, user: createdUser });
+    })
+  );
 
   // Public staff self-registration request (creates account with status = 'pending' until approved by Administrator)
-  app.post('/api/auth/register-request', (req: Request, res: Response) => {
-    const existingCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
-    if (existingCount === 0) {
-      res.status(400).json({
-        error: 'No System Administrator exists yet. Please complete Initial System Setup first.',
-      });
-      return;
-    }
+  app.post(
+    '/api/auth/register-request',
+    asyncHandler(async (req: Request, res: Response) => {
+      const existingCount = Number(
+        (await db.prepare('SELECT COUNT(*) as count FROM users').get<{ count: number }>())?.count ?? 0
+      );
+      if (existingCount === 0) {
+        res.status(400).json({
+          error: 'No System Administrator exists yet. Please complete Initial System Setup first.',
+        });
+        return;
+      }
 
-    const name = String(req.body?.name || '').trim();
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
-    const requestedRole: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = normalizeDepartment(req.body?.department, 'HR');
+      const name = String(req.body?.name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+      const requestedRole: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+      const department = normalizeDepartment(req.body?.department, 'HR');
 
-    if (!name || !email || !email.includes('@') || password.length < 8) {
-      res.status(400).json({
-        error: 'Full name, valid work email, and a password of at least 8 characters are required.',
-      });
-      return;
-    }
+      if (!name || !email || !email.includes('@') || password.length < 8) {
+        res.status(400).json({
+          error: 'Full name, valid work email, and a password of at least 8 characters are required.',
+        });
+        return;
+      }
 
-    const existing = db.prepare('SELECT id, status FROM users WHERE lower(email) = ?').get(email) as
-      | { id: number; status: UserApprovalStatus }
-      | undefined;
-    if (existing) {
-      const msg =
-        existing.status === 'pending'
-          ? 'An access request for this email is already pending approval by a System Administrator.'
-          : 'A staff account with this email already exists.';
-      res.status(409).json({ error: msg });
-      return;
-    }
+      const existing = await db
+        .prepare('SELECT id, status FROM users WHERE lower(email) = ?')
+        .get<{ id: number; status: UserApprovalStatus }>(email);
+      if (existing) {
+        const msg =
+          existing.status === 'pending'
+            ? 'An access request for this email is already pending approval by a System Administrator.'
+            : 'A staff account with this email already exists.';
+        res.status(409).json({ error: msg });
+        return;
+      }
 
-    const hash = bcrypt.hashSync(password, 10);
-    const info = db
-      .prepare(
-        `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', '', '', '')`
-      )
-      .run(name, email, hash, requestedRole, department);
+      const hash = bcrypt.hashSync(password, 10);
+      const info = await db
+        .prepare(
+          `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', '', '', '')`
+        )
+        .run(name, email, hash, requestedRole, department);
 
-    const newUserId = Number(info.lastInsertRowid);
-    logAudit({
-      req,
-      actorId: newUserId,
-      actorName: `${name} (${email})`,
-      actorRole: requestedRole,
-      pageVisited: 'Login Gate',
-      actionTaken: 'REGISTER_ACCESS_REQUEST',
-      targetEntity: `${name} (${email})`,
-      details: `Submitted new staff access request for ${name} (${email}, ${department}) requesting role "${requestedRole}". Status: pending System Administrator approval.`,
-    });
-
-    const createdRow = db
-      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-      .get(newUserId) as Record<string, unknown>;
-
-    res.status(201).json({
-      message:
-        'Your staff access request has been submitted and is pending approval by a System Administrator.',
-      user: serializePublicUser(createdRow),
-    });
-  });
-
-  app.post('/api/auth/login', (req: Request, res: Response) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
-
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required.' });
-      return;
-    }
-
-    const userRow = db
-      .prepare(`SELECT ${PUBLIC_USER_SELECT}, password_hash, token_version FROM users WHERE lower(email) = ?`)
-      .get(email) as
-      | (Record<string, unknown> & {
-          id: number;
-          name: string;
-          email: string;
-          password_hash: string;
-          role: StaffRole;
-          department: string;
-          status: UserApprovalStatus;
-          token_version: number;
-        })
-      | undefined;
-
-    if (!userRow || !bcrypt.compareSync(password, userRow.password_hash)) {
-      logAudit({
+      const newUserId = Number(info.lastInsertRowid);
+      await logAudit({
         req,
-        actorId: userRow?.id ?? null,
-        actorName: userRow ? `${userRow.name} (${userRow.email})` : email,
-        actorRole: userRow ? userRow.role : 'system',
+        actorId: newUserId,
+        actorName: `${name} (${email})`,
+        actorRole: requestedRole,
         pageVisited: 'Login Gate',
-        actionTaken: 'LOGIN_FAILED',
-        targetEntity: email,
-        details: userRow
-          ? `Failed login attempt for ${userRow.email}: incorrect password.`
-          : `Failed login attempt for unregistered email (${email}).`,
+        actionTaken: 'REGISTER_ACCESS_REQUEST',
+        targetEntity: `${name} (${email})`,
+        details: `Submitted new staff access request for ${name} (${email}, ${department}) requesting role "${requestedRole}". Status: pending System Administrator approval.`,
       });
-      res.status(401).json({ error: 'Invalid email or password.' });
-      return;
-    }
 
-    if (userRow.status === 'pending') {
-      logAudit({
+      const createdRow = (await db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get<Record<string, unknown>>(newUserId))!;
+
+      res.status(201).json({
+        message:
+          'Your staff access request has been submitted and is pending approval by a System Administrator.',
+        user: serializePublicUser(createdRow),
+      });
+    })
+  );
+
+  app.post(
+    '/api/auth/login',
+    asyncHandler(async (req: Request, res: Response) => {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+
+      if (!email || !password) {
+        res.status(400).json({ error: 'Email and password are required.' });
+        return;
+      }
+
+      const userRow = await db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT}, password_hash, token_version FROM users WHERE lower(email) = ?`)
+        .get<
+          Record<string, unknown> & {
+            id: number;
+            name: string;
+            email: string;
+            password_hash: string;
+            role: StaffRole;
+            department: string;
+            status: UserApprovalStatus;
+            token_version: number;
+          }
+        >(email);
+
+      if (!userRow || !bcrypt.compareSync(password, userRow.password_hash)) {
+        await logAudit({
+          req,
+          actorId: userRow?.id ?? null,
+          actorName: userRow ? `${userRow.name} (${userRow.email})` : email,
+          actorRole: userRow ? userRow.role : 'system',
+          pageVisited: 'Login Gate',
+          actionTaken: 'LOGIN_FAILED',
+          targetEntity: email,
+          details: userRow
+            ? `Failed login attempt for ${userRow.email}: incorrect password.`
+            : `Failed login attempt for unregistered email (${email}).`,
+        });
+        res.status(401).json({ error: 'Invalid email or password.' });
+        return;
+      }
+
+      if (userRow.status === 'pending') {
+        await logAudit({
+          req,
+          actorId: userRow.id,
+          actorName: `${userRow.name} (${userRow.email})`,
+          actorRole: userRow.role,
+          pageVisited: 'Login Gate',
+          actionTaken: 'LOGIN_FAILED',
+          targetEntity: `${userRow.name} (${userRow.email})`,
+          details: `Blocked login attempt for ${userRow.email}: account is pending approval by a System Administrator.`,
+        });
+        res.status(403).json({ error: 'Your account is pending approval by a System Administrator.' });
+        return;
+      }
+
+      if (userRow.status !== 'approved') {
+        await logAudit({
+          req,
+          actorId: userRow.id,
+          actorName: `${userRow.name} (${userRow.email})`,
+          actorRole: userRow.role,
+          pageVisited: 'Login Gate',
+          actionTaken: 'LOGIN_FAILED',
+          targetEntity: `${userRow.name} (${userRow.email})`,
+          details: `Blocked login attempt for ${userRow.email}: account status is "${userRow.status}".`,
+        });
+        res.status(403).json({
+          error: 'Your access request was not approved. Please contact a System Administrator.',
+        });
+        return;
+      }
+
+      const user = serializePublicUser(userRow);
+      const sid = await registerActiveSession(user.id);
+      const payload: AuthPayload = {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        department: user.department,
+        sid,
+        tv: Number(userRow.token_version ?? 1),
+      };
+
+      const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
+
+      await logAudit({
         req,
-        actorId: userRow.id,
-        actorName: `${userRow.name} (${userRow.email})`,
-        actorRole: userRow.role,
+        actor: payload,
         pageVisited: 'Login Gate',
-        actionTaken: 'LOGIN_FAILED',
-        targetEntity: `${userRow.name} (${userRow.email})`,
-        details: `Blocked login attempt for ${userRow.email}: account is pending approval by a System Administrator.`,
+        actionTaken: 'LOGIN_SUCCESS',
+        targetEntity: `${user.name} (${user.email})`,
+        details: `${user.name} (${user.email}) signed in as ${user.role} (2FA: ${user.two_fa_enabled ? `Enabled · ${user.two_fa_method}` : 'Disabled'}).`,
       });
-      res.status(403).json({ error: 'Your account is pending approval by a System Administrator.' });
-      return;
-    }
 
-    if (userRow.status !== 'approved') {
-      logAudit({
-        req,
-        actorId: userRow.id,
-        actorName: `${userRow.name} (${userRow.email})`,
-        actorRole: userRow.role,
-        pageVisited: 'Login Gate',
-        actionTaken: 'LOGIN_FAILED',
-        targetEntity: `${userRow.name} (${userRow.email})`,
-        details: `Blocked login attempt for ${userRow.email}: account status is "${userRow.status}".`,
+      res.json({
+        token,
+        user,
       });
-      res.status(403).json({
-        error: 'Your access request was not approved. Please contact a System Administrator.',
-      });
-      return;
-    }
-
-    const user = serializePublicUser(userRow);
-    const sid = registerActiveSession(user.id);
-    const payload: AuthPayload = {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      department: user.department,
-      sid,
-      tv: Number(userRow.token_version ?? 1),
-    };
-
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
-
-    logAudit({
-      req,
-      actor: payload,
-      pageVisited: 'Login Gate',
-      actionTaken: 'LOGIN_SUCCESS',
-      targetEntity: `${user.name} (${user.email})`,
-      details: `${user.name} (${user.email}) signed in as ${user.role} (2FA: ${user.two_fa_enabled ? `Enabled · ${user.two_fa_method}` : 'Disabled'}).`,
-    });
-
-    res.json({
-      token,
-      user,
-    });
-  });
+    })
+  );
 
   // Explicit logout & 10-minute idle auto-logout endpoint (revokes session and logs immutable audit event)
-  app.post('/api/auth/logout', (req: Request, res: Response) => {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-    const reason = String(req.body?.reason || 'manual').trim().toLowerCase();
-    const pageVisited = String(req.body?.page_visited || 'Pipeline Dashboard').trim() || 'Pipeline Dashboard';
+  app.post(
+    '/api/auth/logout',
+    asyncHandler(async (req: Request, res: Response) => {
+      const header = req.headers.authorization || '';
+      const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+      const reason = String(req.body?.reason || 'manual').trim().toLowerCase();
+      const pageVisited = String(req.body?.page_visited || 'Pipeline Dashboard').trim() || 'Pipeline Dashboard';
 
-    if (token) {
-      const decoded = verifyJwtToken(token);
-      if (decoded) {
-        const dbUser = db
-          .prepare('SELECT id, name, email, role, department, status, approved_by, approved_at FROM users WHERE id = ?')
-          .get(decoded.id) as AuthPayload | undefined;
+      if (token) {
+        const decoded = verifyJwtToken(token);
+        if (decoded) {
+          const dbUser = await db
+            .prepare('SELECT id, name, email, role, department, status, approved_by, approved_at FROM users WHERE id = ?')
+            .get<AuthPayload>(decoded.id);
 
-        const actor = dbUser || decoded;
-        const sid = typeof decoded.sid === 'string' ? decoded.sid : '';
+          const actor = dbUser || decoded;
+          const sid = typeof decoded.sid === 'string' ? decoded.sid : '';
 
-        if (reason === 'idle_timeout') {
-          recordIdleAutoLogoutOnce({
-            req,
-            user: actor,
-            sid: sid || undefined,
-            pageVisited,
-            details: `Automatically logged out ${actor.name} (${actor.email}) after 10 minutes of inactivity on ${pageVisited}.`,
-          });
-        } else {
-          if (sid) {
-            const existing = sessionActivityMap.get(sid);
-            sessionActivityMap.set(sid, {
-              userId: actor.id,
-              lastActiveMs: existing?.lastActiveMs ?? Date.now(),
-              revoked: true,
-              idleAuditLogged: existing?.idleAuditLogged ?? false,
+          if (reason === 'idle_timeout') {
+            await recordIdleAutoLogoutOnce({
+              req,
+              user: actor,
+              sid: sid || undefined,
+              pageVisited,
+              details: `Automatically logged out ${actor.name} (${actor.email}) after 10 minutes of inactivity on ${pageVisited}.`,
+            });
+          } else {
+            if (sid) {
+              const existing = sessionActivityMap.get(sid);
+              sessionActivityMap.set(sid, {
+                userId: actor.id,
+                lastActiveMs: existing?.lastActiveMs ?? Date.now(),
+                revoked: true,
+                idleAuditLogged: existing?.idleAuditLogged ?? false,
+              });
+            }
+            await logAudit({
+              req,
+              actor,
+              pageVisited,
+              actionTaken: 'LOGOUT',
+              targetEntity: `${actor.name} (${actor.email})`,
+              details: `${actor.name} (${actor.email}) signed out manually from ${pageVisited}.`,
             });
           }
-          logAudit({
-            req,
-            actor,
-            pageVisited,
-            actionTaken: 'LOGOUT',
-            targetEntity: `${actor.name} (${actor.email})`,
-            details: `${actor.name} (${actor.email}) signed out manually from ${pageVisited}.`,
-          });
         }
       }
-    }
 
-    res.json({ loggedOut: true });
-  });
+      res.json({ loggedOut: true });
+    })
+  );
 
   // Keep-alive heartbeat triggered only when user clicks "Stay Signed In" or has verified local activity
   app.post('/api/auth/keep-alive', requireAuth, (_req: AuthedRequest, res: Response) => {
@@ -2454,79 +2790,87 @@ async function startServer() {
     res.json({ user: req.user });
   });
 
-  app.get('/api/users', requireAuth, requireRole('administrator'), (_req: AuthedRequest, res: Response) => {
-    const rows = db
-      .prepare(
-        `SELECT ${PUBLIC_USER_SELECT}
-         FROM users
-         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, id ASC`
-      )
-      .all() as Array<Record<string, unknown>>;
-    res.json({ users: rows.map(serializePublicUser) });
-  });
+  app.get(
+    '/api/users',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler<AuthedRequest>(async (_req, res) => {
+      const rows = await db
+        .prepare(
+          `SELECT ${PUBLIC_USER_SELECT}
+           FROM users
+           ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, id ASC`
+        )
+        .all<Record<string, unknown>>();
+      res.json({ users: rows.map(serializePublicUser) });
+    })
+  );
 
-  app.post('/api/users', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const name = String(req.body?.name || '').trim();
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
-    const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = normalizeDepartment(req.body?.department, 'HR');
+  app.post(
+    '/api/users',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler<AuthedRequest>(async (req, res) => {
+      const name = String(req.body?.name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+      const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+      const department = normalizeDepartment(req.body?.department, 'HR');
 
-    if (!name || !email || !email.includes('@') || password.length < 6) {
-      res.status(400).json({ error: 'Name, valid email, and password (min 6 characters) are required.' });
-      return;
-    }
+      if (!name || !email || !email.includes('@') || password.length < 6) {
+        res.status(400).json({ error: 'Name, valid email, and password (min 6 characters) are required.' });
+        return;
+      }
 
-    const exists = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
-    if (exists) {
-      res.status(409).json({ error: 'A user account with this email already exists.' });
-      return;
-    }
+      const exists = await db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
+      if (exists) {
+        res.status(409).json({ error: 'A user account with this email already exists.' });
+        return;
+      }
 
-    const hash = bcrypt.hashSync(password, 10);
-    const approvedBy = `${req.user!.name} (${req.user!.email})`;
-    const approvedAt = formatAuditTimestamp(new Date());
+      const hash = bcrypt.hashSync(password, 10);
+      const approvedBy = `${req.user!.name} (${req.user!.email})`;
+      const approvedAt = formatAuditTimestamp(new Date());
 
-    const info = db
-      .prepare(
-        `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, 'approved', ?, ?, '')`
-      )
-      .run(name, email, hash, role, department, approvedBy, approvedAt);
+      const info = await db
+        .prepare(
+          `INSERT INTO users (name, email, password_hash, role, department, status, approved_by, approved_at, last_active_at)
+           VALUES (?, ?, ?, ?, ?, 'approved', ?, ?, '')`
+        )
+        .run(name, email, hash, role, department, approvedBy, approvedAt);
 
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Team & Access Management',
-      actionTaken: 'CREATE_USER',
-      targetEntity: `${name} (${email})`,
-      details: `Created & approved ${role} account for ${name} (${email}, ${department}). Approved by ${approvedBy}. 2FA enabled & locked (EMAIL_OTP).`,
-    });
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'CREATE_USER',
+        targetEntity: `${name} (${email})`,
+        details: `Created & approved ${role} account for ${name} (${email}, ${department}). Approved by ${approvedBy}. 2FA enabled & locked (EMAIL_OTP).`,
+      });
 
-    const createdRow = db
-      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-      .get(info.lastInsertRowid) as Record<string, unknown>;
-    res.status(201).json({ user: serializePublicUser(createdRow) });
-  });
+      const createdRow = (await db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get<Record<string, unknown>>(info.lastInsertRowid))!;
+      res.status(201).json({ user: serializePublicUser(createdRow) });
+    })
+  );
 
   app.patch(
     '/api/users/:id/approve',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const targetId = Number(req.params.id);
-      const target = db
+      const target = await db
         .prepare('SELECT id, name, email, role, department, status FROM users WHERE id = ?')
-        .get(targetId) as
-        | {
-            id: number;
-            name: string;
-            email: string;
-            role: StaffRole;
-            department: string;
-            status: UserApprovalStatus;
-          }
-        | undefined;
+        .get<{
+          id: number;
+          name: string;
+          email: string;
+          role: StaffRole;
+          department: string;
+          status: UserApprovalStatus;
+        }>(targetId);
 
       if (!target) {
         res.status(404).json({ error: 'User account not found.' });
@@ -2544,13 +2888,15 @@ async function startServer() {
       const approvedBy = `${req.user!.name} (${req.user!.email})`;
       const approvedAt = formatAuditTimestamp(new Date());
 
-      db.prepare(
-        `UPDATE users
-         SET status = 'approved', role = ?, department = ?, approved_by = ?, approved_at = ?
-         WHERE id = ?`
-      ).run(assignedRole, assignedDepartment, approvedBy, approvedAt, targetId);
+      await db
+        .prepare(
+          `UPDATE users
+           SET status = 'approved', role = ?, department = ?, approved_by = ?, approved_at = ?
+           WHERE id = ?`
+        )
+        .run(assignedRole, assignedDepartment, approvedBy, approvedAt, targetId);
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
@@ -2559,36 +2905,34 @@ async function startServer() {
         details: `Approved staff account for ${target.name} (${target.email}) from status "${target.status}" to "approved" with assigned role "${assignedRole}" (${assignedDepartment}). Approved by ${approvedBy}.`,
       });
 
-      const updatedRow = db
+      const updatedRow = (await db
         .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-        .get(targetId) as Record<string, unknown>;
+        .get<Record<string, unknown>>(targetId))!;
       res.json({ user: serializePublicUser(updatedRow) });
-    }
+    })
   );
 
   app.patch(
     '/api/users/:id/reject',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const targetId = Number(req.params.id);
       if (req.user && targetId === req.user.id) {
         res.status(400).json({ error: 'You cannot reject or suspend your own currently signed-in account.' });
         return;
       }
 
-      const target = db
+      const target = await db
         .prepare('SELECT id, name, email, role, department, status FROM users WHERE id = ?')
-        .get(targetId) as
-        | {
-            id: number;
-            name: string;
-            email: string;
-            role: StaffRole;
-            department: string;
-            status: UserApprovalStatus;
-          }
-        | undefined;
+        .get<{
+          id: number;
+          name: string;
+          email: string;
+          role: StaffRole;
+          department: string;
+          status: UserApprovalStatus;
+        }>(targetId);
 
       if (!target) {
         res.status(404).json({ error: 'User account not found.' });
@@ -2596,11 +2940,13 @@ async function startServer() {
       }
 
       if (target.role === 'administrator' && target.status === 'approved') {
-        const adminCount = (
-          db
-            .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
-            .get() as { count: number }
-        ).count;
+        const adminCount = Number(
+          (
+            await db
+              .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+              .get<{ count: number }>()
+          )?.count ?? 0
+        );
         if (adminCount <= 1) {
           res.status(400).json({ error: 'Cannot reject or suspend the last remaining active Administrator account.' });
           return;
@@ -2611,11 +2957,13 @@ async function startServer() {
       const reviewedBy = `${req.user!.name} (${req.user!.email})`;
       const reviewedAt = formatAuditTimestamp(new Date());
 
-      db.prepare(
-        `UPDATE users
-         SET status = 'rejected', approved_by = ?, approved_at = ?, last_active_at = '', token_version = COALESCE(token_version, 1) + 1
-         WHERE id = ?`
-      ).run(`Rejected by ${reviewedBy}`, reviewedAt, targetId);
+      await db
+        .prepare(
+          `UPDATE users
+           SET status = 'rejected', approved_by = ?, approved_at = ?, last_active_at = '', token_version = COALESCE(token_version, 1) + 1
+           WHERE id = ?`
+        )
+        .run(`Rejected by ${reviewedBy}`, reviewedAt, targetId);
 
       // Immediately revoke any active in-memory sessions for this user
       for (const [sid, session] of sessionActivityMap.entries()) {
@@ -2624,7 +2972,7 @@ async function startServer() {
         }
       }
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
@@ -2633,112 +2981,179 @@ async function startServer() {
         details: `Rejected/suspended ${target.role} account ${target.name} (${target.email}) (previous status: "${target.status}")${reason ? `. Reason: ${reason}` : ''}.`,
       });
 
-      const updatedRow = db
+      const updatedRow = (await db
         .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-        .get(targetId) as Record<string, unknown>;
+        .get<Record<string, unknown>>(targetId))!;
       res.json({ user: serializePublicUser(updatedRow) });
-    }
+    })
   );
 
-  app.patch('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    if (
-      req.body &&
-      ('two_fa_enabled' in req.body ||
-        'two_fa_method' in req.body ||
-        'two_fa_change_status' in req.body)
-    ) {
-      res.status(403).json({
-        error:
-          '2FA authentication settings are locked and cannot be changed without System Administrator approval via password re-verification.',
-      });
-      return;
-    }
-
-    const targetId = Number(req.params.id);
-    const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
-    const department = normalizeDepartment(req.body?.department, 'HR');
-
-    const target = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(targetId) as
-      | { id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }
-      | undefined;
-    if (!target) {
-      res.status(404).json({ error: 'User account not found.' });
-      return;
-    }
-
-    if (target.role === 'administrator' && target.status === 'approved' && role !== 'administrator') {
-      const adminCount = (
-        db
-          .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
-          .get() as { count: number }
-      ).count;
-      if (adminCount <= 1) {
-        res.status(400).json({ error: 'Cannot demote the last remaining active Administrator account.' });
+  app.patch(
+    '/api/users/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler<AuthedRequest>(async (req, res) => {
+      if (
+        req.body &&
+        ('two_fa_enabled' in req.body ||
+          'two_fa_method' in req.body ||
+          'two_fa_change_status' in req.body)
+      ) {
+        res.status(403).json({
+          error:
+            '2FA authentication settings are locked and cannot be changed without System Administrator approval via password re-verification.',
+        });
         return;
       }
-    }
 
-    db.prepare('UPDATE users SET role = ?, department = ? WHERE id = ?').run(role, department, targetId);
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Team & Access Management',
-      actionTaken: 'UPDATE_USER_ROLE',
-      targetEntity: `${target.name} (${target.email})`,
-      details: `Updated access role for ${target.email} from ${target.role} to ${role} (${department}).`,
-    });
+      const targetId = Number(req.params.id);
+      const role: StaffRole = req.body?.role === 'administrator' ? 'administrator' : 'manager';
+      const department = normalizeDepartment(req.body?.department, 'HR');
 
-    const updatedRow = db
-      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-      .get(targetId) as Record<string, unknown>;
-    res.json({ user: serializePublicUser(updatedRow) });
-  });
+      const target = await db
+        .prepare('SELECT id, name, email, role, status FROM users WHERE id = ?')
+        .get<{ id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }>(targetId);
+      if (!target) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
+      }
+
+      if (target.role === 'administrator' && target.status === 'approved' && role !== 'administrator') {
+        const adminCount = Number(
+          (
+            await db
+              .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+              .get<{ count: number }>()
+          )?.count ?? 0
+        );
+        if (adminCount <= 1) {
+          res.status(400).json({ error: 'Cannot demote the last remaining active Administrator account.' });
+          return;
+        }
+      }
+
+      await db.prepare('UPDATE users SET role = ?, department = ? WHERE id = ?').run(role, department, targetId);
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'UPDATE_USER_ROLE',
+        targetEntity: `${target.name} (${target.email})`,
+        details: `Updated access role for ${target.email} from ${target.role} to ${role} (${department}).`,
+      });
+
+      const updatedRow = (await db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get<Record<string, unknown>>(targetId))!;
+      res.json({ user: serializePublicUser(updatedRow) });
+    })
+  );
 
   // ===========================================================================
   // 1B. 2FA AUTHENTICATION LOCK & ADMINISTRATOR DANGER ZONE GOVERNANCE
   // ===========================================================================
-  function verifyAdminPassword(adminId: number, suppliedPassword: string): boolean {
+  async function verifyAdminPassword(adminId: number, suppliedPassword: string): Promise<boolean> {
     if (!suppliedPassword) return false;
-    const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(adminId) as
-      | { password_hash: string }
-      | undefined;
+    const row = await db
+      .prepare('SELECT password_hash FROM users WHERE id = ?')
+      .get<{ password_hash: string }>(adminId);
     if (!row || !row.password_hash) return false;
     return bcrypt.compareSync(suppliedPassword, row.password_hash);
   }
 
   const REJECTED_CANDIDATE_STATUS_SQL = `LOWER(status) IN ('rejected', 'withdrawn', 'rejected_screening', 'rejected_post_interview', 'offer_rejected', 'not_qualified')`;
 
-  function computeDangerZoneStats() {
-    const totalCandidates = (
-      db.prepare('SELECT COUNT(*) as count FROM candidates').get() as { count: number }
-    ).count;
-    const rejectedOrWithdrawn = (
+  async function computeDangerZoneStats() {
+    const todayMyt = getMalaysiaDateStamp(new Date());
+    const [
+      totalCandidatesRow,
+      rejectedOrWithdrawnRow,
+      dbDocumentRecordsRow,
+      rejectedDocFiles,
+      totalSlotsRow,
+      activeSlotsRow,
+      bookedSlotsRow,
+      unbookedFutureSlotsRow,
+      totalBookingsRow,
+      confirmedBookingsRow,
+      totalUsersRow,
+      approvedUsersRow,
+      pendingUsersRow,
+      rejectedOrLockedUsersRow,
+      twoFaLockedUsersRow,
+      pendingTwoFaRows,
+      totalAuditEntriesRow,
+      triggerRows,
+    ] = await Promise.all([
+      db.prepare('SELECT COUNT(*) as count FROM candidates').get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM candidates WHERE ${REJECTED_CANDIDATE_STATUS_SQL}`).get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM candidate_documents WHERE file_path != ''`).get<{ count: number }>(),
       db
-        .prepare(`SELECT COUNT(*) as count FROM candidates WHERE ${REJECTED_CANDIDATE_STATUS_SQL}`)
-        .get() as { count: number }
-    ).count;
+        .prepare(`
+          SELECT DISTINCT cd.file_path AS fp
+          FROM candidate_documents cd
+          JOIN candidates c ON c.id = cd.candidate_id
+          WHERE cd.file_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
+          UNION
+          SELECT DISTINCT o.offer_letter_path AS fp
+          FROM offers o
+          JOIN candidates c ON c.id = o.candidate_id
+          WHERE o.offer_letter_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
+        `)
+        .all<{ fp: string }>(),
+      db.prepare('SELECT COUNT(*) as count FROM interview_slots').get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM interview_slots WHERE status = 'ACTIVE'`).get<{ count: number }>(),
+      db
+        .prepare(
+          `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+        )
+        .get<{ count: number }>(),
+      db
+        .prepare(
+          `SELECT COUNT(*) as count FROM interview_slots WHERE date >= ? AND booked_count = 0 AND id NOT IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+        )
+        .get<{ count: number }>(todayMyt),
+      db.prepare('SELECT COUNT(*) as count FROM interview_bookings').get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM interview_bookings WHERE status = 'CONFIRMED'`).get<{ count: number }>(),
+      db.prepare('SELECT COUNT(*) as count FROM users').get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'approved'`).get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'pending'`).get<{ count: number }>(),
+      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'rejected'`).get<{ count: number }>(),
+      db
+        .prepare(`SELECT COUNT(*) as count FROM users WHERE two_fa_change_status = 'locked' AND two_fa_enabled = 1`)
+        .get<{ count: number }>(),
+      db
+        .prepare(
+          `SELECT ${PUBLIC_USER_SELECT} FROM users WHERE two_fa_change_status = 'pending_admin_approval' ORDER BY id ASC`
+        )
+        .all<Record<string, unknown>>(),
+      db.prepare('SELECT COUNT(*) as count FROM audit_logs').get<{ count: number }>(),
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_logs' ORDER BY name ASC`)
+        .all<{ name: string }>(),
+    ]);
 
-    const dbDocumentRecords = (
-      db
-        .prepare(`SELECT COUNT(*) as count FROM candidate_documents WHERE file_path != ''`)
-        .get() as { count: number }
-    ).count;
+    const totalCandidates = Number(totalCandidatesRow?.count ?? 0);
+    const rejectedOrWithdrawn = Number(rejectedOrWithdrawnRow?.count ?? 0);
+    const dbDocumentRecords = Number(dbDocumentRecordsRow?.count ?? 0);
 
     let filesOnDisk = 0;
     let totalDiskBytes = 0;
     try {
-      const entries = fs.readdirSync(UPLOADS_ROOT);
-      for (const entry of entries) {
-        if (entry.startsWith('.')) continue;
-        const full = path.join(UPLOADS_ROOT, entry);
-        try {
-          const stat = fs.statSync(full);
-          if (stat.isFile()) {
-            filesOnDisk += 1;
-            totalDiskBytes += stat.size;
+      if (fs.existsSync(UPLOADS_ROOT)) {
+        const entries = fs.readdirSync(UPLOADS_ROOT);
+        for (const entry of entries) {
+          if (entry.startsWith('.')) continue;
+          const full = path.join(UPLOADS_ROOT, entry);
+          try {
+            const stat = fs.statSync(full);
+            if (stat.isFile()) {
+              filesOnDisk += 1;
+              totalDiskBytes += stat.size;
+            }
+          } catch {
+            // ignore transient stat errors
           }
-        } catch {
-          // ignore transient stat errors
         }
       }
     } catch {
@@ -2746,79 +3161,6 @@ async function startServer() {
       totalDiskBytes = 0;
     }
 
-    const rejectedDocFiles = db
-      .prepare(`
-        SELECT DISTINCT cd.file_path AS fp
-        FROM candidate_documents cd
-        JOIN candidates c ON c.id = cd.candidate_id
-        WHERE cd.file_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
-        UNION
-        SELECT DISTINCT o.offer_letter_path AS fp
-        FROM offers o
-        JOIN candidates c ON c.id = o.candidate_id
-        WHERE o.offer_letter_path != '' AND ${REJECTED_CANDIDATE_STATUS_SQL.replace(/status/g, 'c.status')}
-      `)
-      .all() as Array<{ fp: string }>;
-
-    const todayMyt = getMalaysiaDateStamp(new Date());
-    const totalSlots = (
-      db.prepare('SELECT COUNT(*) as count FROM interview_slots').get() as { count: number }
-    ).count;
-    const activeSlots = (
-      db.prepare(`SELECT COUNT(*) as count FROM interview_slots WHERE status = 'ACTIVE'`).get() as {
-        count: number;
-      }
-    ).count;
-    const bookedSlots = (
-      db
-        .prepare(
-          `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
-        )
-        .get() as { count: number }
-    ).count;
-    const unbookedFutureSlots = (
-      db
-        .prepare(
-          `SELECT COUNT(*) as count FROM interview_slots WHERE date >= ? AND booked_count = 0 AND id NOT IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
-        )
-        .get(todayMyt) as { count: number }
-    ).count;
-    const totalBookings = (
-      db.prepare('SELECT COUNT(*) as count FROM interview_bookings').get() as { count: number }
-    ).count;
-    const confirmedBookings = (
-      db
-        .prepare(`SELECT COUNT(*) as count FROM interview_bookings WHERE status = 'CONFIRMED'`)
-        .get() as { count: number }
-    ).count;
-
-    const totalUsers = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
-    const approvedUsers = (
-      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'approved'`).get() as { count: number }
-    ).count;
-    const pendingUsers = (
-      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'pending'`).get() as { count: number }
-    ).count;
-    const rejectedOrLockedUsers = (
-      db.prepare(`SELECT COUNT(*) as count FROM users WHERE status = 'rejected'`).get() as { count: number }
-    ).count;
-    const twoFaLockedUsers = (
-      db
-        .prepare(`SELECT COUNT(*) as count FROM users WHERE two_fa_change_status = 'locked' AND two_fa_enabled = 1`)
-        .get() as { count: number }
-    ).count;
-    const pendingTwoFaRows = db
-      .prepare(
-        `SELECT ${PUBLIC_USER_SELECT} FROM users WHERE two_fa_change_status = 'pending_admin_approval' ORDER BY id ASC`
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    const totalAuditEntries = (
-      db.prepare('SELECT COUNT(*) as count FROM audit_logs').get() as { count: number }
-    ).count;
-    const triggerRows = db
-      .prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_logs' ORDER BY name ASC`)
-      .all() as Array<{ name: string }>;
     const triggers = triggerRows.map((t) => t.name);
 
     return {
@@ -2834,23 +3176,23 @@ async function startServer() {
         rejectedCandidateFiles: rejectedDocFiles.length,
       },
       interviews: {
-        totalSlots,
-        activeSlots,
-        bookedSlots,
-        unbookedFutureSlots,
-        totalBookings,
-        confirmedBookings,
+        totalSlots: Number(totalSlotsRow?.count ?? 0),
+        activeSlots: Number(activeSlotsRow?.count ?? 0),
+        bookedSlots: Number(bookedSlotsRow?.count ?? 0),
+        unbookedFutureSlots: Number(unbookedFutureSlotsRow?.count ?? 0),
+        totalBookings: Number(totalBookingsRow?.count ?? 0),
+        confirmedBookings: Number(confirmedBookingsRow?.count ?? 0),
       },
       users: {
-        totalUsers,
-        approvedUsers,
-        pendingUsers,
-        rejectedOrLockedUsers,
-        twoFaLockedUsers,
+        totalUsers: Number(totalUsersRow?.count ?? 0),
+        approvedUsers: Number(approvedUsersRow?.count ?? 0),
+        pendingUsers: Number(pendingUsersRow?.count ?? 0),
+        rejectedOrLockedUsers: Number(rejectedOrLockedUsersRow?.count ?? 0),
+        twoFaLockedUsers: Number(twoFaLockedUsersRow?.count ?? 0),
         pendingTwoFaRequests: pendingTwoFaRows.length,
       },
       auditLogs: {
-        totalEntries: totalAuditEntries,
+        totalEntries: Number(totalAuditEntriesRow?.count ?? 0),
         immutableProtected:
           triggers.includes('prevent_audit_log_delete') && triggers.includes('prevent_audit_log_update'),
         triggers,
@@ -2860,9 +3202,9 @@ async function startServer() {
   }
 
   // Strictly block ANY direct self-service 2FA modification/disable/reset without System Administrator approval
-  const blockDirectTwoFaChange = (req: AuthedRequest, res: Response) => {
+  const blockDirectTwoFaChange = asyncHandler<AuthedRequest>(async (req, res) => {
     const pageVisited = String(req.headers['x-page-visited'] || 'User Profile & 2FA Settings').trim();
-    logAudit({
+    await logAudit({
       req,
       actor: req.user,
       pageVisited,
@@ -2873,70 +3215,76 @@ async function startServer() {
     res.status(403).json({
       error: '2FA authentication settings are locked and cannot be changed without System Administrator approval',
     });
-  };
+  });
   app.patch('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
   app.put('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
   app.post('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
   app.delete('/api/users/me/2fa', requireAuth, blockDirectTwoFaChange);
 
   // Formal 2FA change/reset request submitted by a logged-in user for System Administrator review
-  app.post('/api/users/me/request-2fa-change', requireAuth, (req: AuthedRequest, res: Response) => {
-    const requestedAction = String(req.body?.requested_action || '').trim().toUpperCase() as TwoFaRequestedAction;
-    const reason = String(req.body?.reason || '').trim();
+  app.post(
+    '/api/users/me/request-2fa-change',
+    requireAuth,
+    asyncHandler<AuthedRequest>(async (req, res) => {
+      const requestedAction = String(req.body?.requested_action || '').trim().toUpperCase() as TwoFaRequestedAction;
+      const reason = String(req.body?.reason || '').trim();
 
-    if (!VALID_TWO_FA_ACTIONS.has(requestedAction)) {
-      res.status(400).json({
-        error:
-          'Invalid 2FA requested action. Choose RESET_2FA, DISABLE_2FA, ENABLE_2FA, SWITCH_TO_AUTHENTICATOR_APP, or SWITCH_TO_EMAIL_OTP.',
+      if (!VALID_TWO_FA_ACTIONS.has(requestedAction)) {
+        res.status(400).json({
+          error:
+            'Invalid 2FA requested action. Choose RESET_2FA, DISABLE_2FA, ENABLE_2FA, SWITCH_TO_AUTHENTICATOR_APP, or SWITCH_TO_EMAIL_OTP.',
+        });
+        return;
+      }
+
+      if (reason.length < 5) {
+        res.status(400).json({
+          error: 'Please provide a brief reason (at least 5 characters) for your 2FA change request.',
+        });
+        return;
+      }
+
+      const requestPayload = JSON.stringify({
+        action: requestedAction,
+        reason: reason.slice(0, 400),
+        requested_at: formatAuditTimestamp(new Date()),
       });
-      return;
-    }
 
-    if (reason.length < 5) {
-      res.status(400).json({
-        error: 'Please provide a brief reason (at least 5 characters) for your 2FA change request.',
+      await db
+        .prepare(
+          `UPDATE users
+           SET two_fa_change_status = 'pending_admin_approval', two_fa_requested_state = ?
+           WHERE id = ?`
+        )
+        .run(requestPayload, req.user!.id);
+
+      const pageVisited = String(req.headers['x-page-visited'] || 'User Profile & 2FA Settings').trim();
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited,
+        actionTaken: 'REQUEST_2FA_CHANGE',
+        targetEntity: `${req.user!.name} (${req.user!.email})`,
+        details: `Submitted formal 2FA change request (${requestedAction}) pending System Administrator approval. Reason: ${reason.slice(0, 300)}`,
       });
-      return;
-    }
 
-    const requestPayload = JSON.stringify({
-      action: requestedAction,
-      reason: reason.slice(0, 400),
-      requested_at: formatAuditTimestamp(new Date()),
-    });
-
-    db.prepare(
-      `UPDATE users
-       SET two_fa_change_status = 'pending_admin_approval', two_fa_requested_state = ?
-       WHERE id = ?`
-    ).run(requestPayload, req.user!.id);
-
-    const pageVisited = String(req.headers['x-page-visited'] || 'User Profile & 2FA Settings').trim();
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited,
-      actionTaken: 'REQUEST_2FA_CHANGE',
-      targetEntity: `${req.user!.name} (${req.user!.email})`,
-      details: `Submitted formal 2FA change request (${requestedAction}) pending System Administrator approval. Reason: ${reason.slice(0, 300)}`,
-    });
-
-    const updatedRow = db
-      .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-      .get(req.user!.id) as Record<string, unknown>;
-    res.status(200).json({
-      message:
-        'Your 2FA change request has been queued for System Administrator approval. Your current 2FA lock remains active until approved.',
-      user: serializePublicUser(updatedRow),
-    });
-  });
+      const updatedRow = (await db
+        .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
+        .get<Record<string, unknown>>(req.user!.id))!;
+      res.status(200).json({
+        message:
+          'Your 2FA change request has been queued for System Administrator approval. Your current 2FA lock remains active until approved.',
+        user: serializePublicUser(updatedRow),
+      });
+    })
+  );
 
   // Administrator-only 2FA approval/denial endpoint (requires Administrator role + current admin password re-verification)
   app.patch(
     '/api/admin/users/:id/2fa-approval',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const targetId = Number(req.params.id);
       const decision = String(req.body?.decision || '').trim().toLowerCase();
       const adminPassword = String(req.body?.admin_password || '');
@@ -2948,8 +3296,8 @@ async function startServer() {
         return;
       }
 
-      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
-        logAudit({
+      if (!(await verifyAdminPassword(req.user!.id, adminPassword))) {
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Team & Access Management',
@@ -2963,9 +3311,9 @@ async function startServer() {
         return;
       }
 
-      const targetRow = db
+      const targetRow = await db
         .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-        .get(targetId) as Record<string, unknown> | undefined;
+        .get<Record<string, unknown>>(targetId);
 
       if (!targetRow) {
         res.status(404).json({ error: 'Target user account not found.' });
@@ -2993,13 +3341,15 @@ async function startServer() {
       }
 
       if (decision === 'deny') {
-        db.prepare(
-          `UPDATE users
-           SET two_fa_change_status = 'locked', two_fa_requested_state = ''
-           WHERE id = ?`
-        ).run(targetId);
+        await db
+          .prepare(
+            `UPDATE users
+             SET two_fa_change_status = 'locked', two_fa_requested_state = ''
+             WHERE id = ?`
+          )
+          .run(targetId);
 
-        logAudit({
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Team & Access Management',
@@ -3008,10 +3358,10 @@ async function startServer() {
           details: `Denied 2FA change request (${pendingAction || 'unspecified'}) for ${target.email}. Account remains locked on ${target.two_fa_enabled ? `Enabled (${target.two_fa_method})` : 'Disabled'}.${notes ? ` Admin notes: ${notes}` : ''}`,
         });
 
-        const refreshed = db
+        const refreshed = (await db
           .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-          .get(targetId) as Record<string, unknown>;
-        res.json({ user: serializePublicUser(refreshed), stats: computeDangerZoneStats() });
+          .get<Record<string, unknown>>(targetId))!;
+        res.json({ user: serializePublicUser(refreshed), stats: await computeDangerZoneStats() });
         return;
       }
 
@@ -3044,17 +3394,19 @@ async function startServer() {
         nextMethod = 'EMAIL_OTP';
       }
 
-      db.prepare(
-        `UPDATE users
-         SET two_fa_enabled = ?,
-             two_fa_method = ?,
-             two_fa_change_status = 'locked',
-             two_fa_requested_state = '',
-             two_fa_approved_by = ?
-         WHERE id = ?`
-      ).run(nextEnabled, nextMethod, approverLabel, targetId);
+      await db
+        .prepare(
+          `UPDATE users
+           SET two_fa_enabled = ?,
+               two_fa_method = ?,
+               two_fa_change_status = 'locked',
+               two_fa_requested_state = '',
+               two_fa_approved_by = ?
+           WHERE id = ?`
+        )
+        .run(nextEnabled, nextMethod, approverLabel, targetId);
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
@@ -3063,11 +3415,11 @@ async function startServer() {
         details: `Approved & executed 2FA change (${actionToApply}) for ${target.email} by ${approverLabel}. Previous: ${target.two_fa_enabled ? `Enabled (${target.two_fa_method})` : 'Disabled'} -> New: ${nextEnabled ? `Enabled (${nextMethod})` : 'Disabled'} (re-locked).${pendingReason ? ` Request reason: "${pendingReason}".` : ''}${notes ? ` Admin notes: ${notes}` : ''}`,
       });
 
-      const refreshed = db
+      const refreshed = (await db
         .prepare(`SELECT ${PUBLIC_USER_SELECT} FROM users WHERE id = ?`)
-        .get(targetId) as Record<string, unknown>;
-      res.json({ user: serializePublicUser(refreshed), stats: computeDangerZoneStats() });
-    }
+        .get<Record<string, unknown>>(targetId))!;
+      res.json({ user: serializePublicUser(refreshed), stats: await computeDangerZoneStats() });
+    })
   );
 
   // ===========================================================================
@@ -3077,14 +3429,14 @@ async function startServer() {
     '/api/admin/danger-zone/stats',
     requireAuth,
     requireRole('administrator'),
-    (_req: AuthedRequest, res: Response) => {
-      res.json({ stats: computeDangerZoneStats() });
-    }
+    asyncHandler<AuthedRequest>(async (_req, res) => {
+      res.json({ stats: await computeDangerZoneStats() });
+    })
   );
 
   // Explicit guard confirming audit_logs can never be purged even from the Danger Zone
-  const rejectDangerZoneAuditPurge = (req: AuthedRequest, res: Response) => {
-    logAudit({
+  const rejectDangerZoneAuditPurge = asyncHandler<AuthedRequest>(async (req, res) => {
+    await logAudit({
       req,
       actor: req.user,
       pageVisited: 'Team & Access Management',
@@ -3097,7 +3449,7 @@ async function startServer() {
       error:
         'Audit logs are protected by SQLite immutability triggers (prevent_audit_log_delete, prevent_audit_log_update) and can never be purged.',
     });
-  };
+  });
   app.delete('/api/admin/danger-zone/audit-logs', requireAuth, requireRole('administrator'), rejectDangerZoneAuditPurge);
   app.post('/api/admin/danger-zone/purge-audit-logs', requireAuth, requireRole('administrator'), rejectDangerZoneAuditPurge);
 
@@ -3106,7 +3458,7 @@ async function startServer() {
     '/api/admin/danger-zone/purge-rejected-candidates',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const adminPassword = String(req.body?.admin_password || '');
       const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
 
@@ -3117,17 +3469,17 @@ async function startServer() {
         return;
       }
 
-      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+      if (!(await verifyAdminPassword(req.user!.id, adminPassword))) {
         res.status(403).json({
           error: 'Administrator password verification failed. Action aborted.',
         });
         return;
       }
 
-      const txResult = db.transaction(() => {
-        const targets = db
+      const txResult = await db.transaction(async (tx) => {
+        const targets = await tx
           .prepare(`SELECT id, candidate_code, full_name, status FROM candidates WHERE ${REJECTED_CANDIDATE_STATUS_SQL}`)
-          .all() as Array<{ id: number; candidate_code: string; full_name: string; status: string }>;
+          .all<{ id: number; candidate_code: string; full_name: string; status: string }>();
 
         if (targets.length === 0) {
           return {
@@ -3140,28 +3492,32 @@ async function startServer() {
         const ids = targets.map((t) => t.id);
         const placeholders = ids.map(() => '?').join(', ');
 
-        const docPaths = db
+        const docPaths = await tx
           .prepare(`SELECT file_path FROM candidate_documents WHERE candidate_id IN (${placeholders}) AND file_path != ''`)
-          .all(...ids) as Array<{ file_path: string }>;
-        const offerPaths = db
+          .all<{ file_path: string }>(...ids);
+        const offerPaths = await tx
           .prepare(`SELECT offer_letter_path FROM offers WHERE candidate_id IN (${placeholders}) AND offer_letter_path != ''`)
-          .all(...ids) as Array<{ offer_letter_path: string }>;
+          .all<{ offer_letter_path: string }>(...ids);
 
         // Release any active confirmed slot counts if a rejected candidate somehow still held one
-        const activeBookings = db
+        const activeBookings = await tx
           .prepare(`SELECT slot_id FROM interview_bookings WHERE candidate_id IN (${placeholders}) AND status = 'CONFIRMED'`)
-          .all(...ids) as Array<{ slot_id: number }>;
+          .all<{ slot_id: number }>(...ids);
         for (const b of activeBookings) {
-          db.prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?').run(b.slot_id);
+          await tx
+            .prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?')
+            .run(b.slot_id);
         }
 
-        db.prepare(`DELETE FROM candidates WHERE id IN (${placeholders})`).run(...ids);
+        await tx.prepare(`DELETE FROM candidates WHERE id IN (${placeholders})`).run(...ids);
 
         const candidateFiles = Array.from(
-          new Set([
-            ...docPaths.map((d) => path.basename(d.file_path)),
-            ...offerPaths.map((o) => path.basename(o.offer_letter_path)),
-          ].filter(Boolean))
+          new Set(
+            [
+              ...docPaths.map((d) => normalizeStoredFileRef(d.file_path)),
+              ...offerPaths.map((o) => normalizeStoredFileRef(o.offer_letter_path)),
+            ].filter(Boolean)
+          )
         );
 
         return {
@@ -3169,37 +3525,31 @@ async function startServer() {
           candidateCodes: targets.map((t) => `${t.full_name} (${t.candidate_code})`),
           candidateFiles,
         };
-      })();
+      });
 
-      // Remove physical files from uploads/ only if no remaining record references them
+      // Remove stored files from Google Drive (via ?action=delete&fileId=...) or local uploads/ if no longer referenced
       let removedFiles = 0;
-      for (const fileName of txResult.candidateFiles) {
-        const stillReferencedDoc = db
+      for (const fileRef of txResult.candidateFiles) {
+        const stillReferencedDoc = await db
           .prepare('SELECT id FROM candidate_documents WHERE file_path = ? LIMIT 1')
-          .get(fileName);
-        const stillReferencedOffer = db
+          .get(fileRef);
+        const stillReferencedOffer = await db
           .prepare('SELECT id FROM offers WHERE offer_letter_path = ? LIMIT 1')
-          .get(fileName);
+          .get(fileRef);
         if (stillReferencedDoc || stillReferencedOffer) continue;
 
-        const diskPath = path.join(UPLOADS_ROOT, fileName);
-        try {
-          if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
-            fs.unlinkSync(diskPath);
-            removedFiles += 1;
-          }
-        } catch {
-          // continue removing remaining files
+        if (await deleteStoredFile(fileRef)) {
+          removedFiles += 1;
         }
       }
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
         actionTaken: 'DANGER_PURGE_REJECTED_CANDIDATES',
         targetEntity: `${txResult.purgedCandidates} rejected/withdrawn candidate(s)`,
-        details: `PDPA Retention Cleanup executed via Danger Zone: purged ${txResult.purgedCandidates} rejected/withdrawn candidate record(s) and deleted ${removedFiles} physical file(s) from uploads/. Active pipeline candidates and immutable audit_logs preserved.${
+        details: `PDPA Retention Cleanup executed via Danger Zone: purged ${txResult.purgedCandidates} rejected/withdrawn candidate record(s) and deleted ${removedFiles} stored file(s). Active pipeline candidates and immutable audit_logs preserved.${
           txResult.candidateCodes.length > 0
             ? ` Purged: ${txResult.candidateCodes.slice(0, 15).join(', ')}${txResult.candidateCodes.length > 15 ? ' ...' : ''}.`
             : ''
@@ -3209,9 +3559,9 @@ async function startServer() {
       res.json({
         purgedCandidates: txResult.purgedCandidates,
         removedFiles,
-        stats: computeDangerZoneStats(),
+        stats: await computeDangerZoneStats(),
       });
-    }
+    })
   );
 
   // Danger Zone Action 2: Revoke All Active User Sessions (Force Global Logout via token_version increment)
@@ -3219,7 +3569,7 @@ async function startServer() {
     '/api/admin/danger-zone/revoke-all-sessions',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const adminPassword = String(req.body?.admin_password || '');
       const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
 
@@ -3230,14 +3580,14 @@ async function startServer() {
         return;
       }
 
-      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+      if (!(await verifyAdminPassword(req.user!.id, adminPassword))) {
         res.status(403).json({
           error: 'Administrator password verification failed. Action aborted.',
         });
         return;
       }
 
-      const info = db
+      const info = await db
         .prepare(`UPDATE users SET token_version = COALESCE(token_version, 1) + 1, last_active_at = ''`)
         .run();
 
@@ -3245,7 +3595,7 @@ async function startServer() {
         sessionActivityMap.set(sid, { ...session, revoked: true });
       }
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
@@ -3258,7 +3608,7 @@ async function startServer() {
         revokedAccounts: info.changes,
         forceReauth: true,
       });
-    }
+    })
   );
 
   // Danger Zone Action 4: Reset Unbooked Future Interview Slots (Preserves Booked Candidate Interviews)
@@ -3266,7 +3616,7 @@ async function startServer() {
     '/api/admin/danger-zone/reset-interview-slots',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       const adminPassword = String(req.body?.admin_password || '');
       const confirmationPhrase = String(req.body?.confirmation_phrase || '').trim();
 
@@ -3277,7 +3627,7 @@ async function startServer() {
         return;
       }
 
-      if (!verifyAdminPassword(req.user!.id, adminPassword)) {
+      if (!(await verifyAdminPassword(req.user!.id, adminPassword))) {
         res.status(403).json({
           error: 'Administrator password verification failed. Action aborted.',
         });
@@ -3285,8 +3635,8 @@ async function startServer() {
       }
 
       const todayMyt = getMalaysiaDateStamp(new Date());
-      const txResult = db.transaction(() => {
-        const deleteInfo = db
+      const txResult = await db.transaction(async (tx) => {
+        const deleteInfo = await tx
           .prepare(
             `DELETE FROM interview_slots
              WHERE date >= ?
@@ -3295,21 +3645,23 @@ async function startServer() {
           )
           .run(todayMyt);
 
-        const preservedBookedSlots = (
-          db
-            .prepare(
-              `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
-            )
-            .get() as { count: number }
-        ).count;
+        const preservedBookedSlots = Number(
+          (
+            await tx
+              .prepare(
+                `SELECT COUNT(*) as count FROM interview_slots WHERE booked_count > 0 OR id IN (SELECT DISTINCT slot_id FROM interview_bookings WHERE status = 'CONFIRMED')`
+              )
+              .get<{ count: number }>()
+          )?.count ?? 0
+        );
 
         return {
           deletedSlots: deleteInfo.changes,
           preservedBookedSlots,
         };
-      })();
+      });
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Team & Access Management',
@@ -3321,56 +3673,63 @@ async function startServer() {
       res.json({
         deletedSlots: txResult.deletedSlots,
         preservedBookedSlots: txResult.preservedBookedSlots,
-        stats: computeDangerZoneStats(),
+        stats: await computeDangerZoneStats(),
       });
-    }
+    })
   );
 
-  app.delete('/api/users/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const targetId = Number(req.params.id);
-    if (req.user && targetId === req.user.id) {
-      res.status(400).json({ error: 'You cannot delete your own currently signed-in account.' });
-      return;
-    }
-
-    const target = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(targetId) as
-      | { id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }
-      | undefined;
-    if (!target) {
-      res.status(404).json({ error: 'User account not found.' });
-      return;
-    }
-
-    if (target.role === 'administrator' && target.status === 'approved') {
-      const adminCount = (
-        db
-          .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
-          .get() as { count: number }
-      ).count;
-      if (adminCount <= 1) {
-        res.status(400).json({ error: 'Cannot delete the last remaining active Administrator account.' });
+  app.delete(
+    '/api/users/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler<AuthedRequest>(async (req, res) => {
+      const targetId = Number(req.params.id);
+      if (req.user && targetId === req.user.id) {
+        res.status(400).json({ error: 'You cannot delete your own currently signed-in account.' });
         return;
       }
-    }
 
-    db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
-    for (const [sid, session] of sessionActivityMap.entries()) {
-      if (session.userId === targetId) {
-        sessionActivityMap.set(sid, { ...session, revoked: true });
+      const target = await db
+        .prepare('SELECT id, name, email, role, status FROM users WHERE id = ?')
+        .get<{ id: number; name: string; email: string; role: StaffRole; status: UserApprovalStatus }>(targetId);
+      if (!target) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
       }
-    }
 
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Team & Access Management',
-      actionTaken: 'DELETE_USER',
-      targetEntity: `${target.name} (${target.email})`,
-      details: `Removed ${target.role} account (${target.email}, status: ${target.status}).`,
-    });
+      if (target.role === 'administrator' && target.status === 'approved') {
+        const adminCount = Number(
+          (
+            await db
+              .prepare(`SELECT COUNT(*) as count FROM users WHERE role = 'administrator' AND status = 'approved'`)
+              .get<{ count: number }>()
+          )?.count ?? 0
+        );
+        if (adminCount <= 1) {
+          res.status(400).json({ error: 'Cannot delete the last remaining active Administrator account.' });
+          return;
+        }
+      }
 
-    res.json({ deleted: true });
-  });
+      await db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+      for (const [sid, session] of sessionActivityMap.entries()) {
+        if (session.userId === targetId) {
+          sessionActivityMap.set(sid, { ...session, revoked: true });
+        }
+      }
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Team & Access Management',
+        actionTaken: 'DELETE_USER',
+        targetEntity: `${target.name} (${target.email})`,
+        details: `Removed ${target.role} account (${target.email}, status: ${target.status}).`,
+      });
+
+      res.json({ deleted: true });
+    })
+  );
 
   // ===========================================================================
   // 2. GEMINI AI RESUME PARSER & JOB-FIT SCORECARD (SERVER-SIDE ONLY)
@@ -3380,7 +3739,7 @@ async function startServer() {
     requireAuth,
     requireRole('administrator'),
     parseResumeMultipartIfPresent,
-    async (req: AuthedRequest, res: Response) => {
+    asyncHandler<AuthedRequest>(async (req, res) => {
       try {
         const body = (req.body ?? {}) as Record<string, unknown>;
         const uploadedFile: Express.Multer.File | null =
@@ -3404,7 +3763,6 @@ async function startServer() {
         }
 
         const result = await extractDocumentWithGemini({
-          filePath: uploadedFile?.path,
           fileBuffer: uploadedFile?.buffer,
           fileBase64: !uploadedFile ? rawJsonBase64 : undefined,
           fileName,
@@ -3426,7 +3784,7 @@ async function startServer() {
         }
 
         const extracted = result.data;
-        logAudit({
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Candidate Intake Modal',
@@ -3462,463 +3820,509 @@ async function startServer() {
         const { statusCode, userMessage } = formatGeminiError(err);
         res.status(statusCode).json({ error: userMessage });
       }
-    }
+    })
   );
 
   // ===========================================================================
   // 3. CANDIDATE CRUD, WORKFLOW TRANSITIONS & DOCUMENT UPLOADS
   // ===========================================================================
-  app.get('/api/candidates', requireAuth, (req: AuthedRequest, res: Response) => {
-    const rows = db
-      .prepare('SELECT * FROM candidates ORDER BY applied_date DESC, id DESC')
-      .all() as Array<Record<string, unknown>>;
-    const role = req.user!.role;
-    const candidates = rows.map((r) => hydrateCandidate(r, role));
-    res.json({ candidates });
-  });
+  app.get(
+    '/api/candidates',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const rows = (await db
+        .prepare('SELECT * FROM candidates ORDER BY applied_date DESC, id DESC')
+        .all()) as Array<Record<string, unknown>>;
+      const role = req.user!.role;
+      const candidates = await Promise.all(rows.map((r) => hydrateCandidate(r, role, req)));
+      res.json({ candidates });
+    })
+  );
 
-  app.get('/api/candidates/:id', requireAuth, (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    const row = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Candidate not found.' });
-      return;
-    }
-    res.json({ candidate: hydrateCandidate(row, req.user!.role) });
-  });
-
-  app.post('/api/candidates', requireAuth, requireRole('administrator'), upload.single('resumeFile'), async (req: AuthedRequest, res: Response) => {
-    const body = req.body ?? {};
-    const fullName = String(body.full_name || body.fullName || '').trim();
-    const email = String(body.email || '').trim().toLowerCase();
-    const phone = String(body.phone || '').trim();
-    const location = String(body.location || 'Kuala Lumpur, Malaysia').trim();
-    const position = String(body.position || body.positionApplied || '').trim();
-    const department = normalizeDepartment(body.department, 'HR');
-    const source = body.source === 'Email' ? 'Email' : 'JobStreet';
-    const education = String(body.education || body.educationSummary || '').trim();
-    const experience = String(body.experience || body.experienceSummary || '').trim();
-    const yearsExperience = Math.max(0, Math.min(60, Number(body.years_experience ?? body.yearsExperience ?? 0) || 0));
-    const aiScore = Math.max(0, Math.min(100, Math.round(Number(body.ai_score ?? body.aiMatchScore ?? 0) || 0)));
-    const aiSummary = String(body.ai_summary || body.aiSummary || '').trim();
-    const hasUec = body.hasUec === true || body.hasUec === 'true';
-
-    let skillsArr: string[] = [];
-    if (Array.isArray(body.skills)) {
-      skillsArr = body.skills.map(String).filter(Boolean).slice(0, 20);
-    } else if (typeof body.skills === 'string' && body.skills.trim()) {
-      try {
-        const parsed = JSON.parse(body.skills);
-        skillsArr = Array.isArray(parsed) ? parsed.map(String) : body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
-      } catch {
-        skillsArr = body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
-      }
-    }
-
-    if (!fullName || !email || !phone || !position || !department) {
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(400).json({ error: 'Full name, email, phone, position, and department are required.' });
-      return;
-    }
-
-    // Duplicate check by email OR normalized phone
-    const emailDup = db.prepare('SELECT id, candidate_code, full_name FROM candidates WHERE lower(email) = ?').get(email) as
-      | { id: number; candidate_code: string; full_name: string }
-      | undefined;
-    if (emailDup) {
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(409).json({
-        error: `Duplicate candidate blocked: ${emailDup.full_name} (${emailDup.candidate_code}) already exists with email ${email}.`,
-      });
-      return;
-    }
-
-    const normPhone = normalizePhone(phone);
-    const allPhones = db.prepare('SELECT id, candidate_code, full_name, phone FROM candidates').all() as Array<{
-      id: number;
-      candidate_code: string;
-      full_name: string;
-      phone: string;
-    }>;
-    const phoneDup = allPhones.find((c) => normalizePhone(c.phone) === normPhone && normPhone.length >= 7);
-    if (phoneDup) {
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(409).json({
-        error: `Duplicate candidate blocked: ${phoneDup.full_name} (${phoneDup.candidate_code}) already exists with matching phone number.`,
-      });
-      return;
-    }
-
-    const candidateCode = generateCandidateCode();
-    const portalToken = generatePortalToken();
-    const appliedDate = String(body.applied_date || new Date().toISOString().slice(0, 10));
-
-    const info = db
-      .prepare(`
-        INSERT INTO candidates (
-          candidate_code, full_name, phone, email, location, position, department, source,
-          applied_date, stage, status, education, experience, years_experience, skills,
-          ai_score, ai_summary, portal_token
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 3, 'pending_screening', ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        candidateCode,
-        fullName,
-        phone,
-        email,
-        location,
-        position,
-        department,
-        source,
-        appliedDate,
-        education,
-        experience,
-        yearsExperience,
-        JSON.stringify(skillsArr),
-        aiScore,
-        aiSummary,
-        portalToken
-      );
-
-    const candidateId = Number(info.lastInsertRowid);
-    ensureCandidateDocumentRows(candidateId, hasUec);
-
-    if (req.file) {
-      db.prepare(`
-        UPDATE candidate_documents
-        SET completed = 1, verified = 1, file_name = ?, file_path = ?, uploaded_at = datetime('now')
-        WHERE candidate_id = ? AND doc_type = 'RESUME'
-      `).run(req.file.originalname, req.file.filename, candidateId);
-
-      if (aiSummary || aiScore > 0) {
-        const intakeResumeJson = JSON.stringify({
-          full_name: fullName,
-          email,
-          phone,
-          location,
-          years_experience: yearsExperience,
-          has_uec: hasUec,
-          skills: skillsArr,
-          education,
-          experience,
-          ai_score: aiScore,
-          ai_summary: aiSummary,
-          extracted_at: new Date().toISOString(),
-        });
-        db.prepare(`
-          UPDATE candidate_documents
-          SET ai_extracted_json = ?, ai_verified_status = 'VERIFIED_MATCH'
-          WHERE candidate_id = ? AND doc_type = 'RESUME'
-        `).run(intakeResumeJson, candidateId);
-      } else {
-        await runAndPersistDocumentExtraction({
-          req,
-          actor: req.user,
-          pageVisited: 'Candidate Intake Modal',
-          candidateId,
-          candidateCode,
-          candidateName: fullName,
-          position,
-          department,
-          docType: 'RESUME',
-          filePath: req.file.path,
-          fileName: req.file.originalname,
-          mimeType: req.file.mimetype,
-        });
-      }
-    } else if (body.resumeFileName) {
-      db.prepare(`
-        UPDATE candidate_documents
-        SET completed = 1, verified = 1, file_name = ?, uploaded_at = datetime('now')
-        WHERE candidate_id = ? AND doc_type = 'RESUME'
-      `).run(String(body.resumeFileName), candidateId);
-    }
-
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Candidate Intake Modal',
-      actionTaken: 'CREATE_CANDIDATE',
-      targetEntity: `${fullName} (${candidateCode})`,
-      details: `Registered ${fullName} (${candidateCode}) via ${source} for ${position} (${department}), AI Job-Fit Score: ${aiScore}%.`,
-    });
-
-    const row = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
-    res.status(201).json({ candidate: hydrateCandidate(row, req.user!.role) });
-  });
-
-  // Update candidate workflow stages, screening decision, docs verification, qualification, panel evaluation
-  app.patch('/api/candidates/:id', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
-      | Record<string, unknown>
-      | undefined;
-
-    if (!existing) {
-      res.status(404).json({ error: 'Candidate not found.' });
-      return;
-    }
-
-    const body = req.body ?? {};
-    const actionType = String(body.actionType || 'generic');
-    const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(existing.portal_token)}`;
-
-    // 1. Stage 4 Screening Decision
-    if (actionType === 'screening_decision') {
-      const decision = String(body.screening_decision || 'pending');
-      const remarks = String(body.screening_remarks || '').trim();
-      if (decision === 'reject' && !remarks) {
-        res.status(400).json({ error: 'A mandatory rejection reason is required when rejecting a candidate.' });
+  app.get(
+    '/api/candidates/:id',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const row = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as
+        | Record<string, unknown>
+        | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'Candidate not found.' });
         return;
       }
-      const nextStage = decision === 'proceed' ? 5 : decision === 'reject' ? 4 : 3;
-      const nextStatus =
-        decision === 'proceed'
-          ? 'shortlisted_docs'
-          : decision === 'reject'
-            ? 'rejected_screening'
-            : 'pending_screening';
+      res.json({ candidate: await hydrateCandidate(row, req.user!.role, req) });
+    })
+  );
 
-      db.prepare(`
-        UPDATE candidates
-        SET stage = ?, status = ?, screening_decision = ?, screening_remarks = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(nextStage, nextStatus, decision, remarks, id);
+  app.post(
+    '/api/candidates',
+    requireAuth,
+    requireRole('administrator'),
+    upload.single('resumeFile'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const body = req.body ?? {};
+      const fullName = String(body.full_name || body.fullName || '').trim();
+      const email = String(body.email || '').trim().toLowerCase();
+      const phone = String(body.phone || '').trim();
+      const location = String(body.location || 'Kuala Lumpur, Malaysia').trim();
+      const position = String(body.position || body.positionApplied || '').trim();
+      const department = normalizeDepartment(body.department, 'HR');
+      const source = body.source === 'Email' ? 'Email' : 'JobStreet';
+      const education = String(body.education || body.educationSummary || '').trim();
+      const experience = String(body.experience || body.experienceSummary || '').trim();
+      const yearsExperience = Math.max(0, Math.min(60, Number(body.years_experience ?? body.yearsExperience ?? 0) || 0));
+      const aiScore = Math.max(0, Math.min(100, Math.round(Number(body.ai_score ?? body.aiMatchScore ?? 0) || 0)));
+      const aiSummary = String(body.ai_summary || body.aiSummary || '').trim();
+      const hasUec = body.hasUec === true || body.hasUec === 'true';
 
-      if (decision === 'proceed') {
-        await dispatchEmail({
-          candidateId: id,
-          candidateName: String(existing.full_name),
-          recipientEmail: String(existing.email),
-          templateType: 'shortlist_forms_disc',
-          subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Upload Application Form, Assessments & Academic Docs`,
-          bodyText: [
-            `Dear ${existing.full_name},`,
-            '',
-            `Congratulations! Your application for ${existing.position} (${existing.department}) has progressed to the next stage.`,
-            '',
-            'Please upload the following completed documents directly via your Candidate Self-Service Portal (accepted formats: PDF, PNG, JPG, WEBP, DOCX):',
-            '- Employment Application Form (Mandatory)',
-            '- DISC Assessment Report / Sheet (Mandatory)',
-            '- VAKAD Assessment Report / Sheet (Mandatory)',
-            '- SPM Examination Results (Mandatory)',
-            '- UEC Examination Results (If applicable)',
-            '- University Degree Certificate (Mandatory)',
-            '- University Academic Transcript (Mandatory)',
-            '',
-            `Candidate Self-Service Portal Link: ${portalUrl}`,
-            '',
-            'Best regards,',
-            'TalentFlow MY HR Recruitment Team',
-          ].join('\n'),
-          stageTriggered: 5,
-          triggeredBy: req.user!.email,
-          req,
-          actor: req.user,
-          pageVisited: 'Candidate Detail Drawer',
-        });
-      } else if (decision === 'reject') {
-        await dispatchEmail({
-          candidateId: id,
-          candidateName: String(existing.full_name),
-          recipientEmail: String(existing.email),
-          templateType: 'rejection_notice',
-          subject: `Application Update — ${existing.position}`,
-          bodyText: `Dear ${existing.full_name},\n\nThank you for applying for the ${existing.position} position (${existing.department}). After careful review, we will not be moving forward at this stage.\n\nWe appreciate your interest and wish you every success.\n\nTalentFlow MY HR Team`,
-          stageTriggered: 4,
-          triggeredBy: req.user!.email,
-          req,
-          actor: req.user,
-          pageVisited: 'Candidate Detail Drawer',
-        });
+      let skillsArr: string[] = [];
+      if (Array.isArray(body.skills)) {
+        skillsArr = body.skills.map(String).filter(Boolean).slice(0, 20);
+      } else if (typeof body.skills === 'string' && body.skills.trim()) {
+        try {
+          const parsed = JSON.parse(body.skills);
+          skillsArr = Array.isArray(parsed)
+            ? parsed.map(String)
+            : body.skills
+                .split(',')
+                .map((s: string) => s.trim())
+                .filter(Boolean);
+        } catch {
+          skillsArr = body.skills
+            .split(',')
+            .map((s: string) => s.trim())
+            .filter(Boolean);
+        }
       }
 
-      logAudit({
-        req,
-        actor: req.user,
-        pageVisited: 'Candidate Detail Drawer',
-        actionTaken: 'UPDATE_SCREENING_DECISION',
-        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-        details:
-          decision === 'proceed'
-            ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Candidate Portal upload request (Application Form, DISC, VAKAD & Academic Docs).`
-            : `Updated screening decision for ${existing.full_name} to "${decision}". Remarks: ${remarks || 'None'}`,
-      });
-    }
-    // 2. Stage 6-7 Document Checklist & Google Apps Script Verification
-    else if (actionType === 'docs_verification') {
-      const docsUpdates = Array.isArray(body.documents) ? body.documents : [];
-      const discProfile = String(body.disc_profile ?? existing.disc_profile ?? '').trim();
+      if (!fullName || !email || !phone || !position || !department) {
+        res.status(400).json({ error: 'Full name, email, phone, position, and department are required.' });
+        return;
+      }
 
-      const updateDocStmt = db.prepare(`
-        UPDATE candidate_documents
-        SET completed = ?, verified = ?, not_applicable = ?
-        WHERE candidate_id = ? AND doc_type = ?
-      `);
+      // Duplicate check by email OR normalized phone
+      const emailDup = (await db
+        .prepare('SELECT id, candidate_code, full_name FROM candidates WHERE lower(email) = ?')
+        .get(email)) as { id: number; candidate_code: string; full_name: string } | undefined;
+      if (emailDup) {
+        res.status(409).json({
+          error: `Duplicate candidate blocked: ${emailDup.full_name} (${emailDup.candidate_code}) already exists with email ${email}.`,
+        });
+        return;
+      }
 
-      for (const item of docsUpdates) {
-        updateDocStmt.run(
-          item.completed ? 1 : 0,
-          item.verified ? 1 : 0,
-          item.not_applicable ? 1 : 0,
-          id,
-          String(item.doc_type)
+      const normPhone = normalizePhone(phone);
+      const allPhones = (await db.prepare('SELECT id, candidate_code, full_name, phone FROM candidates').all()) as Array<{
+        id: number;
+        candidate_code: string;
+        full_name: string;
+        phone: string;
+      }>;
+      const phoneDup = allPhones.find((c) => normalizePhone(c.phone) === normPhone && normPhone.length >= 7);
+      if (phoneDup) {
+        res.status(409).json({
+          error: `Duplicate candidate blocked: ${phoneDup.full_name} (${phoneDup.candidate_code}) already exists with matching phone number.`,
+        });
+        return;
+      }
+
+      // Persist uploaded resume file first so a storage error does not leave an orphan candidate record
+      const storedResume = req.file ? await saveUploadedFile(req.file) : null;
+
+      const candidateCode = generateCandidateCode();
+      const portalToken = generatePortalToken();
+      const appliedDate = String(body.applied_date || new Date().toISOString().slice(0, 10));
+
+      const info = await db
+        .prepare(`
+          INSERT INTO candidates (
+            candidate_code, full_name, phone, email, location, position, department, source,
+            applied_date, stage, status, education, experience, years_experience, skills,
+            ai_score, ai_summary, portal_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 3, 'pending_screening', ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          candidateCode,
+          fullName,
+          phone,
+          email,
+          location,
+          position,
+          department,
+          source,
+          appliedDate,
+          education,
+          experience,
+          yearsExperience,
+          JSON.stringify(skillsArr),
+          aiScore,
+          aiSummary,
+          portalToken
         );
+
+      const candidateId = Number(info.lastInsertRowid);
+      await ensureCandidateDocumentRows(candidateId, hasUec);
+
+      if (req.file && storedResume) {
+        await db
+          .prepare(`
+            UPDATE candidate_documents
+            SET completed = 1, verified = 1, file_name = ?, file_path = ?, uploaded_at = datetime('now')
+            WHERE candidate_id = ? AND doc_type = 'RESUME'
+          `)
+          .run(storedResume.fileName, storedResume.filePath, candidateId);
+
+        if (aiSummary || aiScore > 0) {
+          const intakeResumeJson = JSON.stringify({
+            full_name: fullName,
+            email,
+            phone,
+            location,
+            years_experience: yearsExperience,
+            has_uec: hasUec,
+            skills: skillsArr,
+            education,
+            experience,
+            ai_score: aiScore,
+            ai_summary: aiSummary,
+            extracted_at: new Date().toISOString(),
+          });
+          await db
+            .prepare(`
+              UPDATE candidate_documents
+              SET ai_extracted_json = ?, ai_verified_status = 'VERIFIED_MATCH'
+              WHERE candidate_id = ? AND doc_type = 'RESUME'
+            `)
+            .run(intakeResumeJson, candidateId);
+        } else {
+          await runAndPersistDocumentExtraction({
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Intake Modal',
+            candidateId,
+            candidateCode,
+            candidateName: fullName,
+            position,
+            department,
+            docType: 'RESUME',
+            filePath: storedResume.filePath,
+            fileBuffer: req.file.buffer,
+            fileName: storedResume.fileName,
+            mimeType: req.file.mimetype,
+          });
+        }
+      } else if (body.resumeFileName) {
+        await db
+          .prepare(`
+            UPDATE candidate_documents
+            SET completed = 1, verified = 1, file_name = ?, uploaded_at = datetime('now')
+            WHERE candidate_id = ? AND doc_type = 'RESUME'
+          `)
+          .run(String(body.resumeFileName), candidateId);
       }
 
-      const missing = getMissingDocsForCandidate(id);
-      const currentStage = Number(existing.stage);
-      const nextStage = currentStage < 7 ? (missing.length === 0 ? 7 : 6) : currentStage;
-      const nextStatus =
-        currentStage <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(existing.status);
-
-      db.prepare(`
-        UPDATE candidates
-        SET stage = ?, status = ?, disc_profile = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(nextStage, nextStatus, discProfile, id);
-
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
-        pageVisited: 'Candidate Detail Drawer',
-        actionTaken: 'VERIFY_DOCUMENT',
-        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-        details: `Verified forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}${discProfile ? `, DISC: ${discProfile}` : ''}).`,
+        pageVisited: 'Candidate Intake Modal',
+        actionTaken: 'CREATE_CANDIDATE',
+        targetEntity: `${fullName} (${candidateCode})`,
+        details: `Registered ${fullName} (${candidateCode}) via ${source} for ${position} (${department}), AI Job-Fit Score: ${aiScore}%.`,
       });
-    }
-    // 3. Stage 8 -> 9 Qualification Decision + Auto Interview Invite
-    else if (actionType === 'qualification_decision') {
-      const qualStatus = String(body.qualification_status || 'pending');
-      const qualRemarks = String(body.qualification_remarks || '').trim();
 
-      const nextStage = qualStatus === 'qualified' ? 9 : qualStatus === 'not_qualified' ? 8 : 7;
-      const nextStatus =
-        qualStatus === 'qualified'
-          ? 'interview_invited'
-          : qualStatus === 'not_qualified'
-            ? 'not_qualified'
-            : 'docs_under_review';
+      const row = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId)) as Record<string, unknown>;
+      res.status(201).json({ candidate: await hydrateCandidate(row, req.user!.role, req) });
+    })
+  );
 
-      db.prepare(`
-        UPDATE candidates
-        SET stage = ?, status = ?, qualification_status = ?, qualification_remarks = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(nextStage, nextStatus, qualStatus, qualRemarks, id);
+  // Update candidate workflow stages, screening decision, docs verification, qualification, panel evaluation
+  app.patch(
+    '/api/candidates/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const existing = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as
+        | Record<string, unknown>
+        | undefined;
 
-      if (qualStatus === 'qualified') {
-        await dispatchEmail({
-          candidateId: id,
-          candidateName: String(existing.full_name),
-          recipientEmail: String(existing.email),
-          templateType: 'interview_invite',
-          subject: `[Interview Invitation] Select Your Interview Slot — ${existing.position}`,
-          bodyText: [
-            `Dear ${existing.full_name},`,
-            '',
-            `Great news! Your forms and academic credentials for ${existing.position} (${existing.department}) have been verified and you are Qualified for the interview stage.`,
-            '',
-            'Please open your personal Self-Service Interview Portal link below to reserve an available date and time slot:',
-            portalUrl,
-            '',
-            'Slots are reserved atomically on a first-come basis and you will receive an instant confirmation email upon booking.',
-            '',
-            'Best regards,',
-            'TalentFlow MY Recruitment Team',
-          ].join('\n'),
-          stageTriggered: 9,
-          triggeredBy: req.user!.email,
+      if (!existing) {
+        res.status(404).json({ error: 'Candidate not found.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const actionType = String(body.actionType || 'generic');
+      const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(existing.portal_token)}`;
+
+      // 1. Stage 4 Screening Decision
+      if (actionType === 'screening_decision') {
+        const decision = String(body.screening_decision || 'pending');
+        const remarks = String(body.screening_remarks || '').trim();
+        if (decision === 'reject' && !remarks) {
+          res.status(400).json({ error: 'A mandatory rejection reason is required when rejecting a candidate.' });
+          return;
+        }
+        const nextStage = decision === 'proceed' ? 5 : decision === 'reject' ? 4 : 3;
+        const nextStatus =
+          decision === 'proceed'
+            ? 'shortlisted_docs'
+            : decision === 'reject'
+              ? 'rejected_screening'
+              : 'pending_screening';
+
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET stage = ?, status = ?, screening_decision = ?, screening_remarks = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(nextStage, nextStatus, decision, remarks, id);
+
+        if (decision === 'proceed') {
+          await dispatchEmail({
+            candidateId: id,
+            candidateName: String(existing.full_name),
+            recipientEmail: String(existing.email),
+            templateType: 'shortlist_forms_disc',
+            subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Upload Application Form, Assessments & Academic Docs`,
+            bodyText: [
+              `Dear ${existing.full_name},`,
+              '',
+              `Congratulations! Your application for ${existing.position} (${existing.department}) has progressed to the next stage.`,
+              '',
+              'Please upload the following completed documents directly via your Candidate Self-Service Portal (accepted formats: PDF, PNG, JPG, WEBP, DOCX):',
+              '- Employment Application Form (Mandatory)',
+              '- DISC Assessment Report / Sheet (Mandatory)',
+              '- VAKAD Assessment Report / Sheet (Mandatory)',
+              '- SPM Examination Results (Mandatory)',
+              '- UEC Examination Results (If applicable)',
+              '- University Degree Certificate (Mandatory)',
+              '- University Academic Transcript (Mandatory)',
+              '',
+              `Candidate Self-Service Portal Link: ${portalUrl}`,
+              '',
+              'Best regards,',
+              'TalentFlow MY HR Recruitment Team',
+            ].join('\n'),
+            stageTriggered: 5,
+            triggeredBy: req.user!.email,
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Detail Drawer',
+          });
+        } else if (decision === 'reject') {
+          await dispatchEmail({
+            candidateId: id,
+            candidateName: String(existing.full_name),
+            recipientEmail: String(existing.email),
+            templateType: 'rejection_notice',
+            subject: `Application Update — ${existing.position}`,
+            bodyText: `Dear ${existing.full_name},\n\nThank you for applying for the ${existing.position} position (${existing.department}). After careful review, we will not be moving forward at this stage.\n\nWe appreciate your interest and wish you every success.\n\nTalentFlow MY HR Team`,
+            stageTriggered: 4,
+            triggeredBy: req.user!.email,
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Detail Drawer',
+          });
+        }
+
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Candidate Detail Drawer',
+          actionTaken: 'UPDATE_SCREENING_DECISION',
+          targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+          details:
+            decision === 'proceed'
+              ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Candidate Portal upload request (Application Form, DISC, VAKAD & Academic Docs).`
+              : `Updated screening decision for ${existing.full_name} to "${decision}". Remarks: ${remarks || 'None'}`,
         });
-      } else if (qualStatus === 'not_qualified') {
-        await dispatchEmail({
-          candidateId: id,
-          candidateName: String(existing.full_name),
-          recipientEmail: String(existing.email),
-          templateType: 'rejection_notice',
-          subject: `Application Update — ${existing.position}`,
-          bodyText: `Dear ${existing.full_name},\n\nThank you for submitting your assessments and academic documents for ${existing.position}. After review, we will not be advancing to the interview stage at this time.\n\nBest wishes,\nTalentFlow MY HR Team`,
-          stageTriggered: 8,
-          triggeredBy: req.user!.email,
+      }
+      // 2. Stage 6-7 Document Checklist & Verification
+      else if (actionType === 'docs_verification') {
+        const docsUpdates = Array.isArray(body.documents) ? body.documents : [];
+        const discProfile = String(body.disc_profile ?? existing.disc_profile ?? '').trim();
+
+        const updateDocStmt = db.prepare(`
+          UPDATE candidate_documents
+          SET completed = ?, verified = ?, not_applicable = ?
+          WHERE candidate_id = ? AND doc_type = ?
+        `);
+
+        for (const item of docsUpdates) {
+          await updateDocStmt.run(
+            item.completed ? 1 : 0,
+            item.verified ? 1 : 0,
+            item.not_applicable ? 1 : 0,
+            id,
+            String(item.doc_type)
+          );
+        }
+
+        const missing = await getMissingDocsForCandidate(id);
+        const currentStage = Number(existing.stage);
+        const nextStage = currentStage < 7 ? (missing.length === 0 ? 7 : 6) : currentStage;
+        const nextStatus =
+          currentStage <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(existing.status);
+
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET stage = ?, status = ?, disc_profile = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(nextStage, nextStatus, discProfile, id);
+
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Candidate Detail Drawer',
+          actionTaken: 'VERIFY_DOCUMENT',
+          targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+          details: `Verified forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}${discProfile ? `, DISC: ${discProfile}` : ''}).`,
         });
       }
+      // 3. Stage 8 -> 9 Qualification Decision + Auto Interview Invite
+      else if (actionType === 'qualification_decision') {
+        const qualStatus = String(body.qualification_status || 'pending');
+        const qualRemarks = String(body.qualification_remarks || '').trim();
 
-      logAudit({
-        req,
-        actor: req.user,
-        pageVisited: 'Candidate Detail Drawer',
-        actionTaken: 'UPDATE_QUALIFICATION',
-        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-        details: `Classified ${existing.full_name} as "${qualStatus}". Remarks: ${qualRemarks || 'None'}`,
-      });
-    }
-    // 4. Stage 11-12 Post-Interview Evaluation & Decision
-    else if (actionType === 'post_interview') {
-      const feedback = String(body.interview_feedback || '').trim();
-      const rating = Math.max(0, Math.min(5, Math.round(Number(body.interview_rating) || 0)));
-      const decision = String(body.post_interview_decision || 'pending');
-      const notes = String(body.final_decision_notes || '').trim();
+        const nextStage = qualStatus === 'qualified' ? 9 : qualStatus === 'not_qualified' ? 8 : 7;
+        const nextStatus =
+          qualStatus === 'qualified'
+            ? 'interview_invited'
+            : qualStatus === 'not_qualified'
+              ? 'not_qualified'
+              : 'docs_under_review';
 
-      const nextStatus = decision === 'reject' ? 'rejected_post_interview' : 'interview_completed';
-      db.prepare(`
-        UPDATE candidates
-        SET stage = 12, status = ?, interview_feedback = ?, interview_rating = ?,
-            post_interview_decision = ?, final_decision_notes = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(nextStatus, feedback, rating, decision, notes, id);
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET stage = ?, status = ?, qualification_status = ?, qualification_remarks = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(nextStage, nextStatus, qualStatus, qualRemarks, id);
 
-      if (decision === 'reject') {
-        await dispatchEmail({
-          candidateId: id,
-          candidateName: String(existing.full_name),
-          recipientEmail: String(existing.email),
-          templateType: 'rejection_notice',
-          subject: `Interview Outcome — ${existing.position}`,
-          bodyText: `Dear ${existing.full_name},\n\nThank you for interviewing with our team for ${existing.position} (${existing.department}). While we appreciated meeting you, we have decided to proceed with another candidate at this time.\n\nWarm regards,\nTalentFlow MY HR Team`,
-          stageTriggered: 12,
-          triggeredBy: req.user!.email,
+        if (qualStatus === 'qualified') {
+          await dispatchEmail({
+            candidateId: id,
+            candidateName: String(existing.full_name),
+            recipientEmail: String(existing.email),
+            templateType: 'interview_invite',
+            subject: `[Interview Invitation] Select Your Interview Slot — ${existing.position}`,
+            bodyText: [
+              `Dear ${existing.full_name},`,
+              '',
+              `Great news! Your forms and academic credentials for ${existing.position} (${existing.department}) have been verified and you are Qualified for the interview stage.`,
+              '',
+              'Please open your personal Self-Service Interview Portal link below to reserve an available date and time slot:',
+              portalUrl,
+              '',
+              'Slots are reserved atomically on a first-come basis and you will receive an instant confirmation email upon booking.',
+              '',
+              'Best regards,',
+              'TalentFlow MY Recruitment Team',
+            ].join('\n'),
+            stageTriggered: 9,
+            triggeredBy: req.user!.email,
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Detail Drawer',
+          });
+        } else if (qualStatus === 'not_qualified') {
+          await dispatchEmail({
+            candidateId: id,
+            candidateName: String(existing.full_name),
+            recipientEmail: String(existing.email),
+            templateType: 'rejection_notice',
+            subject: `Application Update — ${existing.position}`,
+            bodyText: `Dear ${existing.full_name},\n\nThank you for submitting your assessments and academic documents for ${existing.position}. After review, we will not be advancing to the interview stage at this time.\n\nBest wishes,\nTalentFlow MY HR Team`,
+            stageTriggered: 8,
+            triggeredBy: req.user!.email,
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Detail Drawer',
+          });
+        }
+
+        await logAudit({
           req,
           actor: req.user,
           pageVisited: 'Candidate Detail Drawer',
+          actionTaken: 'UPDATE_QUALIFICATION',
+          targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+          details: `Classified ${existing.full_name} as "${qualStatus}". Remarks: ${qualRemarks || 'None'}`,
+        });
+      }
+      // 4. Stage 11-12 Post-Interview Evaluation & Decision
+      else if (actionType === 'post_interview') {
+        const feedback = String(body.interview_feedback || '').trim();
+        const rating = Math.max(0, Math.min(5, Math.round(Number(body.interview_rating) || 0)));
+        const decision = String(body.post_interview_decision || 'pending');
+        const notes = String(body.final_decision_notes || '').trim();
+
+        const nextStatus = decision === 'reject' ? 'rejected_post_interview' : 'interview_completed';
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET stage = 12, status = ?, interview_feedback = ?, interview_rating = ?,
+                post_interview_decision = ?, final_decision_notes = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(nextStatus, feedback, rating, decision, notes, id);
+
+        if (decision === 'reject') {
+          await dispatchEmail({
+            candidateId: id,
+            candidateName: String(existing.full_name),
+            recipientEmail: String(existing.email),
+            templateType: 'rejection_notice',
+            subject: `Interview Outcome — ${existing.position}`,
+            bodyText: `Dear ${existing.full_name},\n\nThank you for interviewing with our team for ${existing.position} (${existing.department}). While we appreciated meeting you, we have decided to proceed with another candidate at this time.\n\nWarm regards,\nTalentFlow MY HR Team`,
+            stageTriggered: 12,
+            triggeredBy: req.user!.email,
+            req,
+            actor: req.user,
+            pageVisited: 'Candidate Detail Drawer',
+          });
+        }
+
+        await logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
+          actionTaken: 'RECORD_INTERVIEW_FEEDBACK',
+          targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+          details: `Recorded panel rating ${rating}/5 and post-interview decision "${decision}" for ${existing.full_name}.`,
+        });
+      }
+      // Generic profile update
+      else {
+        const fullName = String(body.full_name ?? existing.full_name).trim();
+        const position = String(body.position ?? existing.position).trim();
+        const department = normalizeDepartment(body.department ?? existing.department, 'HR');
+        await db
+          .prepare(`
+            UPDATE candidates SET full_name = ?, position = ?, department = ?, updated_at = datetime('now') WHERE id = ?
+          `)
+          .run(fullName, position, department, id);
+
+        await logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Candidate Detail Drawer',
+          actionTaken: 'UPDATE_CANDIDATE',
+          targetEntity: `${fullName} (${existing.candidate_code})`,
+          details: `Updated candidate profile (${position}, ${department}).`,
         });
       }
 
-      logAudit({
-        req,
-        actor: req.user,
-        pageVisited: 'Candidate Detail Drawer',
-        actionTaken: 'RECORD_INTERVIEW_FEEDBACK',
-        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-        details: `Recorded panel rating ${rating}/5 and post-interview decision "${decision}" for ${existing.full_name}.`,
-      });
-    }
-    // Generic profile update
-    else {
-      const fullName = String(body.full_name ?? existing.full_name).trim();
-      const position = String(body.position ?? existing.position).trim();
-      const department = normalizeDepartment(body.department ?? existing.department, 'HR');
-      db.prepare(`
-        UPDATE candidates SET full_name = ?, position = ?, department = ?, updated_at = datetime('now') WHERE id = ?
-      `).run(fullName, position, department, id);
-
-      logAudit({
-        req,
-        actor: req.user,
-        pageVisited: 'Candidate Detail Drawer',
-        actionTaken: 'UPDATE_CANDIDATE',
-        targetEntity: `${fullName} (${existing.candidate_code})`,
-        details: `Updated candidate profile (${position}, ${department}).`,
-      });
-    }
-
-    const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
-    res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
-  });
+      const updated = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as Record<string, unknown>;
+      res.json({ candidate: await hydrateCandidate(updated, req.user!.role, req) });
+    })
+  );
 
   // Upload a candidate document file (HR staff) + automatic Gemini AI multimodal extraction
   app.post(
@@ -3926,12 +4330,11 @@ async function startServer() {
     requireAuth,
     requireRole('administrator'),
     upload.single('file'),
-    async (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const candidateId = Number(req.params.id);
       const docType = String(req.body?.doc_type || '').toUpperCase();
 
       if (!isExtractableDocType(docType)) {
-        if (req.file) fs.unlink(req.file.path, () => {});
         res.status(400).json({ error: 'Invalid document type.' });
         return;
       }
@@ -3940,32 +4343,35 @@ async function startServer() {
         return;
       }
 
-      const candidate = db
+      const candidate = (await db
         .prepare('SELECT id, candidate_code, full_name, position, department FROM candidates WHERE id = ?')
-        .get(candidateId) as
+        .get(candidateId)) as
         | { id: number; candidate_code: string; full_name: string; position: string; department: string }
         | undefined;
       if (!candidate) {
-        fs.unlink(req.file.path, () => {});
         res.status(404).json({ error: 'Candidate not found.' });
         return;
       }
 
-      ensureCandidateDocumentRows(candidateId);
-      db.prepare(`
-        UPDATE candidate_documents
-        SET completed = 1, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
-            ai_extracted_json = '', ai_verified_status = ''
-        WHERE candidate_id = ? AND doc_type = ?
-      `).run(req.file.originalname, req.file.filename, candidateId, docType);
+      const stored = await saveUploadedFile(req.file);
 
-      logAudit({
+      await ensureCandidateDocumentRows(candidateId);
+      await db
+        .prepare(`
+          UPDATE candidate_documents
+          SET completed = 1, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
+              ai_extracted_json = '', ai_verified_status = ''
+          WHERE candidate_id = ? AND doc_type = ?
+        `)
+        .run(stored.fileName, stored.filePath, candidateId, docType);
+
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Candidate Detail Drawer',
         actionTaken: 'UPLOAD_DOCUMENT',
         targetEntity: `${candidate.full_name} (${candidate.candidate_code}) — ${docType}`,
-        details: `Uploaded ${docType} (${req.file.originalname}) for ${candidate.full_name}.`,
+        details: `Uploaded ${docType} (${stored.fileName}) for ${candidate.full_name} [${stored.storage === 'gdrive' ? 'Google Drive' : 'Local Storage'}].`,
       });
 
       const aiExtraction = await runAndPersistDocumentExtraction({
@@ -3978,17 +4384,21 @@ async function startServer() {
         position: candidate.position,
         department: candidate.department,
         docType,
-        filePath: req.file.path,
-        fileName: req.file.originalname,
+        filePath: stored.filePath,
+        fileBuffer: req.file.buffer,
+        fileName: stored.fileName,
         mimeType: req.file.mimetype,
       });
 
-      const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
+      const updated = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId)) as Record<
+        string,
+        unknown
+      >;
       res.json({
-        candidate: hydrateCandidate(updated, req.user!.role),
+        candidate: await hydrateCandidate(updated, req.user!.role, req),
         aiExtraction,
       });
-    }
+    })
   );
 
   // Manual Gemini AI re-scan for any uploaded candidate document (Administrator only)
@@ -3996,21 +4406,21 @@ async function startServer() {
     '/api/documents/:docId/ai-extract',
     requireAuth,
     requireRole('administrator'),
-    async (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const docId = Number(req.params.docId);
       if (!Number.isInteger(docId) || docId <= 0) {
         res.status(400).json({ error: 'Invalid document ID.' });
         return;
       }
 
-      const docRow = db
+      const docRow = (await db
         .prepare(`
           SELECT d.*, c.candidate_code, c.full_name, c.position, c.department
           FROM candidate_documents d
           JOIN candidates c ON c.id = d.candidate_id
           WHERE d.id = ?
         `)
-        .get(docId) as
+        .get(docId)) as
         | {
             id: number;
             candidate_id: number;
@@ -4035,15 +4445,15 @@ async function startServer() {
         return;
       }
 
-      const safeFile = path.basename(String(docRow.file_path || ''));
-      if (!safeFile) {
+      const storedRef = normalizeStoredFileRef(String(docRow.file_path || ''));
+      if (!storedRef) {
         res.status(400).json({ error: 'No uploaded file is attached to this document row yet.' });
         return;
       }
 
-      const diskPath = path.join(UPLOADS_ROOT, safeFile);
-      if (!fs.existsSync(diskPath)) {
-        res.status(404).json({ error: 'Stored document file could not be found on disk. Please re-upload the file.' });
+      const storedFile = await readStoredFile(storedRef, docRow.file_name || '');
+      if (!storedFile) {
+        res.status(404).json({ error: 'Stored document file could not be found in storage. Please re-upload the file.' });
         return;
       }
 
@@ -4057,139 +4467,51 @@ async function startServer() {
         position: docRow.position,
         department: docRow.department,
         docType,
-        filePath: diskPath,
-        fileName: docRow.file_name || safeFile,
+        filePath: storedRef,
+        fileBuffer: storedFile.buffer,
+        fileName: docRow.file_name || storedFile.fileName,
+        mimeType: storedFile.mimeType,
         isReanalysis: true,
       });
 
-      const updated = db
+      const updated = (await db
         .prepare('SELECT * FROM candidates WHERE id = ?')
-        .get(docRow.candidate_id) as Record<string, unknown>;
+        .get(docRow.candidate_id)) as Record<string, unknown>;
       res.json({
-        candidate: hydrateCandidate(updated, req.user!.role),
+        candidate: await hydrateCandidate(updated, req.user!.role, req),
         aiExtraction,
       });
-    }
+    })
   );
 
   // Stage 6: Automated Document Reminder Email (Single)
-  app.post('/api/candidates/:id/remind-docs', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!candidate) {
-      res.status(404).json({ error: 'Candidate not found.' });
-      return;
-    }
-
-    const missing = getMissingDocsForCandidate(id);
-    const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(candidate.portal_token)}`;
-    const nowIso = new Date().toISOString().slice(0, 19);
-
-    db.prepare(`
-      UPDATE candidates
-      SET last_doc_reminder_at = ?, stage = CASE WHEN stage < 6 THEN 6 ELSE stage END, updated_at = datetime('now')
-      WHERE id = ?
-    `).run(nowIso, id);
-
-    const emailDelivery = await dispatchEmail({
-      candidateId: id,
-      candidateName: String(candidate.full_name),
-      recipientEmail: String(candidate.email),
-      templateType: 'docs_reminder_48h',
-      subject: `[Reminder] Pending Forms & Academic Documents — ${candidate.position}`,
-      bodyText: [
-        `Dear ${candidate.full_name},`,
-        '',
-        `This is a reminder for your ${candidate.position} application. We are still awaiting your direct portal upload for the following items:`,
-        ...(missing.length > 0 ? missing.map((m) => `- ${m}`) : ['- Outstanding application form, assessments, or academic documents']),
-        '',
-        `Please upload your completed Application Form, DISC, VAKAD, and academic certificates (SPM, UEC if applicable, Degree, Transcript) directly via your Candidate Self-Service Portal:`,
-        `${portalUrl}`,
-        '',
-        'Thank you,',
-        'TalentFlow MY HR Team',
-      ].join('\n'),
-      stageTriggered: 6,
-      triggeredBy: req.user!.email,
-      skipAuditLog: true,
-    });
-
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Candidate Detail Drawer',
-      actionTaken: 'SEND_EMAIL',
-      targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
-      details:
-        emailDelivery.delivery_status === 'SENT_SMTP'
-          ? `Sent document reminder email via SMTP to ${candidate.email} (${missing.length} outstanding item(s)).`
-          : `Attempted document reminder email to ${candidate.email} — SMTP_FAILED: ${emailDelivery.smtp_error}`,
-    });
-
-    const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
-    res.json({ candidate: hydrateCandidate(updated, req.user!.role), emailDelivery });
-  });
-
-  // WhatsApp Outreach Audit Logging (Administrator Only)
-  app.post('/api/candidates/:id/whatsapp-log', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || id <= 0) {
-      res.status(400).json({ error: 'Invalid candidate ID.' });
-      return;
-    }
-
-    const candidate = db.prepare('SELECT id, candidate_code, full_name, phone FROM candidates WHERE id = ?').get(id) as
-      | { id: number; candidate_code: string; full_name: string; phone: string }
-      | undefined;
-    if (!candidate) {
-      res.status(404).json({ error: 'Candidate not found.' });
-      return;
-    }
-
-    const rawPhone = String(req.body?.phone || candidate.phone || '').trim();
-    const normalizedPhone = String(req.body?.normalizedPhone || '').trim();
-    const templateName = String(req.body?.templateName || 'General Follow-Up').trim().slice(0, 120);
-    const pageVisited = String(req.body?.pageVisited || 'Candidate Detail Drawer').trim().slice(0, 120);
-    const phoneDisplay = normalizedPhone ? `${rawPhone || normalizedPhone} (+${normalizedPhone})` : rawPhone || 'N/A';
-
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited,
-      actionTaken: 'WHATSAPP_OUTREACH',
-      targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
-      details: `Opened WhatsApp outreach to ${phoneDisplay} with template: ${templateName}`,
-    });
-
-    res.json({ logged: true });
-  });
-
-  // Batch 48h Missing-Docs Reminder
-  app.post('/api/candidates/remind-docs-batch', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
-    const ids = Array.isArray(req.body?.candidateIds) ? req.body.candidateIds.map(Number) : [];
-    let sentCount = 0;
-    let deliveredCount = 0;
-    let failedCount = 0;
-    let lastError = '';
-
-    for (const id of ids) {
-      const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
+  app.post(
+    '/api/candidates/:id/remind-docs',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const candidate = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as
         | Record<string, unknown>
         | undefined;
-      if (!candidate) continue;
-      const missing = getMissingDocsForCandidate(id);
-      if (missing.length === 0) continue;
+      if (!candidate) {
+        res.status(404).json({ error: 'Candidate not found.' });
+        return;
+      }
 
+      const missing = await getMissingDocsForCandidate(id);
       const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(candidate.portal_token)}`;
-      db.prepare(`
-        UPDATE candidates
-        SET last_doc_reminder_at = ?, stage = CASE WHEN stage < 6 THEN 6 ELSE stage END, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(new Date().toISOString().slice(0, 19), id);
+      const nowIso = new Date().toISOString().slice(0, 19);
 
-      const delivery = await dispatchEmail({
+      await db
+        .prepare(`
+          UPDATE candidates
+          SET last_doc_reminder_at = ?, stage = CASE WHEN stage < 6 THEN 6 ELSE stage END, updated_at = datetime('now')
+          WHERE id = ?
+        `)
+        .run(nowIso, id);
+
+      const emailDelivery = await dispatchEmail({
         candidateId: id,
         candidateName: String(candidate.full_name),
         recipientEmail: String(candidate.email),
@@ -4198,37 +4520,148 @@ async function startServer() {
         bodyText: [
           `Dear ${candidate.full_name},`,
           '',
-          `This is a 48-hour follow-up reminder for your ${candidate.position} application. Please upload the outstanding items via your Candidate Self-Service Portal:`,
-          ...missing.map((m) => `- ${m}`),
+          `This is a reminder for your ${candidate.position} application. We are still awaiting your direct portal upload for the following items:`,
+          ...(missing.length > 0
+            ? missing.map((m) => `- ${m}`)
+            : ['- Outstanding application form, assessments, or academic documents']),
           '',
-          `Candidate Self-Service Portal Link: ${portalUrl}`,
+          `Please upload your completed Application Form, DISC, VAKAD, and academic certificates (SPM, UEC if applicable, Degree, Transcript) directly via your Candidate Self-Service Portal:`,
+          `${portalUrl}`,
           '',
-          'Regards,\nTalentFlow MY HR Team',
+          'Thank you,',
+          'TalentFlow MY HR Team',
         ].join('\n'),
         stageTriggered: 6,
         triggeredBy: req.user!.email,
         skipAuditLog: true,
       });
-      sentCount++;
-      if (delivery.delivery_status === 'SENT_SMTP') {
-        deliveredCount++;
-      } else {
-        failedCount++;
-        if (delivery.smtp_error) lastError = delivery.smtp_error;
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'SEND_EMAIL',
+        targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
+        details:
+          emailDelivery.delivery_status === 'SENT_SMTP'
+            ? `Sent document reminder email via SMTP to ${candidate.email} (${missing.length} outstanding item(s)).`
+            : `Attempted document reminder email to ${candidate.email} — SMTP_FAILED: ${emailDelivery.smtp_error}`,
+      });
+
+      const updated = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as Record<string, unknown>;
+      res.json({ candidate: await hydrateCandidate(updated, req.user!.role, req), emailDelivery });
+    })
+  );
+
+  // WhatsApp Outreach Audit Logging (Administrator Only)
+  app.post(
+    '/api/candidates/:id/whatsapp-log',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid candidate ID.' });
+        return;
       }
-    }
 
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Email Automation & Audit Trail',
-      actionTaken: 'SEND_EMAIL',
-      targetEntity: `Batch Document Reminders (${sentCount} candidates)`,
-      details: `Processed batch document reminders: ${deliveredCount} sent via SMTP, ${failedCount} failed${lastError ? ` (Last error: ${lastError})` : ''}.`,
-    });
+      const candidate = (await db
+        .prepare('SELECT id, candidate_code, full_name, phone FROM candidates WHERE id = ?')
+        .get(id)) as { id: number; candidate_code: string; full_name: string; phone: string } | undefined;
+      if (!candidate) {
+        res.status(404).json({ error: 'Candidate not found.' });
+        return;
+      }
 
-    res.json({ sentCount, deliveredCount, failedCount, lastError });
-  });
+      const rawPhone = String(req.body?.phone || candidate.phone || '').trim();
+      const normalizedPhone = String(req.body?.normalizedPhone || '').trim();
+      const templateName = String(req.body?.templateName || 'General Follow-Up').trim().slice(0, 120);
+      const pageVisited = String(req.body?.pageVisited || 'Candidate Detail Drawer').trim().slice(0, 120);
+      const phoneDisplay = normalizedPhone ? `${rawPhone || normalizedPhone} (+${normalizedPhone})` : rawPhone || 'N/A';
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited,
+        actionTaken: 'WHATSAPP_OUTREACH',
+        targetEntity: `${candidate.full_name} (${candidate.candidate_code})`,
+        details: `Opened WhatsApp outreach to ${phoneDisplay} with template: ${templateName}`,
+      });
+
+      res.json({ logged: true });
+    })
+  );
+
+  // Batch 48h Missing-Docs Reminder
+  app.post(
+    '/api/candidates/remind-docs-batch',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const ids = Array.isArray(req.body?.candidateIds) ? req.body.candidateIds.map(Number) : [];
+      let sentCount = 0;
+      let deliveredCount = 0;
+      let failedCount = 0;
+      let lastError = '';
+
+      for (const id of ids) {
+        const candidate = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as
+          | Record<string, unknown>
+          | undefined;
+        if (!candidate) continue;
+        const missing = await getMissingDocsForCandidate(id);
+        if (missing.length === 0) continue;
+
+        const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(candidate.portal_token)}`;
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET last_doc_reminder_at = ?, stage = CASE WHEN stage < 6 THEN 6 ELSE stage END, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(new Date().toISOString().slice(0, 19), id);
+
+        const delivery = await dispatchEmail({
+          candidateId: id,
+          candidateName: String(candidate.full_name),
+          recipientEmail: String(candidate.email),
+          templateType: 'docs_reminder_48h',
+          subject: `[Reminder] Pending Forms & Academic Documents — ${candidate.position}`,
+          bodyText: [
+            `Dear ${candidate.full_name},`,
+            '',
+            `This is a 48-hour follow-up reminder for your ${candidate.position} application. Please upload the outstanding items via your Candidate Self-Service Portal:`,
+            ...missing.map((m) => `- ${m}`),
+            '',
+            `Candidate Self-Service Portal Link: ${portalUrl}`,
+            '',
+            'Regards,\nTalentFlow MY HR Team',
+          ].join('\n'),
+          stageTriggered: 6,
+          triggeredBy: req.user!.email,
+          skipAuditLog: true,
+        });
+        sentCount++;
+        if (delivery.delivery_status === 'SENT_SMTP') {
+          deliveredCount++;
+        } else {
+          failedCount++;
+          if (delivery.smtp_error) lastError = delivery.smtp_error;
+        }
+      }
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Email Automation & Audit Trail',
+        actionTaken: 'SEND_EMAIL',
+        targetEntity: `Batch Document Reminders (${sentCount} candidates)`,
+        details: `Processed batch document reminders: ${deliveredCount} sent via SMTP, ${failedCount} failed${lastError ? ` (Last error: ${lastError})` : ''}.`,
+      });
+
+      res.json({ sentCount, deliveredCount, failedCount, lastError });
+    })
+  );
 
   // Stage 13: Create/Send Employment Offer (HR Admin only, optional offer letter PDF)
   app.post(
@@ -4236,13 +4669,12 @@ async function startServer() {
     requireAuth,
     requireRole('administrator'),
     upload.single('offerLetter'),
-    async (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const id = Number(req.params.id);
-      const candidate = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as
+      const candidate = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as
         | Record<string, unknown>
         | undefined;
       if (!candidate) {
-        if (req.file) fs.unlink(req.file.path, () => {});
         res.status(404).json({ error: 'Candidate not found.' });
         return;
       }
@@ -4258,58 +4690,65 @@ async function startServer() {
       const issueDate = new Date().toISOString().slice(0, 10);
       const termsSummary = String(body.offer_terms_summary || '').trim();
 
-      const existingOffer = db.prepare('SELECT id, offer_letter_path FROM offers WHERE candidate_id = ?').get(id) as
-        | { id: number; offer_letter_path: string }
-        | undefined;
+      const existingOffer = (await db
+        .prepare('SELECT id, offer_letter_path FROM offers WHERE candidate_id = ?')
+        .get(id)) as { id: number; offer_letter_path: string } | undefined;
 
-      const offerLetterPath = req.file ? req.file.filename : existingOffer?.offer_letter_path || '';
+      const storedOfferLetter = req.file ? await saveUploadedFile(req.file) : null;
+      const offerLetterPath = storedOfferLetter ? storedOfferLetter.filePath : existingOffer?.offer_letter_path || '';
 
       if (existingOffer) {
-        db.prepare(`
-          UPDATE offers
-          SET position = ?, department = ?, salary_myr = ?, allowance_myr = ?, probation_months = ?,
-              start_date = ?, issue_date = ?, deadline_date = ?, offer_letter_path = ?,
-              offer_terms_summary = ?, status = 'Offer Sent', candidate_response_note = '', responded_at = ''
-          WHERE candidate_id = ?
-        `).run(
-          position,
-          department,
-          salaryMyr,
-          allowanceMyr,
-          probationMonths,
-          startDate,
-          issueDate,
-          deadlineDate,
-          offerLetterPath,
-          termsSummary,
-          id
-        );
+        await db
+          .prepare(`
+            UPDATE offers
+            SET position = ?, department = ?, salary_myr = ?, allowance_myr = ?, probation_months = ?,
+                start_date = ?, issue_date = ?, deadline_date = ?, offer_letter_path = ?,
+                offer_terms_summary = ?, status = 'Offer Sent', candidate_response_note = '', responded_at = ''
+            WHERE candidate_id = ?
+          `)
+          .run(
+            position,
+            department,
+            salaryMyr,
+            allowanceMyr,
+            probationMonths,
+            startDate,
+            issueDate,
+            deadlineDate,
+            offerLetterPath,
+            termsSummary,
+            id
+          );
       } else {
-        db.prepare(`
-          INSERT INTO offers (
-            candidate_id, position, department, salary_myr, allowance_myr, probation_months,
-            start_date, issue_date, deadline_date, offer_letter_path, offer_terms_summary, status
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Offer Sent')
-        `).run(
-          id,
-          position,
-          department,
-          salaryMyr,
-          allowanceMyr,
-          probationMonths,
-          startDate,
-          issueDate,
-          deadlineDate,
-          offerLetterPath,
-          termsSummary
-        );
+        await db
+          .prepare(`
+            INSERT INTO offers (
+              candidate_id, position, department, salary_myr, allowance_myr, probation_months,
+              start_date, issue_date, deadline_date, offer_letter_path, offer_terms_summary, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Offer Sent')
+          `)
+          .run(
+            id,
+            position,
+            department,
+            salaryMyr,
+            allowanceMyr,
+            probationMonths,
+            startDate,
+            issueDate,
+            deadlineDate,
+            offerLetterPath,
+            termsSummary
+          );
       }
 
-      db.prepare(`
-        UPDATE candidates
-        SET stage = 13, status = 'offer_sent', final_decision_notes = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(`Official MYR offer dispatched on ${issueDate}.`, id);
+      await db
+        .prepare(`
+          UPDATE candidates
+          SET stage = 13, status = 'offer_sent', final_decision_notes = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `)
+        .run(`Official MYR offer dispatched on ${issueDate}.`, id);
 
       const portalUrl = `${getAppBaseUrl(req)}/?portal=${String(candidate.portal_token)}`;
       await dispatchEmail({
@@ -4341,7 +4780,7 @@ async function startServer() {
         pageVisited: 'Candidate Detail Drawer',
       });
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Candidate Detail Drawer',
@@ -4350,360 +4789,452 @@ async function startServer() {
         details: `Issued MYR employment offer (RM ${salaryMyr.toLocaleString('en-MY')}/mo, start ${startDate || 'TBD'}) for ${position}.`,
       });
 
-      const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
-      res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
-    }
+      const updated = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as Record<string, unknown>;
+      res.json({ candidate: await hydrateCandidate(updated, req.user!.role, req) });
+    })
   );
 
   // Stage 14-15: Update Offer Status (HR Admin)
-  app.patch('/api/candidates/:id/offer-status', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    const status = String(req.body?.status || 'Pending Response');
-    const note = String(req.body?.candidate_response_note || '').trim();
-    const validStatuses = ['Offer Sent', 'Pending Response', 'Accepted', 'Rejected', 'Expired'];
-    if (!validStatuses.includes(status)) {
-      res.status(400).json({ error: 'Invalid offer status.' });
-      return;
-    }
-
-    const offer = db.prepare('SELECT id FROM offers WHERE candidate_id = ?').get(id);
-    if (!offer) {
-      res.status(404).json({ error: 'No employment offer exists for this candidate yet.' });
-      return;
-    }
-
-    const isFinal = status === 'Accepted' || status === 'Rejected' || status === 'Expired';
-    const nextStage = isFinal ? 15 : 14;
-    const candStatus =
-      status === 'Accepted'
-        ? 'offer_accepted'
-        : status === 'Rejected'
-          ? 'offer_rejected'
-          : status === 'Expired'
-            ? 'offer_expired'
-            : status === 'Offer Sent'
-              ? 'offer_sent'
-              : 'offer_pending';
-
-    db.prepare(`
-      UPDATE offers
-      SET status = ?, candidate_response_note = ?, responded_at = CASE WHEN ? = 1 THEN datetime('now') ELSE responded_at END
-      WHERE candidate_id = ?
-    `).run(status, note, isFinal ? 1 : 0, id);
-
-    db.prepare(`
-      UPDATE candidates SET stage = ?, status = ?, final_decision_notes = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(nextStage, candStatus, note || `Offer status updated to ${status}.`, id);
-
-    const updated = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id) as Record<string, unknown>;
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Candidate Detail Drawer',
-      actionTaken: 'UPDATE_OFFER_STATUS',
-      targetEntity: `${updated.full_name} (${updated.candidate_code})`,
-      details: `Updated offer status for ${updated.full_name} to "${status}" (Stage ${nextStage}).`,
-    });
-
-    res.json({ candidate: hydrateCandidate(updated, req.user!.role) });
-  });
-
-  app.delete('/api/candidates/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const id = Number(req.params.id);
-    const existing = db.prepare('SELECT id, full_name, candidate_code FROM candidates WHERE id = ?').get(id) as
-      | { id: number; full_name: string; candidate_code: string }
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Candidate not found.' });
-      return;
-    }
-
-    // Release any confirmed bookings atomically
-    const deleteTx = db.transaction((candId: number) => {
-      const bookings = db
-        .prepare(`SELECT slot_id FROM interview_bookings WHERE candidate_id = ? AND status = 'CONFIRMED'`)
-        .all(candId) as Array<{ slot_id: number }>;
-      for (const b of bookings) {
-        db.prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?').run(b.slot_id);
+  app.patch(
+    '/api/candidates/:id/offer-status',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const status = String(req.body?.status || 'Pending Response');
+      const note = String(req.body?.candidate_response_note || '').trim();
+      const validStatuses = ['Offer Sent', 'Pending Response', 'Accepted', 'Rejected', 'Expired'];
+      if (!validStatuses.includes(status)) {
+        res.status(400).json({ error: 'Invalid offer status.' });
+        return;
       }
-      db.prepare('DELETE FROM candidates WHERE id = ?').run(candId);
-    });
-    deleteTx(id);
 
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Candidate Detail Drawer',
-      actionTaken: 'DELETE_CANDIDATE',
-      targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-      details: `Deleted candidate record ${existing.full_name} (${existing.candidate_code}).`,
-    });
+      const offer = await db.prepare('SELECT id FROM offers WHERE candidate_id = ?').get(id);
+      if (!offer) {
+        res.status(404).json({ error: 'No employment offer exists for this candidate yet.' });
+        return;
+      }
 
-    res.json({ deleted: true });
-  });
+      const isFinal = status === 'Accepted' || status === 'Rejected' || status === 'Expired';
+      const nextStage = isFinal ? 15 : 14;
+      const candStatus =
+        status === 'Accepted'
+          ? 'offer_accepted'
+          : status === 'Rejected'
+            ? 'offer_rejected'
+            : status === 'Expired'
+              ? 'offer_expired'
+              : status === 'Offer Sent'
+                ? 'offer_sent'
+                : 'offer_pending';
+
+      await db
+        .prepare(`
+          UPDATE offers
+          SET status = ?, candidate_response_note = ?, responded_at = CASE WHEN ? = 1 THEN datetime('now') ELSE responded_at END
+          WHERE candidate_id = ?
+        `)
+        .run(status, note, isFinal ? 1 : 0, id);
+
+      await db
+        .prepare(`
+          UPDATE candidates SET stage = ?, status = ?, final_decision_notes = ?, updated_at = datetime('now') WHERE id = ?
+        `)
+        .run(nextStage, candStatus, note || `Offer status updated to ${status}.`, id);
+
+      const updated = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(id)) as Record<string, unknown>;
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'UPDATE_OFFER_STATUS',
+        targetEntity: `${updated.full_name} (${updated.candidate_code})`,
+        details: `Updated offer status for ${updated.full_name} to "${status}" (Stage ${nextStage}).`,
+      });
+
+      res.json({ candidate: await hydrateCandidate(updated, req.user!.role, req) });
+    })
+  );
+
+  app.delete(
+    '/api/candidates/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const existing = (await db.prepare('SELECT id, full_name, candidate_code FROM candidates WHERE id = ?').get(id)) as
+        | { id: number; full_name: string; candidate_code: string }
+        | undefined;
+      if (!existing) {
+        res.status(404).json({ error: 'Candidate not found.' });
+        return;
+      }
+
+      // Release any confirmed bookings and delete candidate atomically, collecting attached file refs for cleanup
+      const filesToDelete = await db.transaction(async (tx) => {
+        const docRows = (await tx
+          .prepare(`SELECT file_path FROM candidate_documents WHERE candidate_id = ? AND file_path != ''`)
+          .all(id)) as Array<{ file_path: string }>;
+        const offerRows = (await tx
+          .prepare(`SELECT offer_letter_path FROM offers WHERE candidate_id = ? AND offer_letter_path != ''`)
+          .all(id)) as Array<{ offer_letter_path: string }>;
+
+        const bookings = (await tx
+          .prepare(`SELECT slot_id FROM interview_bookings WHERE candidate_id = ? AND status = 'CONFIRMED'`)
+          .all(id)) as Array<{ slot_id: number }>;
+        for (const b of bookings) {
+          await tx
+            .prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?')
+            .run(b.slot_id);
+        }
+        await tx.prepare('DELETE FROM candidates WHERE id = ?').run(id);
+
+        const refs = new Set<string>();
+        for (const r of docRows) {
+          const ref = normalizeStoredFileRef(r.file_path);
+          if (ref) refs.add(ref);
+        }
+        for (const o of offerRows) {
+          const ref = normalizeStoredFileRef(o.offer_letter_path);
+          if (ref) refs.add(ref);
+        }
+        return Array.from(refs);
+      });
+
+      for (const fileRef of filesToDelete) {
+        const stillDocRef = await db.prepare('SELECT 1 FROM candidate_documents WHERE file_path = ? LIMIT 1').get(fileRef);
+        const stillOfferRef = await db.prepare('SELECT 1 FROM offers WHERE offer_letter_path = ? LIMIT 1').get(fileRef);
+        if (!stillDocRef && !stillOfferRef) {
+          await deleteStoredFile(fileRef);
+        }
+      }
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Detail Drawer',
+        actionTaken: 'DELETE_CANDIDATE',
+        targetEntity: `${existing.full_name} (${existing.candidate_code})`,
+        details: `Deleted candidate record ${existing.full_name} (${existing.candidate_code}).`,
+      });
+
+      res.json({ deleted: true });
+    })
+  );
 
   // ===========================================================================
   // 4. INTERVIEW SLOTS & ATOMIC BOOKING CALENDAR
   // ===========================================================================
-  app.get('/api/interview-slots', requireAuth, (_req: AuthedRequest, res: Response) => {
-    const rows = db
-      .prepare('SELECT * FROM interview_slots ORDER BY date ASC, start_time ASC')
-      .all() as Array<Record<string, unknown>>;
-    res.json({ slots: rows.map(hydrateSlot) });
-  });
+  app.get(
+    '/api/interview-slots',
+    requireAuth,
+    asyncHandler(async (_req: AuthedRequest, res: Response) => {
+      const rows = (await db
+        .prepare('SELECT * FROM interview_slots ORDER BY date ASC, start_time ASC')
+        .all()) as Array<Record<string, unknown>>;
+      const slots = await Promise.all(rows.map(hydrateSlot));
+      res.json({ slots });
+    })
+  );
 
-  app.post('/api/interview-slots', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const body = req.body ?? {};
-    const date = String(body.date || '').trim();
-    const startTime = String(body.start_time || '').trim();
-    const endTime = String(body.end_time || '').trim();
-    const capacity = Math.max(1, Math.min(20, Math.round(Number(body.capacity) || 1)));
-    const locationOrLink = String(body.location_or_link || '').trim();
-    const interviewerName = String(body.interviewer_name || 'Hiring Panel').trim();
-    const department = normalizeDepartment(body.department, 'HR');
-    const mode = String(body.mode || 'Google Meet').trim();
+  app.post(
+    '/api/interview-slots',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const body = req.body ?? {};
+      const date = String(body.date || '').trim();
+      const startTime = String(body.start_time || '').trim();
+      const endTime = String(body.end_time || '').trim();
+      const capacity = Math.max(1, Math.min(20, Math.round(Number(body.capacity) || 1)));
+      const locationOrLink = String(body.location_or_link || '').trim();
+      const interviewerName = String(body.interviewer_name || 'Hiring Panel').trim();
+      const department = normalizeDepartment(body.department, 'HR');
+      const mode = String(body.mode || 'Google Meet').trim();
 
-    if (!date || !startTime || !endTime) {
-      res.status(400).json({ error: 'Date, start time, and end time are required.' });
-      return;
-    }
-
-    const info = db
-      .prepare(`
-        INSERT INTO interview_slots (
-          date, start_time, end_time, capacity, booked_count,
-          location_or_link, interviewer_name, department, mode, status
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'ACTIVE')
-      `)
-      .run(date, startTime, endTime, capacity, locationOrLink, interviewerName, department, mode);
-
-    const slotId = Number(info.lastInsertRowid);
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Interview Calendar',
-      actionTaken: 'CREATE_INTERVIEW_SLOT',
-      targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
-      details: `Created interview slot ${date} ${startTime}-${endTime} (capacity ${capacity}, ${mode}) with ${interviewerName}.`,
-    });
-
-    const row = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
-    res.status(201).json({ slot: hydrateSlot(row) });
-  });
-
-  app.patch('/api/interview-slots/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const slotId = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as
-      | Record<string, unknown>
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Interview slot not found.' });
-      return;
-    }
-
-    const body = req.body ?? {};
-    const date = String(body.date ?? existing.date);
-    const startTime = String(body.start_time ?? existing.start_time);
-    const endTime = String(body.end_time ?? existing.end_time);
-    const capacity = Math.max(Number(existing.booked_count) || 1, Math.min(20, Math.round(Number(body.capacity ?? existing.capacity) || 1)));
-    const locationOrLink = String(body.location_or_link ?? existing.location_or_link);
-    const interviewerName = String(body.interviewer_name ?? existing.interviewer_name);
-    const status = body.status === 'CANCELLED' ? 'CANCELLED' : 'ACTIVE';
-
-    db.prepare(`
-      UPDATE interview_slots
-      SET date = ?, start_time = ?, end_time = ?, capacity = ?, location_or_link = ?, interviewer_name = ?, status = ?
-      WHERE id = ?
-    `).run(date, startTime, endTime, capacity, locationOrLink, interviewerName, status, slotId);
-
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Interview Calendar',
-      actionTaken: status === 'CANCELLED' ? 'CANCEL_INTERVIEW' : 'RESCHEDULE_INTERVIEW',
-      targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
-      details: `Updated interview slot #${slotId} (${date} ${startTime}-${endTime}, capacity ${capacity}, status ${status}).`,
-    });
-
-    const updated = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
-    res.json({ slot: hydrateSlot(updated) });
-  });
-
-  app.delete('/api/interview-slots/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const slotId = Number(req.params.id);
-    const existing = db.prepare('SELECT id, date, start_time, booked_count FROM interview_slots WHERE id = ?').get(slotId) as
-      | { id: number; date: string; start_time: string; booked_count: number }
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Interview slot not found.' });
-      return;
-    }
-    if (existing.booked_count > 0) {
-      res.status(400).json({ error: 'Cancel active bookings before deleting this slot.' });
-      return;
-    }
-    db.prepare('DELETE FROM interview_slots WHERE id = ?').run(slotId);
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Interview Calendar',
-      actionTaken: 'CANCEL_INTERVIEW',
-      targetEntity: `Slot #${slotId} (${existing.date} ${existing.start_time})`,
-      details: `Deleted interview slot #${slotId} (${existing.date} ${existing.start_time}).`,
-    });
-    res.json({ deleted: true });
-  });
-
-  // HR-initiated atomic slot booking
-  app.post('/api/interview-slots/:id/book', requireAuth, requireRole('administrator'), async (req: AuthedRequest, res: Response) => {
-    const slotId = Number(req.params.id);
-    const candidateId = Number(req.body?.candidateId);
-    if (!candidateId) {
-      res.status(400).json({ error: 'candidateId is required.' });
-      return;
-    }
-
-    try {
-      const result = reserveSlotTransaction(slotId, candidateId);
-      await dispatchEmail({
-        candidateId: result.candidate.id,
-        candidateName: result.candidate.full_name,
-        recipientEmail: result.candidate.email,
-        templateType: 'interview_confirmation',
-        subject: `[Confirmed] Interview Schedule for ${result.candidate.position} on ${result.slot.date}`,
-        bodyText: [
-          `Dear ${result.candidate.full_name},`,
-          '',
-          `Your interview for ${result.candidate.position} (${result.candidate.department}) is confirmed:`,
-          `- Date: ${result.slot.date}`,
-          `- Time: ${result.slot.start_time} - ${result.slot.end_time} MYT`,
-          `- Mode: ${result.slot.mode}`,
-          `- Panelist: ${result.slot.interviewer_name}`,
-          `- Location / Link: ${result.slot.location_or_link || 'Provided by HR'}`,
-          '',
-          'We look forward to speaking with you.',
-          '',
-          'Regards,\nTalentFlow MY HR Team',
-        ].join('\n'),
-        stageTriggered: 10,
-        triggeredBy: req.user!.email,
-        req,
-        actor: req.user,
-        pageVisited: 'Interview Calendar',
-      });
-
-      logAudit({
-        req,
-        actor: req.user,
-        pageVisited: 'Interview Calendar',
-        actionTaken: 'BOOK_INTERVIEW_SLOT',
-        targetEntity: `${result.candidate.full_name} — Slot #${slotId}`,
-        details: `Booked interview slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}) for ${result.candidate.full_name}.`,
-      });
-
-      const slotRow = db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId) as Record<string, unknown>;
-      const candRow = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
-      res.json({
-        slot: hydrateSlot(slotRow),
-        candidate: hydrateCandidate(candRow, req.user!.role),
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unable to book slot.';
-      res.status(409).json({ error: msg });
-    }
-  });
-
-  // Update booking status (COMPLETE / CANCEL / RESCHEDULE)
-  app.patch('/api/interview-bookings/:id', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const bookingId = Number(req.params.id);
-    const nextStatus = String(req.body?.status || '');
-    const valid = ['CONFIRMED', 'RESCHEDULED', 'CANCELLED', 'COMPLETED'];
-    if (!valid.includes(nextStatus)) {
-      res.status(400).json({ error: 'Invalid booking status.' });
-      return;
-    }
-
-    const tx = db.transaction(() => {
-      const booking = db.prepare('SELECT * FROM interview_bookings WHERE id = ?').get(bookingId) as
-        | { id: number; slot_id: number; candidate_id: number; status: string }
-        | undefined;
-      if (!booking) throw new Error('Booking not found.');
-
-      db.prepare('UPDATE interview_bookings SET status = ? WHERE id = ?').run(nextStatus, bookingId);
-
-      if ((nextStatus === 'CANCELLED' || nextStatus === 'RESCHEDULED') && booking.status === 'CONFIRMED') {
-        db.prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?').run(
-          booking.slot_id
-        );
-        db.prepare(`UPDATE candidates SET stage = 9, status = 'interview_invited', updated_at = datetime('now') WHERE id = ?`).run(
-          booking.candidate_id
-        );
-      } else if (nextStatus === 'COMPLETED') {
-        db.prepare(`UPDATE candidates SET stage = 11, status = 'interview_completed', updated_at = datetime('now') WHERE id = ?`).run(
-          booking.candidate_id
-        );
+      if (!date || !startTime || !endTime) {
+        res.status(400).json({ error: 'Date, start time, and end time are required.' });
+        return;
       }
 
-      return booking;
-    });
+      const info = await db
+        .prepare(`
+          INSERT INTO interview_slots (
+            date, start_time, end_time, capacity, booked_count,
+            location_or_link, interviewer_name, department, mode, status
+          ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'ACTIVE')
+        `)
+        .run(date, startTime, endTime, capacity, locationOrLink, interviewerName, department, mode);
 
-    try {
-      const booking = tx();
-      const candInfo = db
-        .prepare('SELECT full_name, candidate_code FROM candidates WHERE id = ?')
-        .get(booking.candidate_id) as { full_name: string; candidate_code: string } | undefined;
-      const mappedAction =
-        nextStatus === 'CANCELLED'
-          ? 'CANCEL_INTERVIEW'
-          : nextStatus === 'RESCHEDULED'
-            ? 'RESCHEDULE_INTERVIEW'
-            : nextStatus === 'COMPLETED'
-              ? 'RECORD_INTERVIEW_FEEDBACK'
-              : 'BOOK_INTERVIEW_SLOT';
-
-      logAudit({
+      const slotId = Number(info.lastInsertRowid);
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Interview Calendar',
-        actionTaken: mappedAction,
-        targetEntity: candInfo
-          ? `${candInfo.full_name} (${candInfo.candidate_code}) — Booking #${bookingId}`
-          : `Booking #${bookingId} (Slot #${booking.slot_id})`,
-        details: `Updated interview booking #${bookingId} to "${nextStatus}".`,
+        actionTaken: 'CREATE_INTERVIEW_SLOT',
+        targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
+        details: `Created interview slot ${date} ${startTime}-${endTime} (capacity ${capacity}, ${mode}) with ${interviewerName}.`,
       });
-      res.json({ updated: true });
-    } catch (err: unknown) {
-      res.status(404).json({ error: err instanceof Error ? err.message : 'Booking update failed.' });
-    }
-  });
+
+      const row = (await db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId)) as Record<
+        string,
+        unknown
+      >;
+      res.status(201).json({ slot: await hydrateSlot(row) });
+    })
+  );
+
+  app.patch(
+    '/api/interview-slots/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const slotId = Number(req.params.id);
+      const existing = (await db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId)) as
+        | Record<string, unknown>
+        | undefined;
+      if (!existing) {
+        res.status(404).json({ error: 'Interview slot not found.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const date = String(body.date ?? existing.date);
+      const startTime = String(body.start_time ?? existing.start_time);
+      const endTime = String(body.end_time ?? existing.end_time);
+      const capacity = Math.max(
+        Number(existing.booked_count) || 1,
+        Math.min(20, Math.round(Number(body.capacity ?? existing.capacity) || 1))
+      );
+      const locationOrLink = String(body.location_or_link ?? existing.location_or_link);
+      const interviewerName = String(body.interviewer_name ?? existing.interviewer_name);
+      const status = body.status === 'CANCELLED' ? 'CANCELLED' : 'ACTIVE';
+
+      await db
+        .prepare(`
+          UPDATE interview_slots
+          SET date = ?, start_time = ?, end_time = ?, capacity = ?, location_or_link = ?, interviewer_name = ?, status = ?
+          WHERE id = ?
+        `)
+        .run(date, startTime, endTime, capacity, locationOrLink, interviewerName, status, slotId);
+
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Interview Calendar',
+        actionTaken: status === 'CANCELLED' ? 'CANCEL_INTERVIEW' : 'RESCHEDULE_INTERVIEW',
+        targetEntity: `Slot #${slotId} (${date} ${startTime}-${endTime})`,
+        details: `Updated interview slot #${slotId} (${date} ${startTime}-${endTime}, capacity ${capacity}, status ${status}).`,
+      });
+
+      const updated = (await db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId)) as Record<
+        string,
+        unknown
+      >;
+      res.json({ slot: await hydrateSlot(updated) });
+    })
+  );
+
+  app.delete(
+    '/api/interview-slots/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const slotId = Number(req.params.id);
+      const existing = (await db
+        .prepare('SELECT id, date, start_time, booked_count FROM interview_slots WHERE id = ?')
+        .get(slotId)) as { id: number; date: string; start_time: string; booked_count: number } | undefined;
+      if (!existing) {
+        res.status(404).json({ error: 'Interview slot not found.' });
+        return;
+      }
+      if (existing.booked_count > 0) {
+        res.status(400).json({ error: 'Cancel active bookings before deleting this slot.' });
+        return;
+      }
+      await db.prepare('DELETE FROM interview_slots WHERE id = ?').run(slotId);
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Interview Calendar',
+        actionTaken: 'CANCEL_INTERVIEW',
+        targetEntity: `Slot #${slotId} (${existing.date} ${existing.start_time})`,
+        details: `Deleted interview slot #${slotId} (${existing.date} ${existing.start_time}).`,
+      });
+      res.json({ deleted: true });
+    })
+  );
+
+  // HR-initiated atomic slot booking
+  app.post(
+    '/api/interview-slots/:id/book',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const slotId = Number(req.params.id);
+      const candidateId = Number(req.body?.candidateId);
+      if (!candidateId) {
+        res.status(400).json({ error: 'candidateId is required.' });
+        return;
+      }
+
+      try {
+        const result = await reserveSlotTransaction(slotId, candidateId);
+        await dispatchEmail({
+          candidateId: result.candidate.id,
+          candidateName: result.candidate.full_name,
+          recipientEmail: result.candidate.email,
+          templateType: 'interview_confirmation',
+          subject: `[Confirmed] Interview Schedule for ${result.candidate.position} on ${result.slot.date}`,
+          bodyText: [
+            `Dear ${result.candidate.full_name},`,
+            '',
+            `Your interview for ${result.candidate.position} (${result.candidate.department}) is confirmed:`,
+            `- Date: ${result.slot.date}`,
+            `- Time: ${result.slot.start_time} - ${result.slot.end_time} MYT`,
+            `- Mode: ${result.slot.mode}`,
+            `- Panelist: ${result.slot.interviewer_name}`,
+            `- Location / Link: ${result.slot.location_or_link || 'Provided by HR'}`,
+            '',
+            'We look forward to speaking with you.',
+            '',
+            'Regards,\nTalentFlow MY HR Team',
+          ].join('\n'),
+          stageTriggered: 10,
+          triggeredBy: req.user!.email,
+          req,
+          actor: req.user,
+          pageVisited: 'Interview Calendar',
+        });
+
+        await logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Interview Calendar',
+          actionTaken: 'BOOK_INTERVIEW_SLOT',
+          targetEntity: `${result.candidate.full_name} — Slot #${slotId}`,
+          details: `Booked interview slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}) for ${result.candidate.full_name}.`,
+        });
+
+        const slotRow = (await db.prepare('SELECT * FROM interview_slots WHERE id = ?').get(slotId)) as Record<
+          string,
+          unknown
+        >;
+        const candRow = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId)) as Record<
+          string,
+          unknown
+        >;
+        res.json({
+          slot: await hydrateSlot(slotRow),
+          candidate: await hydrateCandidate(candRow, req.user!.role, req),
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Unable to book slot.';
+        res.status(409).json({ error: msg });
+      }
+    })
+  );
+
+  // Update booking status (COMPLETE / CANCEL / RESCHEDULE)
+  app.patch(
+    '/api/interview-bookings/:id',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const bookingId = Number(req.params.id);
+      const nextStatus = String(req.body?.status || '');
+      const valid = ['CONFIRMED', 'RESCHEDULED', 'CANCELLED', 'COMPLETED'];
+      if (!valid.includes(nextStatus)) {
+        res.status(400).json({ error: 'Invalid booking status.' });
+        return;
+      }
+
+      try {
+        const booking = await db.transaction(async (tx) => {
+          const existingBooking = (await tx
+            .prepare('SELECT * FROM interview_bookings WHERE id = ?')
+            .get(bookingId)) as
+            | { id: number; slot_id: number; candidate_id: number; status: string }
+            | undefined;
+          if (!existingBooking) throw new Error('Booking not found.');
+
+          await tx.prepare('UPDATE interview_bookings SET status = ? WHERE id = ?').run(nextStatus, bookingId);
+
+          if ((nextStatus === 'CANCELLED' || nextStatus === 'RESCHEDULED') && existingBooking.status === 'CONFIRMED') {
+            await tx
+              .prepare('UPDATE interview_slots SET booked_count = MAX(0, booked_count - 1) WHERE id = ?')
+              .run(existingBooking.slot_id);
+            await tx
+              .prepare(`UPDATE candidates SET stage = 9, status = 'interview_invited', updated_at = datetime('now') WHERE id = ?`)
+              .run(existingBooking.candidate_id);
+          } else if (nextStatus === 'COMPLETED') {
+            await tx
+              .prepare(`UPDATE candidates SET stage = 11, status = 'interview_completed', updated_at = datetime('now') WHERE id = ?`)
+              .run(existingBooking.candidate_id);
+          }
+
+          return existingBooking;
+        });
+
+        const candInfo = (await db
+          .prepare('SELECT full_name, candidate_code FROM candidates WHERE id = ?')
+          .get(booking.candidate_id)) as { full_name: string; candidate_code: string } | undefined;
+        const mappedAction =
+          nextStatus === 'CANCELLED'
+            ? 'CANCEL_INTERVIEW'
+            : nextStatus === 'RESCHEDULED'
+              ? 'RESCHEDULE_INTERVIEW'
+              : nextStatus === 'COMPLETED'
+                ? 'RECORD_INTERVIEW_FEEDBACK'
+                : 'BOOK_INTERVIEW_SLOT';
+
+        await logAudit({
+          req,
+          actor: req.user,
+          pageVisited: 'Interview Calendar',
+          actionTaken: mappedAction,
+          targetEntity: candInfo
+            ? `${candInfo.full_name} (${candInfo.candidate_code}) — Booking #${bookingId}`
+            : `Booking #${bookingId} (Slot #${booking.slot_id})`,
+          details: `Updated interview booking #${bookingId} to "${nextStatus}".`,
+        });
+        res.json({ updated: true });
+      } catch (err: unknown) {
+        res.status(404).json({ error: err instanceof Error ? err.message : 'Booking update failed.' });
+      }
+    })
+  );
 
   // ===========================================================================
   // 5. PUBLIC CANDIDATE SELF-SERVICE PORTAL (/api/portal/:token)
   // ===========================================================================
-  app.get('/api/portal/:token', (req: Request, res: Response) => {
-    const token = String(req.params.token || '').trim();
-    const row = db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token) as
-      | Record<string, unknown>
-      | undefined;
+  app.get(
+    '/api/portal/:token',
+    asyncHandler(async (req: Request, res: Response) => {
+      const token = String(req.params.token || '').trim();
+      const row = (await db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token)) as
+        | Record<string, unknown>
+        | undefined;
 
-    if (!row) {
-      res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
-      return;
-    }
+      if (!row) {
+        res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
+        return;
+      }
 
-    const availableSlots = db
-      .prepare(`
-        SELECT * FROM interview_slots
-        WHERE status = 'ACTIVE' AND booked_count < capacity
-        ORDER BY date ASC, start_time ASC
-      `)
-      .all();
+      const availableSlots = await db
+        .prepare(`
+          SELECT * FROM interview_slots
+          WHERE status = 'ACTIVE' AND booked_count < capacity
+          ORDER BY date ASC, start_time ASC
+        `)
+        .all();
 
-    res.json({
-      candidate: hydrateCandidate(row, 'CANDIDATE'),
-      availableSlots,
-    });
-  });
+      res.json({
+        candidate: await hydrateCandidate(row, 'CANDIDATE', req),
+        availableSlots,
+      });
+    })
+  );
 
   async function processPortalAcademicUpload(
     req: Request,
@@ -4713,42 +5244,43 @@ async function startServer() {
     const docType = String(req.body?.doc_type || '').toUpperCase();
     const allowedPortalDocs = ['APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
     if (!allowedPortalDocs.includes(docType)) {
-      if (req.file) fs.unlink(req.file.path, () => {});
       return { errorStatus: 400, errorMessage: 'Invalid document type for portal upload.' };
     }
     if (!req.file) {
       return { errorStatus: 400, errorMessage: 'Please attach a document file (PDF, PNG, JPG, WEBP, or DOCX).' };
     }
 
-    ensureCandidateDocumentRows(candidateId);
-    // Reset verified = 0 when replacing a document so HR performs manual sign-off on the new scan
-    db.prepare(`
-      UPDATE candidate_documents
-      SET completed = 1, verified = 0, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
-          ai_extracted_json = '', ai_verified_status = ''
-      WHERE candidate_id = ? AND doc_type = ?
-    `).run(req.file.originalname, req.file.filename, candidateId, docType);
+    const stored = await saveUploadedFile(req.file);
 
-    const missing = getMissingDocsForCandidate(candidateId);
+    await ensureCandidateDocumentRows(candidateId);
+    // Reset verified = 0 when replacing a document so HR performs manual sign-off on the new scan
+    await db
+      .prepare(`
+        UPDATE candidate_documents
+        SET completed = 1, verified = 0, not_applicable = 0, file_name = ?, file_path = ?, uploaded_at = datetime('now'),
+            ai_extracted_json = '', ai_verified_status = ''
+        WHERE candidate_id = ? AND doc_type = ?
+      `)
+      .run(stored.fileName, stored.filePath, candidateId, docType);
+
+    const missing = await getMissingDocsForCandidate(candidateId);
     const nextStage = Number(row.stage) < 7 ? (missing.length === 0 ? 7 : 6) : Number(row.stage);
     const nextStatus =
       Number(row.stage) <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(row.status);
 
-    db.prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`).run(
-      nextStage,
-      nextStatus,
-      candidateId
-    );
+    await db
+      .prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(nextStage, nextStatus, candidateId);
 
     const candidateActorName = `${row.full_name} (${row.email})`;
-    logAudit({
+    await logAudit({
       req,
       actorName: candidateActorName,
       actorRole: 'candidate_portal',
       pageVisited: 'Candidate Self-Service Portal',
       actionTaken: 'UPLOAD_DOCUMENT',
       targetEntity: `${row.full_name} (${row.candidate_code}) — ${docType}`,
-      details: `Candidate ${row.full_name} uploaded ${docType} (${req.file.originalname}) via self-service portal.`,
+      details: `Candidate ${row.full_name} uploaded ${docType} (${stored.fileName}) via self-service portal [${stored.storage === 'gdrive' ? 'Google Drive' : 'Local Storage'}].`,
     });
 
     await runAndPersistDocumentExtraction({
@@ -4762,8 +5294,9 @@ async function startServer() {
       position: String(row.position || ''),
       department: String(row.department || ''),
       docType: docType as ExtractableDocType,
-      filePath: req.file.path,
-      fileName: req.file.originalname,
+      filePath: stored.filePath,
+      fileBuffer: req.file.buffer,
+      fileName: stored.fileName,
       mimeType: req.file.mimetype,
     });
 
@@ -4771,249 +5304,330 @@ async function startServer() {
   }
 
   // Dedicated Candidate Portal academic document upload + automatic Gemini AI extraction
-  app.post('/api/portal/:token/documents', upload.single('file'), async (req: Request, res: Response) => {
-    const token = String(req.params.token || '').trim();
-    const row = db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token) as
-      | Record<string, unknown>
-      | undefined;
+  app.post(
+    '/api/portal/:token/documents',
+    upload.single('file'),
+    asyncHandler(async (req: Request, res: Response) => {
+      const token = String(req.params.token || '').trim();
+      const row = (await db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token)) as
+        | Record<string, unknown>
+        | undefined;
 
-    if (!row) {
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
-      return;
-    }
+      if (!row) {
+        res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
+        return;
+      }
 
-    const result = await processPortalAcademicUpload(req, row);
-    if (result.errorStatus) {
-      res.status(result.errorStatus).json({ error: result.errorMessage });
-      return;
-    }
-
-    const candidateId = Number(row.id);
-    const refreshed = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
-    const availableSlots = db
-      .prepare(`SELECT * FROM interview_slots WHERE status = 'ACTIVE' AND booked_count < capacity ORDER BY date ASC, start_time ASC`)
-      .all();
-
-    res.json({
-      candidate: hydrateCandidate(refreshed, 'CANDIDATE'),
-      availableSlots,
-    });
-  });
-
-  // Candidate portal actions: upload doc, mark Google Apps Script forms done, book slot, respond to offer
-  app.post('/api/portal/:token', upload.single('file'), async (req: Request, res: Response) => {
-    const token = String(req.params.token || '').trim();
-    const row = db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token) as
-      | Record<string, unknown>
-      | undefined;
-
-    if (!row) {
-      if (req.file) fs.unlink(req.file.path, () => {});
-      res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
-      return;
-    }
-
-    const candidateId = Number(row.id);
-    const action = String(req.body?.action || '');
-
-    // Action A: Upload candidate form, assessment, or academic document
-    if (action === 'upload_document') {
       const result = await processPortalAcademicUpload(req, row);
       if (result.errorStatus) {
         res.status(result.errorStatus).json({ error: result.errorMessage });
         return;
       }
-    }
-    // Action B: Atomic Self-Service Interview Slot Booking
-    else if (action === 'book_slot') {
-      const slotId = Number(req.body?.slot_id);
-      if (!slotId) {
-        res.status(400).json({ error: 'Please select an interview slot.' });
+
+      const candidateId = Number(row.id);
+      const refreshed = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId)) as Record<
+        string,
+        unknown
+      >;
+      const availableSlots = await db
+        .prepare(`SELECT * FROM interview_slots WHERE status = 'ACTIVE' AND booked_count < capacity ORDER BY date ASC, start_time ASC`)
+        .all();
+
+      res.json({
+        candidate: await hydrateCandidate(refreshed, 'CANDIDATE', req),
+        availableSlots,
+      });
+    })
+  );
+
+  // Candidate portal actions: upload doc, book slot, respond to offer
+  app.post(
+    '/api/portal/:token',
+    upload.single('file'),
+    asyncHandler(async (req: Request, res: Response) => {
+      const token = String(req.params.token || '').trim();
+      const row = (await db.prepare('SELECT * FROM candidates WHERE portal_token = ?').get(token)) as
+        | Record<string, unknown>
+        | undefined;
+
+      if (!row) {
+        res.status(404).json({ error: 'Invalid or expired candidate portal token.' });
         return;
       }
-      if (String(row.qualification_status) !== 'qualified') {
-        res.status(403).json({ error: 'Interview booking is only available once HR qualifies your application.' });
+
+      const candidateId = Number(row.id);
+      const action = String(req.body?.action || '');
+
+      // Action A: Upload candidate form, assessment, or academic document
+      if (action === 'upload_document') {
+        const result = await processPortalAcademicUpload(req, row);
+        if (result.errorStatus) {
+          res.status(result.errorStatus).json({ error: result.errorMessage });
+          return;
+        }
+      }
+      // Action B: Atomic Self-Service Interview Slot Booking
+      else if (action === 'book_slot') {
+        const slotId = Number(req.body?.slot_id);
+        if (!slotId) {
+          res.status(400).json({ error: 'Please select an interview slot.' });
+          return;
+        }
+        if (String(row.qualification_status) !== 'qualified') {
+          res.status(403).json({ error: 'Interview booking is only available once HR qualifies your application.' });
+          return;
+        }
+
+        try {
+          const result = await reserveSlotTransaction(slotId, candidateId);
+          await dispatchEmail({
+            candidateId: result.candidate.id,
+            candidateName: result.candidate.full_name,
+            recipientEmail: result.candidate.email,
+            templateType: 'interview_confirmation',
+            subject: `[Confirmed] Interview Schedule for ${result.candidate.position} on ${result.slot.date}`,
+            bodyText: [
+              `Dear ${result.candidate.full_name},`,
+              '',
+              `Your self-scheduled interview slot for ${result.candidate.position} is confirmed:`,
+              `- Date: ${result.slot.date}`,
+              `- Time: ${result.slot.start_time} - ${result.slot.end_time} MYT`,
+              `- Mode: ${result.slot.mode}`,
+              `- Panelist: ${result.slot.interviewer_name}`,
+              `- Location / Link: ${result.slot.location_or_link || 'Provided by HR'}`,
+              '',
+              'Your slot has been atomically reserved. We look forward to speaking with you.',
+              '',
+              'Regards,\nTalentFlow MY HR Team',
+            ].join('\n'),
+            stageTriggered: 10,
+            triggeredBy: 'candidate-portal',
+            req,
+            actorName: `${row.full_name} (${row.email})`,
+            actorRole: 'candidate_portal',
+            pageVisited: 'Candidate Self-Service Portal',
+          });
+
+          await logAudit({
+            req,
+            actorName: `${row.full_name} (${row.email})`,
+            actorRole: 'candidate_portal',
+            pageVisited: 'Candidate Self-Service Portal',
+            actionTaken: 'BOOK_INTERVIEW_SLOT',
+            targetEntity: `${row.full_name} (${row.candidate_code}) — Slot #${slotId}`,
+            details: `Candidate ${row.full_name} self-booked slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}).`,
+          });
+        } catch (err: unknown) {
+          res.status(409).json({ error: err instanceof Error ? err.message : 'Slot reservation conflict.' });
+          return;
+        }
+      }
+      // Action D: Stage 15 Employment Offer Acceptance / Rejection
+      else if (action === 'offer_response') {
+        const accepted = req.body?.accepted === true || req.body?.accepted === 'true';
+        const responseNote = String(req.body?.note || '').trim();
+        const offer = await db.prepare('SELECT id FROM offers WHERE candidate_id = ?').get(candidateId);
+        if (!offer) {
+          res.status(404).json({ error: 'No employment offer found for this candidate.' });
+          return;
+        }
+
+        const offerStatus = accepted ? 'Accepted' : 'Rejected';
+        const candStatus = accepted ? 'offer_accepted' : 'offer_rejected';
+
+        await db
+          .prepare(`
+            UPDATE offers SET status = ?, candidate_response_note = ?, responded_at = datetime('now')
+            WHERE candidate_id = ?
+          `)
+          .run(offerStatus, responseNote || `Candidate ${offerStatus.toLowerCase()} offer via portal.`, candidateId);
+
+        await db
+          .prepare(`
+            UPDATE candidates SET stage = 15, status = ?, final_decision_notes = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(candStatus, responseNote || `Offer ${offerStatus} via Candidate Portal.`, candidateId);
+
+        await logAudit({
+          req,
+          actorName: `${row.full_name} (${row.email})`,
+          actorRole: 'candidate_portal',
+          pageVisited: 'Candidate Self-Service Portal',
+          actionTaken: 'UPDATE_OFFER_STATUS',
+          targetEntity: `${row.full_name} (${row.candidate_code})`,
+          details: `Candidate ${row.full_name} ${offerStatus.toLowerCase()} employment offer via self-service portal.`,
+        });
+      } else {
+        res.status(400).json({ error: 'Unsupported portal action.' });
+        return;
+      }
+
+      const refreshed = (await db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId)) as Record<
+        string,
+        unknown
+      >;
+      const availableSlots = await db
+        .prepare(`SELECT * FROM interview_slots WHERE status = 'ACTIVE' AND booked_count < capacity ORDER BY date ASC, start_time ASC`)
+        .all();
+
+      res.json({
+        candidate: await hydrateCandidate(refreshed, 'CANDIDATE', req),
+        availableSlots,
+      });
+    })
+  );
+
+  // ===========================================================================
+  // 6. PROTECTED FILE DOWNLOADS (/api/files/:filename — Google Drive & Local)
+  // ===========================================================================
+  const SCRIPTABLE_MIME_TYPES = new Set([
+    'text/html',
+    'image/svg+xml',
+    'application/xhtml+xml',
+    'text/xml',
+    'application/xml',
+  ]);
+
+  app.get(
+    '/api/files/:filename',
+    asyncHandler(async (req: Request, res: Response) => {
+      const queryRef = typeof req.query.ref === 'string' ? req.query.ref.trim() : '';
+      const paramName = String(req.params.filename || '').trim();
+      const rawRef = queryRef || paramName;
+      const fileRef = normalizeStoredFileRef(rawRef);
+
+      if (!fileRef) {
+        res.status(400).json({ error: 'Invalid filename.' });
+        return;
+      }
+
+      if (isGoogleDriveRef(fileRef) && !extractGoogleDriveFileId(fileRef)) {
+        res.status(400).json({ error: 'Invalid Google Drive file reference.' });
+        return;
+      }
+
+      // Authorize either via HR JWT (Header or query param) OR matching candidate portal_token
+      const authHeader = req.headers.authorization || '';
+      const jwtRaw = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : String(req.query.auth || '').trim();
+      const portalToken = String(req.query.portal_token || '').trim();
+
+      let authorized = false;
+
+      if (jwtRaw) {
+        const decoded = verifyJwtToken(jwtRaw);
+        if (decoded) {
+          const sessionCheck = await validateSessionAndIdle(decoded, req, true);
+          if (sessionCheck.ok) {
+            authorized = true;
+          } else {
+            res.status(sessionCheck.statusCode).json({
+              error: sessionCheck.error,
+              ...(sessionCheck.code ? { code: sessionCheck.code } : {}),
+            });
+            return;
+          }
+        }
+      } else if (portalToken) {
+        const cand = (await db.prepare('SELECT id FROM candidates WHERE portal_token = ?').get(portalToken)) as
+          | { id: number }
+          | undefined;
+        if (cand) {
+          const docMatch = await db
+            .prepare('SELECT id FROM candidate_documents WHERE candidate_id = ? AND file_path = ?')
+            .get(cand.id, fileRef);
+          const offerMatch = await db
+            .prepare('SELECT id FROM offers WHERE candidate_id = ? AND offer_letter_path = ?')
+            .get(cand.id, fileRef);
+          if (docMatch || offerMatch) {
+            authorized = true;
+          }
+        }
+      }
+
+      if (!authorized) {
+        res.status(401).json({ error: 'Unauthorized file access. Provide a valid HR token or candidate portal token.' });
+        return;
+      }
+
+      if (isGoogleDriveRef(fileRef)) {
+        const docMeta = (await db
+          .prepare('SELECT file_name FROM candidate_documents WHERE file_path = ? LIMIT 1')
+          .get(fileRef)) as { file_name: string } | undefined;
+
+        const stored = await readStoredFile(fileRef, docMeta?.file_name || '');
+        if (!stored) {
+          res.status(404).json({ error: 'File not found in Google Drive storage.' });
+          return;
+        }
+
+        const safeHeaderName = (stored.fileName || 'document')
+          .replace(/[\r\n"\\]/g, '_')
+          .replace(/[^\x20-\x7E]/g, '_')
+          .slice(0, 140);
+        const disposition = SCRIPTABLE_MIME_TYPES.has(stored.mimeType) ? 'attachment' : 'inline';
+
+        res.setHeader('Content-Type', stored.mimeType);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, max-age=300');
+        res.setHeader('Content-Disposition', `${disposition}; filename="${safeHeaderName}"`);
+        res.send(stored.buffer);
+        return;
+      }
+
+      const fullPath = resolveConfinedLocalPath(fileRef);
+      if (!fullPath) {
+        res.status(400).json({ error: 'Invalid file path.' });
         return;
       }
 
       try {
-        const result = reserveSlotTransaction(slotId, candidateId);
-        await dispatchEmail({
-          candidateId: result.candidate.id,
-          candidateName: result.candidate.full_name,
-          recipientEmail: result.candidate.email,
-          templateType: 'interview_confirmation',
-          subject: `[Confirmed] Interview Schedule for ${result.candidate.position} on ${result.slot.date}`,
-          bodyText: [
-            `Dear ${result.candidate.full_name},`,
-            '',
-            `Your self-scheduled interview slot for ${result.candidate.position} is confirmed:`,
-            `- Date: ${result.slot.date}`,
-            `- Time: ${result.slot.start_time} - ${result.slot.end_time} MYT`,
-            `- Mode: ${result.slot.mode}`,
-            `- Panelist: ${result.slot.interviewer_name}`,
-            `- Location / Link: ${result.slot.location_or_link || 'Provided by HR'}`,
-            '',
-            'Your slot has been atomically reserved. We look forward to speaking with you.',
-            '',
-            'Regards,\nTalentFlow MY HR Team',
-          ].join('\n'),
-          stageTriggered: 10,
-          triggeredBy: 'candidate-portal',
-          req,
-          actorName: `${row.full_name} (${row.email})`,
-          actorRole: 'candidate_portal',
-          pageVisited: 'Candidate Self-Service Portal',
-        });
-
-        logAudit({
-          req,
-          actorName: `${row.full_name} (${row.email})`,
-          actorRole: 'candidate_portal',
-          pageVisited: 'Candidate Self-Service Portal',
-          actionTaken: 'BOOK_INTERVIEW_SLOT',
-          targetEntity: `${row.full_name} (${row.candidate_code}) — Slot #${slotId}`,
-          details: `Candidate ${row.full_name} self-booked slot #${slotId} (${result.slot.date} ${result.slot.start_time}-${result.slot.end_time}).`,
-        });
-      } catch (err: unknown) {
-        res.status(409).json({ error: err instanceof Error ? err.message : 'Slot reservation conflict.' });
-        return;
-      }
-    }
-    // Action D: Stage 15 Employment Offer Acceptance / Rejection
-    else if (action === 'offer_response') {
-      const accepted = req.body?.accepted === true || req.body?.accepted === 'true';
-      const responseNote = String(req.body?.note || '').trim();
-      const offer = db.prepare('SELECT id FROM offers WHERE candidate_id = ?').get(candidateId);
-      if (!offer) {
-        res.status(404).json({ error: 'No employment offer found for this candidate.' });
-        return;
-      }
-
-      const offerStatus = accepted ? 'Accepted' : 'Rejected';
-      const candStatus = accepted ? 'offer_accepted' : 'offer_rejected';
-
-      db.prepare(`
-        UPDATE offers SET status = ?, candidate_response_note = ?, responded_at = datetime('now')
-        WHERE candidate_id = ?
-      `).run(offerStatus, responseNote || `Candidate ${offerStatus.toLowerCase()} offer via portal.`, candidateId);
-
-      db.prepare(`
-        UPDATE candidates SET stage = 15, status = ?, final_decision_notes = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(candStatus, responseNote || `Offer ${offerStatus} via Candidate Portal.`, candidateId);
-
-      logAudit({
-        req,
-        actorName: `${row.full_name} (${row.email})`,
-        actorRole: 'candidate_portal',
-        pageVisited: 'Candidate Self-Service Portal',
-        actionTaken: 'UPDATE_OFFER_STATUS',
-        targetEntity: `${row.full_name} (${row.candidate_code})`,
-        details: `Candidate ${row.full_name} ${offerStatus.toLowerCase()} employment offer via self-service portal.`,
-      });
-    } else {
-      res.status(400).json({ error: 'Unsupported portal action.' });
-      return;
-    }
-
-    const refreshed = db.prepare('SELECT * FROM candidates WHERE id = ?').get(candidateId) as Record<string, unknown>;
-    const availableSlots = db
-      .prepare(`SELECT * FROM interview_slots WHERE status = 'ACTIVE' AND booked_count < capacity ORDER BY date ASC, start_time ASC`)
-      .all();
-
-    res.json({
-      candidate: hydrateCandidate(refreshed, 'CANDIDATE'),
-      availableSlots,
-    });
-  });
-
-  // ===========================================================================
-  // 6. PROTECTED FILE DOWNLOADS (/api/files/:filename)
-  // ===========================================================================
-  app.get('/api/files/:filename', (req: Request, res: Response) => {
-    const safeFilename = path.basename(String(req.params.filename || ''));
-    if (!safeFilename) {
-      res.status(400).json({ error: 'Invalid filename.' });
-      return;
-    }
-
-    // Authorize either via HR JWT (Header or query param) OR matching candidate portal_token
-    const authHeader = req.headers.authorization || '';
-    const jwtRaw = authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7).trim()
-      : String(req.query.auth || '').trim();
-    const portalToken = String(req.query.portal_token || '').trim();
-
-    let authorized = false;
-
-    if (jwtRaw) {
-      const decoded = verifyJwtToken(jwtRaw);
-      if (decoded) {
-        const sessionCheck = validateSessionAndIdle(decoded, req, true);
-        if (sessionCheck.ok) {
-          authorized = true;
-        } else {
-          res.status(sessionCheck.statusCode).json({
-            error: sessionCheck.error,
-            ...(sessionCheck.code ? { code: sessionCheck.code } : {}),
-          });
+        const stat = await fs.promises.stat(fullPath);
+        if (!stat.isFile()) {
+          res.status(404).json({ error: 'File not found on server storage.' });
           return;
         }
+      } catch {
+        res.status(404).json({ error: 'File not found on server storage.' });
+        return;
       }
-    } else if (portalToken) {
-      const cand = db.prepare('SELECT id FROM candidates WHERE portal_token = ?').get(portalToken) as
-        | { id: number }
-        | undefined;
-      if (cand) {
-        const docMatch = db
-          .prepare('SELECT id FROM candidate_documents WHERE candidate_id = ? AND file_path = ?')
-          .get(cand.id, safeFilename);
-        const offerMatch = db
-          .prepare('SELECT id FROM offers WHERE candidate_id = ? AND offer_letter_path = ?')
-          .get(cand.id, safeFilename);
-        if (docMatch || offerMatch) {
-          authorized = true;
-        }
-      }
-    }
 
-    if (!authorized) {
-      res.status(401).json({ error: 'Unauthorized file access. Provide a valid HR token or candidate portal token.' });
-      return;
-    }
-
-    const fullPath = path.join(UPLOADS_ROOT, safeFilename);
-    if (!fs.existsSync(fullPath)) {
-      res.status(404).json({ error: 'File not found on server storage.' });
-      return;
-    }
-
-    res.sendFile(fullPath);
-  });
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.sendFile(fullPath);
+    })
+  );
 
   // ===========================================================================
   // 7. EMAIL LOGS & TAMPER-EVIDENT IMMUTABLE AUDIT LOGS
   // ===========================================================================
-  app.get('/api/email-logs', requireAuth, (_req: AuthedRequest, res: Response) => {
-    const emailLogs = db.prepare('SELECT * FROM email_logs ORDER BY id DESC LIMIT 200').all();
-    res.json({ emailLogs, smtpStatus: getPublicSmtpStatus() });
-  });
+  app.get(
+    '/api/email-logs',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const emailLogs = await db.prepare('SELECT * FROM email_logs ORDER BY id DESC LIMIT 200').all();
+      res.json({
+        emailLogs,
+        smtpStatus: getPublicSmtpStatus(),
+        portalUrlStatus: getPublicPortalUrlStatus(req),
+      });
+    })
+  );
 
   // Resend any previously logged email via live Gmail SMTP (Administrator only)
   app.post(
     '/api/email-logs/:id/resend',
     requireAuth,
     requireRole('administrator'),
-    async (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const logId = Number(req.params.id);
       if (!Number.isInteger(logId) || logId <= 0) {
         res.status(400).json({ error: 'Invalid email log ID.' });
         return;
       }
 
-      const original = db.prepare('SELECT * FROM email_logs WHERE id = ?').get(logId) as
+      const original = (await db.prepare('SELECT * FROM email_logs WHERE id = ?').get(logId)) as
         | {
             id: number;
             candidate_id: number | null;
@@ -5047,9 +5661,9 @@ async function startServer() {
         pageVisited,
       });
 
-      const emailLog = db.prepare('SELECT * FROM email_logs WHERE id = ?').get(emailDelivery.id);
+      const emailLog = await db.prepare('SELECT * FROM email_logs WHERE id = ?').get(emailDelivery.id);
       const candidateRow = original.candidate_id
-        ? (db.prepare('SELECT * FROM candidates WHERE id = ?').get(original.candidate_id) as
+        ? ((await db.prepare('SELECT * FROM candidates WHERE id = ?').get(original.candidate_id)) as
             | Record<string, unknown>
             | undefined)
         : undefined;
@@ -5057,39 +5671,44 @@ async function startServer() {
       res.json({
         emailDelivery,
         emailLog,
-        candidate: candidateRow ? hydrateCandidate(candidateRow, req.user!.role) : null,
+        candidate: candidateRow ? await hydrateCandidate(candidateRow, req.user!.role, req) : null,
       });
-    }
+    })
   );
 
   // Live Gmail SMTP connection verification check (Administrator only)
-  app.post('/api/smtp/verify', requireAuth, requireRole('administrator'), async (_req: AuthedRequest, res: Response) => {
-    const smtpStatus = getPublicSmtpStatus();
-    const { transporter, config } = createLiveMailTransporter();
-    if (!transporter) {
-      res.json({
-        ok: false,
-        error: config.reason,
-        smtpStatus,
-      });
-      return;
-    }
+  app.post(
+    '/api/smtp/verify',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (_req: AuthedRequest, res: Response) => {
+      const smtpStatus = getPublicSmtpStatus();
+      const { transporter, config } = createLiveMailTransporter();
+      if (!transporter) {
+        res.json({
+          ok: false,
+          error: config.reason,
+          smtpStatus,
+        });
+        return;
+      }
 
-    try {
-      await transporter.verify();
-      res.json({
-        ok: true,
-        error: '',
-        smtpStatus,
-      });
-    } catch (err) {
-      res.json({
-        ok: false,
-        error: formatSmtpError(err),
-        smtpStatus,
-      });
-    }
-  });
+      try {
+        await transporter.verify();
+        res.json({
+          ok: true,
+          error: '',
+          smtpStatus,
+        });
+      } catch (err) {
+        res.json({
+          ok: false,
+          error: formatSmtpError(err),
+          smtpStatus,
+        });
+      }
+    })
+  );
 
   // Strict immutability enforcement: explicitly reject ANY DELETE, PUT, or PATCH on audit_logs
   const rejectAuditMutation = (_req: Request, res: Response) => {
@@ -5108,97 +5727,106 @@ async function startServer() {
   app.patch('/api/audit-logs/*', rejectAuditMutation);
 
   // Query audit logs with live multi-filter support (both administrator and manager)
-  app.get('/api/audit-logs', requireAuth, (req: AuthedRequest, res: Response) => {
-    const { whereClause, params } = buildAuditLogFilterSql(req.query as Record<string, unknown>);
-    const requestedLimit = Number(req.query.limit);
-    const limit = Number.isFinite(requestedLimit)
-      ? Math.max(1, Math.min(1000, Math.round(requestedLimit)))
-      : 500;
+  app.get(
+    '/api/audit-logs',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const { whereClause, params } = buildAuditLogFilterSql(req.query as Record<string, unknown>);
+      const requestedLimit = Number(req.query.limit);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(1000, Math.round(requestedLimit)))
+        : 500;
 
-    const totalCount = (
-      db.prepare(`SELECT COUNT(*) as count FROM audit_logs ${whereClause}`).get(...params) as {
-        count: number;
-      }
-    ).count;
+      const countRow = (await db
+        .prepare(`SELECT COUNT(*) as count FROM audit_logs ${whereClause}`)
+        .get(...params)) as { count: number } | undefined;
+      const totalCount = Number(countRow?.count || 0);
 
-    const auditLogs = db
-      .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT ?`)
-      .all(...params, limit);
+      const auditLogs = await db
+        .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT ?`)
+        .all(...params, limit);
 
-    const actors = (
-      db
+      const actorRows = (await db
         .prepare(`SELECT DISTINCT actor_name FROM audit_logs WHERE actor_name != '' ORDER BY actor_name ASC`)
-        .all() as Array<{ actor_name: string }>
-    ).map((r) => r.actor_name);
+        .all()) as Array<{ actor_name: string }>;
+      const actors = actorRows.map((r) => r.actor_name);
 
-    const pages = (
-      db
+      const pageRows = (await db
         .prepare(`SELECT DISTINCT page_visited FROM audit_logs WHERE page_visited != '' ORDER BY page_visited ASC`)
-        .all() as Array<{ page_visited: string }>
-    ).map((r) => r.page_visited);
+        .all()) as Array<{ page_visited: string }>;
+      const pages = pageRows.map((r) => r.page_visited);
 
-    const actions = (
-      db
+      const actionRows = (await db
         .prepare(`SELECT DISTINCT action_taken FROM audit_logs WHERE action_taken != '' ORDER BY action_taken ASC`)
-        .all() as Array<{ action_taken: string }>
-    ).map((r) => r.action_taken);
+        .all()) as Array<{ action_taken: string }>;
+      const actions = actionRows.map((r) => r.action_taken);
 
-    res.json({
-      auditLogs,
-      totalCount,
-      facets: { actors, pages, actions },
-    });
-  });
+      res.json({
+        auditLogs,
+        totalCount,
+        facets: { actors, pages, actions },
+      });
+    })
+  );
 
   // Record automatic frontend page/view navigation visits (administrator & manager)
-  app.post('/api/audit-logs/page-visit', requireAuth, (req: AuthedRequest, res: Response) => {
-    const pageVisited = String(req.body?.page_visited || '').trim();
-    if (!pageVisited) {
-      res.status(400).json({ error: 'page_visited is required.' });
-      return;
-    }
-    const targetEntity = String(req.body?.target_entity || '').trim();
-    const details =
-      String(req.body?.details || '').trim() ||
-      `Visited ${pageVisited}${targetEntity ? ` (${targetEntity})` : ''}.`;
+  app.post(
+    '/api/audit-logs/page-visit',
+    requireAuth,
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const pageVisited = String(req.body?.page_visited || '').trim();
+      if (!pageVisited) {
+        res.status(400).json({ error: 'page_visited is required.' });
+        return;
+      }
+      const targetEntity = String(req.body?.target_entity || '').trim();
+      const details =
+        String(req.body?.details || '').trim() ||
+        `Visited ${pageVisited}${targetEntity ? ` (${targetEntity})` : ''}.`;
 
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited,
-      actionTaken: 'PAGE_VIEW',
-      targetEntity,
-      details,
-    });
-    res.status(201).json({ logged: true });
-  });
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited,
+        actionTaken: 'PAGE_VIEW',
+        targetEntity,
+        details,
+      });
+      res.status(201).json({ logged: true });
+    })
+  );
 
   // Record candidate report CSV export (Administrator only)
-  app.post('/api/audit-logs/export', requireAuth, requireRole('administrator'), (req: AuthedRequest, res: Response) => {
-    const count = Number(req.body?.count) || 0;
-    const filterSummary = String(req.body?.filter_summary || '').trim();
-    logAudit({
-      req,
-      actor: req.user,
-      pageVisited: 'Candidate Database',
-      actionTaken: 'EXPORT_REPORT',
-      targetEntity: `Candidate CSV (${count} rows)`,
-      details: `Exported Excel-compatible CSV report covering ${count} candidate record(s)${filterSummary ? ` [Filters: ${filterSummary}]` : ''}.`,
-    });
-    res.json({ logged: true });
-  });
+  app.post(
+    '/api/audit-logs/export',
+    requireAuth,
+    requireRole('administrator'),
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
+      const count = Number(req.body?.count) || 0;
+      const filterSummary = String(req.body?.filter_summary || '').trim();
+      await logAudit({
+        req,
+        actor: req.user,
+        pageVisited: 'Candidate Database',
+        actionTaken: 'EXPORT_REPORT',
+        targetEntity: `Candidate CSV (${count} rows)`,
+        details: `Exported Excel-compatible CSV report covering ${count} candidate record(s)${filterSummary ? ` [Filters: ${filterSummary}]` : ''}.`,
+      });
+      res.json({ logged: true });
+    })
+  );
 
   // Administrator-only full/filtered Audit Trail CSV download
   app.get(
     '/api/audit-logs/export',
     requireAuth,
     requireRole('administrator'),
-    (req: AuthedRequest, res: Response) => {
+    asyncHandler(async (req: AuthedRequest, res: Response) => {
       const query = req.query as Record<string, unknown>;
       const { whereClause, params } = buildAuditLogFilterSql(query);
-      const rows = db
+      const rows = (await db
         .prepare(`SELECT * FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT 50000`)
-        .all(...params) as Array<{
+        .all(...params)) as Array<{
         id: number;
         timestamp: string;
         actor_name: string;
@@ -5223,7 +5851,7 @@ async function startServer() {
 
       const filename = `TJW_HR_Audit_Trail_${getMalaysiaDateStamp()}.csv`;
 
-      logAudit({
+      await logAudit({
         req,
         actor: req.user,
         pageVisited: 'Email Automation & Audit Trail',
@@ -5270,30 +5898,61 @@ async function startServer() {
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.setHeader('Cache-Control', 'no-store');
       res.send(csvContent);
-    }
+    })
   );
+
+  // ===========================================================================
+  // GLOBAL API ERROR HANDLER (Multer / Turso / Google Drive Webhook Safety)
+  // ===========================================================================
+  app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({ error: 'Uploaded file exceeds the 15 MB limit.' });
+        return;
+      }
+      res.status(400).json({ error: `File upload error: ${err.message}` });
+      return;
+    }
+
+    const message = err instanceof Error ? err.message : 'Unexpected server error.';
+    const isUpstreamStorageError = /Google Drive/i.test(message);
+    console.error('[API Error]', err);
+    res.status(isUpstreamStorageError ? 502 : 500).json({
+      error: isUpstreamStorageError ? message : 'An internal server error occurred while processing the request.',
+    });
+  });
 
   // ===========================================================================
   // VITE DEV MIDDLEWARE / PRODUCTION STATIC SPA
   // ===========================================================================
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.resolve(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api')) {
+        res.status(404).json({ error: 'API route not found.' });
+        return;
+      }
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`TalentFlow MY Express + SQLite server running on http://0.0.0.0:${PORT}`);
+    const dbLabel = db.mode === 'turso' ? 'Turso libSQL' : 'Local SQLite';
+    const storageLabel = isGoogleDriveStorageEnabled() ? 'Google Drive Webhook' : 'Local uploads/';
+    console.log(`TalentFlow MY Express server running on http://0.0.0.0:${PORT} [DB: ${dbLabel} | Storage: ${storageLabel}]`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[Startup] Failed to initialize TalentFlow MY server:', err);
+  process.exit(1);
+});

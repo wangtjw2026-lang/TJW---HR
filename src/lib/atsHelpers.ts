@@ -334,19 +334,34 @@ export function getWhatsAppTemplateLabel(key: WhatsAppTemplateKey): string {
   return WHATSAPP_TEMPLATES.find((t) => t.key === key)?.label ?? 'General Follow-Up';
 }
 
+export function resolveCandidatePortalUrl(
+  candidate: Pick<CandidateRecord, 'portal_token' | 'portal_url'>
+): string {
+  const configuredPortalUrl = String(candidate.portal_url || '').trim();
+  if (configuredPortalUrl) return configuredPortalUrl;
+  const token = String(candidate.portal_token || '').trim();
+  if (!token) return '';
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return `${window.location.origin.replace(/\/+$/, '')}/?portal=${token}`;
+  }
+  return `/?portal=${token}`;
+}
+
 export function buildWhatsAppMessage(
-  candidate: Pick<CandidateRecord, 'full_name' | 'position' | 'email'>,
+  candidate: Pick<CandidateRecord, 'full_name' | 'position' | 'email' | 'portal_token' | 'portal_url'>,
   templateKey: WhatsAppTemplateKey
 ): string {
   const name = candidate.full_name || 'Candidate';
   const position = candidate.position || 'open';
   const email = candidate.email || 'your email address';
+  const portalUrl = resolveCandidatePortalUrl(candidate);
+  const portalSuffix = portalUrl ? ` Portal link: ${portalUrl}` : '';
 
   switch (templateKey) {
     case 'shortlisted_docs':
-      return `Hi ${name}, this is HR from TJW. Congratulations on being shortlisted for the ${position} role! We have sent an email to ${email} with your Candidate Self-Service Portal link to upload your completed Employment Application Form, DISC Assessment, VAKAD Assessment, and academic certificates (SPM, UEC if applicable, Degree, and Transcript). Please check your inbox (and Spam/Junk folder) and let us know if you have any questions.`;
+      return `Hi ${name}, this is HR from TJW. Congratulations on being shortlisted for the ${position} role! We have sent an email to ${email} with your Candidate Self-Service Portal link to upload your completed Employment Application Form, DISC Assessment, VAKAD Assessment, and academic certificates (SPM, UEC if applicable, Degree, and Transcript).${portalSuffix} Please check your inbox (and Spam/Junk folder) and let us know if you have any questions.`;
     case 'interview_reminder':
-      return `Hi ${name}, this is HR from TJW regarding your ${position} application. Please confirm your interview slot via our Candidate Portal or reply here if you need any assistance.`;
+      return `Hi ${name}, this is HR from TJW regarding your ${position} application. Please confirm your interview slot via our Candidate Portal or reply here if you need any assistance.${portalSuffix}`;
     case 'general_followup':
     default:
       return `Hi ${name}, this is HR from TJW following up on your application for ${position}.`;

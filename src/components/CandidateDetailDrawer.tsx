@@ -57,6 +57,7 @@ import {
   getWhatsAppTemplateLabel,
   normalizeMalaysiaMobile,
   openExternalWhatsAppUrl,
+  resolveCandidatePortalUrl,
   WHATSAPP_TEMPLATES,
   WhatsAppTemplateKey,
 } from '../lib/atsHelpers';
@@ -291,10 +292,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
       });
   };
 
-  const portalUrl =
-    typeof window !== 'undefined'
-      ? `${window.location.origin}/?portal=${candidate.portal_token}`
-      : `/?portal=${candidate.portal_token}`;
+  const portalUrl = resolveCandidatePortalUrl(candidate);
 
   const resumeDoc = getDoc(candidate, 'RESUME');
   const missingDocs = getMissingMandatoryDocs(candidate);

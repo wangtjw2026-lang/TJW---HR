@@ -13,6 +13,7 @@ import {
   OfferStatus,
   ParsedResumeResult,
   PostInterviewDecision,
+  PublicPortalUrlStatus,
   QualificationStatus,
   ScreeningDecision,
   SmtpConfigStatus,
@@ -121,12 +122,15 @@ async function apiFetch<T>(
 }
 
 export function getProtectedFileUrl(filename: string, portalToken?: string): string {
-  const encoded = encodeURIComponent(filename);
-  if (portalToken) {
-    return `/api/files/${encoded}?portal_token=${encodeURIComponent(portalToken)}`;
+  const isGdrive = filename.startsWith('gdrive://');
+  const authParam = portalToken
+    ? `portal_token=${encodeURIComponent(portalToken)}`
+    : `auth=${encodeURIComponent(getStoredToken() || '')}`;
+  if (isGdrive) {
+    return `/api/files/gdrive?ref=${encodeURIComponent(filename)}&${authParam}`;
   }
-  const token = getStoredToken() || '';
-  return `/api/files/${encoded}?auth=${encodeURIComponent(token)}`;
+  const encoded = encodeURIComponent(filename);
+  return `/api/files/${encoded}?${authParam}`;
 }
 
 // =============================================================================
@@ -823,8 +827,13 @@ export async function portalRespondToOffer(
 export async function fetchEmailLogsWithStatus(): Promise<{
   emailLogs: EmailLogRecord[];
   smtpStatus: SmtpConfigStatus;
+  portalUrlStatus: PublicPortalUrlStatus;
 }> {
-  return apiFetch<{ emailLogs: EmailLogRecord[]; smtpStatus: SmtpConfigStatus }>('/api/email-logs');
+  return apiFetch<{
+    emailLogs: EmailLogRecord[];
+    smtpStatus: SmtpConfigStatus;
+    portalUrlStatus: PublicPortalUrlStatus;
+  }>('/api/email-logs');
 }
 
 export async function fetchEmailLogs(): Promise<EmailLogRecord[]> {

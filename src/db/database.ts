@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { createClient, type Client, type InValue, type Row, type Transaction } from '@libsql/client';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -6,6 +7,14 @@ import path from 'path';
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
 const DB_PATH = path.join(DATA_DIR, 'talentflow.db');
+
+export const UPLOADS_ROOT = UPLOADS_DIR;
+
+function cleanEnv(val: unknown): string {
+  return String(val ?? '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
 
 export function ensureDirectories() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -16,13 +25,198 @@ export function ensureDirectories() {
   }
 }
 
-ensureDirectories();
+export interface DbRunResult {
+  changes: number;
+  lastInsertRowid: number;
+}
 
-export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+export interface DbPreparedStatement {
+  get<T = Record<string, unknown>>(...params: unknown[]): Promise<T | undefined>;
+  all<T = Record<string, unknown>>(...params: unknown[]): Promise<T[]>;
+  run(...params: unknown[]): Promise<DbRunResult>;
+}
 
-export const UPLOADS_ROOT = UPLOADS_DIR;
+export interface DbExecutor {
+  prepare(sql: string): DbPreparedStatement;
+  exec(sql: string): Promise<void>;
+}
+
+export interface AppDatabase extends DbExecutor {
+  readonly mode: 'turso' | 'sqlite';
+  transaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T>;
+  pragma(pragmaSql: string): Promise<void>;
+}
+
+function normalizeSqlValue(val: unknown): InValue {
+  if (val === undefined || val === null) return null;
+  if (typeof val === 'boolean') return val ? 1 : 0;
+  if (typeof val === 'number' || typeof val === 'string' || typeof val === 'bigint') {
+    return val;
+  }
+  if (val instanceof Uint8Array) return val;
+  return String(val);
+}
+
+function normalizeArgs(params: unknown[]): InValue[] {
+  return params.map(normalizeSqlValue);
+}
+
+function convertLibsqlRow(row: Row, columns: string[]): Record<string, unknown> {
+  const obj: Record<string, unknown> = {};
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i];
+    const val = row[col];
+    obj[col] = typeof val === 'bigint' ? Number(val) : val;
+  }
+  return obj;
+}
+
+function createTursoExecutor(runner: Client | Transaction): DbExecutor {
+  return {
+    prepare(sql: string): DbPreparedStatement {
+      return {
+        async get<T = Record<string, unknown>>(...params: unknown[]): Promise<T | undefined> {
+          const rs = await runner.execute({ sql, args: normalizeArgs(params) });
+          if (!rs.rows || rs.rows.length === 0) return undefined;
+          return convertLibsqlRow(rs.rows[0], rs.columns) as T;
+        },
+        async all<T = Record<string, unknown>>(...params: unknown[]): Promise<T[]> {
+          const rs = await runner.execute({ sql, args: normalizeArgs(params) });
+          return rs.rows.map((row) => convertLibsqlRow(row, rs.columns) as T);
+        },
+        async run(...params: unknown[]): Promise<DbRunResult> {
+          const rs = await runner.execute({ sql, args: normalizeArgs(params) });
+          return {
+            changes: Number(rs.rowsAffected ?? 0),
+            lastInsertRowid: rs.lastInsertRowid !== undefined ? Number(rs.lastInsertRowid) : 0,
+          };
+        },
+      };
+    },
+    async exec(sql: string): Promise<void> {
+      await runner.execute(sql);
+    },
+  };
+}
+
+function createSqliteExecutor(sqlite: Database.Database): DbExecutor {
+  return {
+    prepare(sql: string): DbPreparedStatement {
+      const stmt = sqlite.prepare(sql);
+      return {
+        async get<T = Record<string, unknown>>(...params: unknown[]): Promise<T | undefined> {
+          const normalized = params.map((p) => (p === undefined ? null : typeof p === 'boolean' ? (p ? 1 : 0) : p));
+          return stmt.get(...normalized) as T | undefined;
+        },
+        async all<T = Record<string, unknown>>(...params: unknown[]): Promise<T[]> {
+          const normalized = params.map((p) => (p === undefined ? null : typeof p === 'boolean' ? (p ? 1 : 0) : p));
+          return stmt.all(...normalized) as T[];
+        },
+        async run(...params: unknown[]): Promise<DbRunResult> {
+          const normalized = params.map((p) => (p === undefined ? null : typeof p === 'boolean' ? (p ? 1 : 0) : p));
+          const info = stmt.run(...normalized);
+          return {
+            changes: Number(info.changes ?? 0),
+            lastInsertRowid: Number(info.lastInsertRowid ?? 0),
+          };
+        },
+      };
+    },
+    async exec(sql: string): Promise<void> {
+      sqlite.exec(sql);
+    },
+  };
+}
+
+function createAppDatabase(): AppDatabase {
+  const tursoUrl = cleanEnv(process.env.TURSO_DATABASE_URL);
+  const tursoAuthToken = cleanEnv(process.env.TURSO_AUTH_TOKEN);
+
+  if (tursoUrl && tursoAuthToken) {
+    const client = createClient({
+      url: tursoUrl,
+      authToken: tursoAuthToken,
+    });
+    const baseExecutor = createTursoExecutor(client);
+    console.log('[Database] Connected to Turso Cloud SQLite (libSQL).');
+
+    return {
+      mode: 'turso',
+      prepare: baseExecutor.prepare,
+      exec: baseExecutor.exec,
+      async pragma(pragmaSql: string): Promise<void> {
+        try {
+          await client.execute(`PRAGMA ${pragmaSql}`);
+        } catch {
+          // Remote libSQL manages journal_mode/foreign_keys automatically when PRAGMA is unsupported
+        }
+      },
+      async transaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> {
+        const tx = await client.transaction('write');
+        try {
+          const result = await fn(createTursoExecutor(tx));
+          await tx.commit();
+          return result;
+        } catch (err) {
+          try {
+            await tx.rollback();
+          } catch {
+            // Ignore rollback error if transaction already closed
+          }
+          throw err;
+        } finally {
+          tx.close();
+        }
+      },
+    };
+  }
+
+  ensureDirectories();
+  const sqlite = new Database(DB_PATH);
+  sqlite.pragma('journal_mode = WAL');
+  sqlite.pragma('foreign_keys = ON');
+  const baseExecutor = createSqliteExecutor(sqlite);
+  console.log(`[Database] Using local SQLite fallback (${DB_PATH}).`);
+
+  // Serialize async transactions on local better-sqlite3 so concurrent promises never interleave BEGIN/COMMIT
+  let sqliteTxQueue: Promise<void> = Promise.resolve();
+
+  return {
+    mode: 'sqlite',
+    prepare: baseExecutor.prepare,
+    exec: baseExecutor.exec,
+    async pragma(pragmaSql: string): Promise<void> {
+      sqlite.pragma(pragmaSql);
+    },
+    async transaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> {
+      let release!: () => void;
+      const prev = sqliteTxQueue;
+      sqliteTxQueue = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await prev;
+      try {
+        sqlite.exec('BEGIN IMMEDIATE');
+        try {
+          const result = await fn(baseExecutor);
+          sqlite.exec('COMMIT');
+          return result;
+        } catch (err) {
+          try {
+            sqlite.exec('ROLLBACK');
+          } catch {
+            // Ignore if already rolled back
+          }
+          throw err;
+        }
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
+export const db: AppDatabase = createAppDatabase();
 
 export function formatAuditTimestamp(date: Date = new Date()): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -131,8 +325,8 @@ function mapLegacyAuditRow(row: Record<string, unknown>) {
   };
 }
 
-function ensureImmutableAuditLogsTable() {
-  const columns = db.prepare(`PRAGMA table_info(audit_logs)`).all() as Array<{ name: string }>;
+async function ensureImmutableAuditLogsTable(): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(audit_logs)`).all<{ name: string }>();
   const hasNewSchema =
     columns.some((c) => c.name === 'timestamp') &&
     columns.some((c) => c.name === 'page_visited') &&
@@ -141,12 +335,12 @@ function ensureImmutableAuditLogsTable() {
 
   if (columns.length > 0 && !hasNewSchema) {
     // One-time atomic migration from legacy audit_logs schema preserving existing real records
-    const migrate = db.transaction(() => {
-      db.exec(`
-        DROP TRIGGER IF EXISTS prevent_audit_log_delete;
-        DROP TRIGGER IF EXISTS prevent_audit_log_update;
-        ALTER TABLE audit_logs RENAME TO audit_logs_legacy;
+    await db.transaction(async (tx) => {
+      await tx.exec(`DROP TRIGGER IF EXISTS prevent_audit_log_delete`);
+      await tx.exec(`DROP TRIGGER IF EXISTS prevent_audit_log_update`);
+      await tx.exec(`ALTER TABLE audit_logs RENAME TO audit_logs_legacy`);
 
+      await tx.exec(`
         CREATE TABLE audit_logs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           timestamp TEXT NOT NULL,
@@ -159,14 +353,14 @@ function ensureImmutableAuditLogsTable() {
           details TEXT NOT NULL,
           ip_address TEXT NOT NULL DEFAULT '',
           user_agent TEXT NOT NULL DEFAULT ''
-        );
+        )
       `);
 
-      const legacyRows = db
+      const legacyRows = await tx
         .prepare('SELECT * FROM audit_logs_legacy ORDER BY id ASC')
-        .all() as Array<Record<string, unknown>>;
+        .all<Record<string, unknown>>();
 
-      const insertStmt = db.prepare(`
+      const insertStmt = tx.prepare(`
         INSERT INTO audit_logs (
           timestamp, actor_id, actor_name, actor_role, page_visited,
           action_taken, target_entity, details, ip_address, user_agent
@@ -175,7 +369,7 @@ function ensureImmutableAuditLogsTable() {
 
       for (const r of legacyRows) {
         const mapped = mapLegacyAuditRow(r);
-        insertStmt.run(
+        await insertStmt.run(
           mapped.timestamp,
           mapped.actor_id,
           mapped.actor_name,
@@ -189,11 +383,10 @@ function ensureImmutableAuditLogsTable() {
         );
       }
 
-      db.exec('DROP TABLE audit_logs_legacy;');
+      await tx.exec(`DROP TABLE audit_logs_legacy`);
     });
-    migrate();
   } else if (columns.length === 0) {
-    db.exec(`
+    await db.exec(`
       CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -206,211 +399,71 @@ function ensureImmutableAuditLogsTable() {
         details TEXT NOT NULL,
         ip_address TEXT NOT NULL DEFAULT '',
         user_agent TEXT NOT NULL DEFAULT ''
-      );
+      )
     `);
   }
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_role ON audit_logs(actor_role);
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action_taken);
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_page ON audit_logs(page_visited);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC)`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_role ON audit_logs(actor_role)`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action_taken)`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_page ON audit_logs(page_visited)`);
 
+  await db.exec(`
     CREATE TRIGGER IF NOT EXISTS prevent_audit_log_delete
     BEFORE DELETE ON audit_logs
     BEGIN
       SELECT RAISE(ABORT, 'Audit logs cannot be deleted');
-    END;
+    END
+  `);
 
+  await db.exec(`
     CREATE TRIGGER IF NOT EXISTS prevent_audit_log_update
     BEFORE UPDATE ON audit_logs
     BEGIN
       SELECT RAISE(ABORT, 'Audit logs cannot be modified');
-    END;
+    END
   `);
 }
 
-export function initializeDatabase() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('administrator', 'manager')),
-      department TEXT NOT NULL DEFAULT 'HR',
-      status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('pending', 'approved', 'rejected')),
-      approved_by TEXT NOT NULL DEFAULT '',
-      approved_at TEXT NOT NULL DEFAULT '',
-      last_active_at TEXT NOT NULL DEFAULT '',
-      two_fa_enabled INTEGER NOT NULL DEFAULT 1,
-      two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP',
-      two_fa_change_status TEXT NOT NULL DEFAULT 'locked' CHECK(two_fa_change_status IN ('locked', 'pending_admin_approval')),
-      two_fa_requested_state TEXT NOT NULL DEFAULT '',
-      two_fa_approved_by TEXT NOT NULL DEFAULT '',
-      token_version INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS candidates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      candidate_code TEXT NOT NULL UNIQUE,
-      full_name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      location TEXT NOT NULL DEFAULT 'Kuala Lumpur, Malaysia',
-      position TEXT NOT NULL,
-      department TEXT NOT NULL,
-      source TEXT NOT NULL CHECK(source IN ('JobStreet', 'Email')),
-      applied_date TEXT NOT NULL,
-      stage INTEGER NOT NULL DEFAULT 3,
-      status TEXT NOT NULL DEFAULT 'pending_screening',
-      education TEXT NOT NULL DEFAULT '',
-      experience TEXT NOT NULL DEFAULT '',
-      years_experience REAL NOT NULL DEFAULT 0,
-      skills TEXT NOT NULL DEFAULT '[]',
-      ai_score INTEGER NOT NULL DEFAULT 0,
-      ai_summary TEXT NOT NULL DEFAULT '',
-      screening_decision TEXT NOT NULL DEFAULT 'pending',
-      screening_remarks TEXT NOT NULL DEFAULT '',
-      disc_profile TEXT NOT NULL DEFAULT '',
-      last_doc_reminder_at TEXT NOT NULL DEFAULT '',
-      qualification_status TEXT NOT NULL DEFAULT 'pending',
-      qualification_remarks TEXT NOT NULL DEFAULT '',
-      interview_feedback TEXT NOT NULL DEFAULT '',
-      interview_rating INTEGER NOT NULL DEFAULT 0,
-      post_interview_decision TEXT NOT NULL DEFAULT 'pending',
-      final_decision_notes TEXT NOT NULL DEFAULT '',
-      portal_token TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS candidate_documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      candidate_id INTEGER NOT NULL,
-      doc_type TEXT NOT NULL CHECK(doc_type IN ('RESUME', 'APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT')),
-      completed INTEGER NOT NULL DEFAULT 0,
-      verified INTEGER NOT NULL DEFAULT 0,
-      not_applicable INTEGER NOT NULL DEFAULT 0,
-      file_name TEXT NOT NULL DEFAULT '',
-      file_path TEXT NOT NULL DEFAULT '',
-      uploaded_at TEXT NOT NULL DEFAULT '',
-      ai_extracted_json TEXT NOT NULL DEFAULT '',
-      ai_verified_status TEXT NOT NULL DEFAULT '',
-      UNIQUE(candidate_id, doc_type),
-      FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS interview_slots (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL,
-      start_time TEXT NOT NULL,
-      end_time TEXT NOT NULL,
-      capacity INTEGER NOT NULL DEFAULT 1,
-      booked_count INTEGER NOT NULL DEFAULT 0,
-      location_or_link TEXT NOT NULL DEFAULT '',
-      interviewer_name TEXT NOT NULL DEFAULT 'Hiring Panel',
-      department TEXT NOT NULL DEFAULT 'HR',
-      mode TEXT NOT NULL DEFAULT 'Google Meet',
-      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'CANCELLED')),
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS interview_bookings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      slot_id INTEGER NOT NULL,
-      candidate_id INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'CONFIRMED' CHECK(status IN ('CONFIRMED', 'RESCHEDULED', 'CANCELLED', 'COMPLETED')),
-      booked_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (slot_id) REFERENCES interview_slots(id) ON DELETE CASCADE,
-      FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS offers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      candidate_id INTEGER NOT NULL UNIQUE,
-      position TEXT NOT NULL,
-      department TEXT NOT NULL,
-      salary_myr REAL NOT NULL DEFAULT 0,
-      allowance_myr REAL NOT NULL DEFAULT 0,
-      probation_months INTEGER NOT NULL DEFAULT 3,
-      start_date TEXT NOT NULL DEFAULT '',
-      issue_date TEXT NOT NULL DEFAULT '',
-      deadline_date TEXT NOT NULL DEFAULT '',
-      offer_letter_path TEXT NOT NULL DEFAULT '',
-      offer_terms_summary TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'Offer Sent' CHECK(status IN ('Offer Sent', 'Accepted', 'Rejected', 'Pending Response', 'Expired')),
-      candidate_response_note TEXT NOT NULL DEFAULT '',
-      responded_at TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS email_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      candidate_id INTEGER,
-      candidate_name TEXT NOT NULL,
-      recipient_email TEXT NOT NULL,
-      template_type TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      body_preview TEXT NOT NULL,
-      stage_triggered INTEGER NOT NULL DEFAULT 1,
-      delivery_status TEXT NOT NULL DEFAULT 'LOGGED_LOCAL',
-      smtp_error TEXT NOT NULL DEFAULT '',
-      message_id TEXT NOT NULL DEFAULT '',
-      triggered_by TEXT NOT NULL DEFAULT 'system',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE SET NULL
-    );
-  `);
-
-  ensureUsersSecurityColumns();
-  ensureCandidateDocumentsAiColumns();
-  ensureCandidateDocumentsSchemaAndTypes();
-  ensureEmailLogsDeliveryColumns();
-  ensureImmutableAuditLogsTable();
-}
-
-function ensureUsersSecurityColumns() {
-  const columns = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
+async function ensureUsersSecurityColumns(): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(users)`).all<{ name: string }>();
   const colNames = new Set(columns.map((c) => c.name));
 
   if (!colNames.has('status')) {
-    db.exec(`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'`);
+    await db.exec(`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'`);
   }
   if (!colNames.has('approved_by')) {
-    db.exec(`ALTER TABLE users ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE users ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`);
   }
   if (!colNames.has('approved_at')) {
-    db.exec(`ALTER TABLE users ADD COLUMN approved_at TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE users ADD COLUMN approved_at TEXT NOT NULL DEFAULT ''`);
   }
   if (!colNames.has('last_active_at')) {
-    db.exec(`ALTER TABLE users ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE users ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''`);
   }
   if (!colNames.has('two_fa_enabled')) {
-    db.exec(`ALTER TABLE users ADD COLUMN two_fa_enabled INTEGER NOT NULL DEFAULT 1`);
+    await db.exec(`ALTER TABLE users ADD COLUMN two_fa_enabled INTEGER NOT NULL DEFAULT 1`);
   }
   if (!colNames.has('two_fa_method')) {
-    db.exec(`ALTER TABLE users ADD COLUMN two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP'`);
+    await db.exec(`ALTER TABLE users ADD COLUMN two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP'`);
   }
   if (!colNames.has('two_fa_change_status')) {
-    db.exec(`ALTER TABLE users ADD COLUMN two_fa_change_status TEXT NOT NULL DEFAULT 'locked'`);
+    await db.exec(`ALTER TABLE users ADD COLUMN two_fa_change_status TEXT NOT NULL DEFAULT 'locked'`);
   }
   if (!colNames.has('two_fa_requested_state')) {
-    db.exec(`ALTER TABLE users ADD COLUMN two_fa_requested_state TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE users ADD COLUMN two_fa_requested_state TEXT NOT NULL DEFAULT ''`);
   }
   if (!colNames.has('two_fa_approved_by')) {
-    db.exec(`ALTER TABLE users ADD COLUMN two_fa_approved_by TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE users ADD COLUMN two_fa_approved_by TEXT NOT NULL DEFAULT ''`);
   }
   if (!colNames.has('token_version')) {
-    db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1`);
+    await db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1`);
   }
 
   // Backfill approval metadata for pre-existing initial admin/approved accounts only (zero dummy data)
-  const legacyApproved = db
+  const legacyApproved = await db
     .prepare(`SELECT id, created_at FROM users WHERE status = 'approved' AND (approved_by IS NULL OR approved_by = '')`)
-    .all() as Array<{ id: number; created_at: string }>;
+    .all<{ id: number; created_at: string }>();
 
   if (legacyApproved.length > 0) {
     const updateStmt = db.prepare(`
@@ -428,38 +481,38 @@ function ensureUsersSecurityColumns() {
         const d = new Date(isoCandidate);
         if (!Number.isNaN(d.getTime())) parsedDate = d;
       }
-      updateStmt.run(formatAuditTimestamp(parsedDate), row.id);
+      await updateStmt.run(formatAuditTimestamp(parsedDate), row.id);
     }
   }
 }
 
-function ensureCandidateDocumentsAiColumns() {
-  const columns = db.prepare(`PRAGMA table_info(candidate_documents)`).all() as Array<{ name: string }>;
+async function ensureCandidateDocumentsAiColumns(): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(candidate_documents)`).all<{ name: string }>();
   const hasJson = columns.some((c) => c.name === 'ai_extracted_json');
   const hasStatus = columns.some((c) => c.name === 'ai_verified_status');
 
   if (!hasJson) {
-    db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_extracted_json TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_extracted_json TEXT NOT NULL DEFAULT ''`);
   }
   if (!hasStatus) {
-    db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_verified_status TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE candidate_documents ADD COLUMN ai_verified_status TEXT NOT NULL DEFAULT ''`);
   }
 }
 
-function ensureCandidateDocumentsSchemaAndTypes() {
-  const tableDef = db
+async function ensureCandidateDocumentsSchemaAndTypes(): Promise<void> {
+  const tableDef = await db
     .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_documents'`)
-    .get() as { sql?: string } | undefined;
+    .get<{ sql?: string }>();
   const sql = String(tableDef?.sql || '');
 
   const needsMigration =
     sql.includes("'APP_FORM'") || !sql.includes("'APPLICATION_FORM'") || !sql.includes("'VAKAD'");
 
   if (needsMigration) {
-    db.pragma('foreign_keys = OFF');
+    await db.pragma('foreign_keys = OFF');
     try {
-      const migrateDocs = db.transaction(() => {
-        db.exec(`
+      await db.transaction(async (tx) => {
+        await tx.exec(`
           CREATE TABLE candidate_documents_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_id INTEGER NOT NULL,
@@ -474,8 +527,10 @@ function ensureCandidateDocumentsSchemaAndTypes() {
             ai_verified_status TEXT NOT NULL DEFAULT '',
             UNIQUE(candidate_id, doc_type),
             FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
-          );
+          )
+        `);
 
+        await tx.exec(`
           INSERT OR IGNORE INTO candidate_documents_v2 (
             id, candidate_id, doc_type, completed, verified, not_applicable,
             file_name, file_path, uploaded_at, ai_extracted_json, ai_verified_status
@@ -492,42 +547,208 @@ function ensureCandidateDocumentsSchemaAndTypes() {
             uploaded_at,
             ai_extracted_json,
             ai_verified_status
-          FROM candidate_documents;
-
-          DROP TABLE candidate_documents;
-          ALTER TABLE candidate_documents_v2 RENAME TO candidate_documents;
+          FROM candidate_documents
         `);
 
+        await tx.exec(`DROP TABLE candidate_documents`);
+        await tx.exec(`ALTER TABLE candidate_documents_v2 RENAME TO candidate_documents`);
+
         // Ensure every existing candidate has rows for APPLICATION_FORM and VAKAD
-        const candidateRows = db.prepare(`SELECT id FROM candidates`).all() as Array<{ id: number }>;
-        const insertMissing = db.prepare(`
+        const candidateRows = await tx.prepare(`SELECT id FROM candidates`).all<{ id: number }>();
+        const insertMissing = tx.prepare(`
           INSERT OR IGNORE INTO candidate_documents (
             candidate_id, doc_type, completed, verified, not_applicable, file_name, file_path, uploaded_at
           ) VALUES (?, ?, 0, 0, 0, '', '', '')
         `);
         for (const c of candidateRows) {
-          insertMissing.run(c.id, 'APPLICATION_FORM');
-          insertMissing.run(c.id, 'VAKAD');
+          await insertMissing.run(c.id, 'APPLICATION_FORM');
+          await insertMissing.run(c.id, 'VAKAD');
         }
       });
-      migrateDocs();
     } finally {
-      db.pragma('foreign_keys = ON');
+      await db.pragma('foreign_keys = ON');
     }
   }
 }
 
-function ensureEmailLogsDeliveryColumns() {
-  const columns = db.prepare(`PRAGMA table_info(email_logs)`).all() as Array<{ name: string }>;
+async function ensureEmailLogsDeliveryColumns(): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(email_logs)`).all<{ name: string }>();
   const hasSmtpError = columns.some((c) => c.name === 'smtp_error');
   const hasMessageId = columns.some((c) => c.name === 'message_id');
 
   if (!hasSmtpError) {
-    db.exec(`ALTER TABLE email_logs ADD COLUMN smtp_error TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE email_logs ADD COLUMN smtp_error TEXT NOT NULL DEFAULT ''`);
   }
   if (!hasMessageId) {
-    db.exec(`ALTER TABLE email_logs ADD COLUMN message_id TEXT NOT NULL DEFAULT ''`);
+    await db.exec(`ALTER TABLE email_logs ADD COLUMN message_id TEXT NOT NULL DEFAULT ''`);
   }
+}
+
+let initPromise: Promise<void> | null = null;
+
+export function initializeDatabase(): Promise<void> {
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    await db.pragma('foreign_keys = ON');
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('administrator', 'manager')),
+        department TEXT NOT NULL DEFAULT 'HR',
+        status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('pending', 'approved', 'rejected')),
+        approved_by TEXT NOT NULL DEFAULT '',
+        approved_at TEXT NOT NULL DEFAULT '',
+        last_active_at TEXT NOT NULL DEFAULT '',
+        two_fa_enabled INTEGER NOT NULL DEFAULT 1,
+        two_fa_method TEXT NOT NULL DEFAULT 'EMAIL_OTP',
+        two_fa_change_status TEXT NOT NULL DEFAULT 'locked' CHECK(two_fa_change_status IN ('locked', 'pending_admin_approval')),
+        two_fa_requested_state TEXT NOT NULL DEFAULT '',
+        two_fa_approved_by TEXT NOT NULL DEFAULT '',
+        token_version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_code TEXT NOT NULL UNIQUE,
+        full_name TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        location TEXT NOT NULL DEFAULT 'Kuala Lumpur, Malaysia',
+        position TEXT NOT NULL,
+        department TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('JobStreet', 'Email')),
+        applied_date TEXT NOT NULL,
+        stage INTEGER NOT NULL DEFAULT 3,
+        status TEXT NOT NULL DEFAULT 'pending_screening',
+        education TEXT NOT NULL DEFAULT '',
+        experience TEXT NOT NULL DEFAULT '',
+        years_experience REAL NOT NULL DEFAULT 0,
+        skills TEXT NOT NULL DEFAULT '[]',
+        ai_score INTEGER NOT NULL DEFAULT 0,
+        ai_summary TEXT NOT NULL DEFAULT '',
+        screening_decision TEXT NOT NULL DEFAULT 'pending',
+        screening_remarks TEXT NOT NULL DEFAULT '',
+        disc_profile TEXT NOT NULL DEFAULT '',
+        last_doc_reminder_at TEXT NOT NULL DEFAULT '',
+        qualification_status TEXT NOT NULL DEFAULT 'pending',
+        qualification_remarks TEXT NOT NULL DEFAULT '',
+        interview_feedback TEXT NOT NULL DEFAULT '',
+        interview_rating INTEGER NOT NULL DEFAULT 0,
+        post_interview_decision TEXT NOT NULL DEFAULT 'pending',
+        final_decision_notes TEXT NOT NULL DEFAULT '',
+        portal_token TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS candidate_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id INTEGER NOT NULL,
+        doc_type TEXT NOT NULL CHECK(doc_type IN ('RESUME', 'APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT')),
+        completed INTEGER NOT NULL DEFAULT 0,
+        verified INTEGER NOT NULL DEFAULT 0,
+        not_applicable INTEGER NOT NULL DEFAULT 0,
+        file_name TEXT NOT NULL DEFAULT '',
+        file_path TEXT NOT NULL DEFAULT '',
+        uploaded_at TEXT NOT NULL DEFAULT '',
+        ai_extracted_json TEXT NOT NULL DEFAULT '',
+        ai_verified_status TEXT NOT NULL DEFAULT '',
+        UNIQUE(candidate_id, doc_type),
+        FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS interview_slots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        capacity INTEGER NOT NULL DEFAULT 1,
+        booked_count INTEGER NOT NULL DEFAULT 0,
+        location_or_link TEXT NOT NULL DEFAULT '',
+        interviewer_name TEXT NOT NULL DEFAULT 'Hiring Panel',
+        department TEXT NOT NULL DEFAULT 'HR',
+        mode TEXT NOT NULL DEFAULT 'Google Meet',
+        status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'CANCELLED')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS interview_bookings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_id INTEGER NOT NULL,
+        candidate_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'CONFIRMED' CHECK(status IN ('CONFIRMED', 'RESCHEDULED', 'CANCELLED', 'COMPLETED')),
+        booked_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (slot_id) REFERENCES interview_slots(id) ON DELETE CASCADE,
+        FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS offers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id INTEGER NOT NULL UNIQUE,
+        position TEXT NOT NULL,
+        department TEXT NOT NULL,
+        salary_myr REAL NOT NULL DEFAULT 0,
+        allowance_myr REAL NOT NULL DEFAULT 0,
+        probation_months INTEGER NOT NULL DEFAULT 3,
+        start_date TEXT NOT NULL DEFAULT '',
+        issue_date TEXT NOT NULL DEFAULT '',
+        deadline_date TEXT NOT NULL DEFAULT '',
+        offer_letter_path TEXT NOT NULL DEFAULT '',
+        offer_terms_summary TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'Offer Sent' CHECK(status IN ('Offer Sent', 'Accepted', 'Rejected', 'Pending Response', 'Expired')),
+        candidate_response_note TEXT NOT NULL DEFAULT '',
+        responded_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
+      )
+    `);
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS email_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id INTEGER,
+        candidate_name TEXT NOT NULL,
+        recipient_email TEXT NOT NULL,
+        template_type TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        body_preview TEXT NOT NULL,
+        stage_triggered INTEGER NOT NULL DEFAULT 1,
+        delivery_status TEXT NOT NULL DEFAULT 'LOGGED_LOCAL',
+        smtp_error TEXT NOT NULL DEFAULT '',
+        message_id TEXT NOT NULL DEFAULT '',
+        triggered_by TEXT NOT NULL DEFAULT 'system',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE SET NULL
+      )
+    `);
+
+    await ensureUsersSecurityColumns();
+    await ensureCandidateDocumentsAiColumns();
+    await ensureCandidateDocumentsSchemaAndTypes();
+    await ensureEmailLogsDeliveryColumns();
+    await ensureImmutableAuditLogsTable();
+  })().catch((err) => {
+    initPromise = null;
+    throw err;
+  });
+
+  return initPromise;
 }
 
 export function generatePortalToken(): string {
@@ -541,7 +762,7 @@ export function generateCandidateCode(): string {
   return `TFMY-${ym}-${rand}`;
 }
 
-export function ensureCandidateDocumentRows(candidateId: number, hasUec = false) {
+export async function ensureCandidateDocumentRows(candidateId: number, hasUec = false): Promise<void> {
   const docTypes = [
     'RESUME',
     'APPLICATION_FORM',
@@ -558,8 +779,6 @@ export function ensureCandidateDocumentRows(candidateId: number, hasUec = false)
   `);
   for (const dt of docTypes) {
     const notApplicable = dt === 'UEC' && !hasUec ? 1 : 0;
-    stmt.run(candidateId, dt, notApplicable);
+    await stmt.run(candidateId, dt, notApplicable);
   }
 }
-
-initializeDatabase();

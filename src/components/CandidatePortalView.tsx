@@ -239,9 +239,10 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
   };
 
   const shareUrl =
-    typeof window !== 'undefined' && selectedToken
+    portalCandidate?.portal_url ||
+    (typeof window !== 'undefined' && selectedToken
       ? `${window.location.origin}/?portal=${selectedToken}`
-      : '';
+      : '');
 
   const copyShareUrl = async () => {
     if (!shareUrl) return;
