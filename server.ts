@@ -135,24 +135,58 @@ const memoryUpload = upload;
 const GDRIVE_PREFIX = 'gdrive://';
 const VALID_GDRIVE_FILE_ID = /^[a-zA-Z0-9_-]{3,160}$/;
 
-function getGoogleDriveWebhookUrl(): string {
+function getGoogleDriveWebhookUrl(options?: { silent?: boolean }): string {
   const raw = cleanEnvValue(process.env.GOOGLE_DRIVE_WEBHOOK_URL);
   if (!raw) return '';
   try {
     const parsed = new URL(raw);
     if (parsed.protocol !== 'https:') {
-      console.warn('[Storage] Ignoring GOOGLE_DRIVE_WEBHOOK_URL because it must use https://.');
+      if (!options?.silent) {
+        console.warn('[Storage] Ignoring GOOGLE_DRIVE_WEBHOOK_URL because it must use https://.');
+      }
       return '';
     }
     return parsed.toString();
   } catch {
-    console.warn('[Storage] Ignoring invalid GOOGLE_DRIVE_WEBHOOK_URL.');
+    if (!options?.silent) {
+      console.warn('[Storage] Ignoring invalid GOOGLE_DRIVE_WEBHOOK_URL.');
+    }
     return '';
   }
 }
 
+function validateGoogleDriveWebhookConfigOnStartup(): void {
+  const raw = cleanEnvValue(process.env.GOOGLE_DRIVE_WEBHOOK_URL);
+  if (!raw) return;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    console.warn(
+      '[Storage] WARNING: GOOGLE_DRIVE_WEBHOOK_URL is not a valid URL. Falling back to local uploads/ storage.'
+    );
+    return;
+  }
+
+  if (parsed.protocol !== 'https:') {
+    console.warn(
+      '[Storage] WARNING: GOOGLE_DRIVE_WEBHOOK_URL must start with https://. Falling back to local uploads/ storage.'
+    );
+    return;
+  }
+
+  const trimmedPath = parsed.pathname.replace(/\/+$/, '');
+  if (!trimmedPath.endsWith('/exec')) {
+    console.warn(
+      `[Storage] WARNING: GOOGLE_DRIVE_WEBHOOK_URL does not end with "/exec" (received path "${parsed.pathname}"). ` +
+        `Google Apps Script Web App deployments must use the ".../exec" URL; otherwise uploads/fetches may fail with HTTP 405 or HTML responses.`
+    );
+  }
+}
+
 function isGoogleDriveStorageEnabled(): boolean {
-  return Boolean(getGoogleDriveWebhookUrl());
+  return Boolean(getGoogleDriveWebhookUrl({ silent: true }));
 }
 
 function isGoogleDriveRef(fileRef: string): boolean {
@@ -202,18 +236,99 @@ function sanitizeDownloadMimeType(rawMime: string, fallbackFileName = ''): strin
   return 'application/octet-stream';
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 30_000): Promise<globalThis.Response> {
+async function fetchGoogleDriveWebhook(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 35_000
+): Promise<globalThis.Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, {
+    let resp = await fetch(url, {
       ...init,
       redirect: 'follow',
       signal: controller.signal,
     });
+
+    // Defensive fallback: if any 302/303 redirect is returned manually, follow Location via GET
+    // so script.googleusercontent.com never receives a re-sent POST (HTTP 405).
+    let redirectHops = 0;
+    while ((resp.status === 302 || resp.status === 303) && redirectHops < 5) {
+      const location = resp.headers.get('location');
+      if (!location) break;
+      const nextUrl = new URL(location, resp.url || url);
+      if (nextUrl.protocol !== 'https:') {
+        throw new Error('Google Drive webhook redirected to an insecure non-HTTPS URL.');
+      }
+      resp = await fetch(nextUrl.toString(), {
+        method: 'GET',
+        headers: { Accept: 'application/json, text/plain, */*' },
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      redirectHops++;
+    }
+
+    return resp;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function parseGoogleDriveJsonResponse(
+  resp: globalThis.Response,
+  operation: 'upload' | 'fetch' | 'delete'
+): Promise<Record<string, unknown>> {
+  const rawBody = await resp.text();
+  const trimmedBody = rawBody.trim();
+  const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
+
+  const looksLikeHtml =
+    contentType.includes('text/html') ||
+    /^<!doctype\s+html/i.test(trimmedBody) ||
+    /^<html[\s>]/i.test(trimmedBody) ||
+    /^<head[\s>]/i.test(trimmedBody) ||
+    /^<body[\s>]/i.test(trimmedBody);
+
+  if (looksLikeHtml) {
+    const titleMatch = trimmedBody.match(/<title[^>]*>([^<]{1,120})<\/title>/i);
+    const titleHint = titleMatch ? ` — "${titleMatch[1].replace(/\s+/g, ' ').trim()}"` : '';
+
+    if (resp.status === 405) {
+      throw new Error(
+        `Google Drive ${operation} failed (HTTP 405 Method Not Allowed — HTML returned instead of JSON${titleHint}). ` +
+          `Verify GOOGLE_DRIVE_WEBHOOK_URL ends with "/exec", implements doPost(e) & doGet(e), and is deployed with access set to "Anyone".`
+      );
+    }
+
+    throw new Error(
+      `Google Drive ${operation} returned HTML instead of JSON (HTTP ${resp.status}${titleHint}). ` +
+        `Check that GOOGLE_DRIVE_WEBHOOK_URL is a valid Apps Script "/exec" Web App URL deployed with access set to "Anyone".`
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = trimmedBody ? JSON.parse(trimmedBody) : {};
+  } catch {
+    const snippet = trimmedBody.replace(/\s+/g, ' ').slice(0, 160);
+    throw new Error(
+      `Google Drive ${operation} returned non-JSON response (HTTP ${resp.status}): ${snippet || 'Empty body'}`
+    );
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Google Drive ${operation} returned an unexpected JSON payload (HTTP ${resp.status}).`);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  if (!resp.ok) {
+    throw new Error(
+      `Google Drive ${operation} failed (HTTP ${resp.status}): ${String(record.error || record.message || 'Webhook error')}`
+    );
+  }
+
+  return record;
 }
 
 async function saveUploadedFile(file: {
@@ -227,11 +342,14 @@ async function saveUploadedFile(file: {
 
   if (webhookUrl) {
     const base64Data = file.buffer.toString('base64');
-    const resp = await fetchWithTimeout(
+    const resp = await fetchGoogleDriveWebhook(
       webhookUrl,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8',
+          Accept: 'application/json, text/plain, */*',
+        },
         body: JSON.stringify({
           fileName: originalName,
           mimeType: resolvedMime,
@@ -241,18 +359,10 @@ async function saveUploadedFile(file: {
       35_000
     );
 
-    const rawBody = await resp.text();
-    let parsed: Record<string, unknown> = {};
-    try {
-      parsed = JSON.parse(rawBody) as Record<string, unknown>;
-    } catch {
-      parsed = {};
-    }
+    const parsed = await parseGoogleDriveJsonResponse(resp, 'upload');
 
-    if (!resp.ok) {
-      throw new Error(
-        `Google Drive upload failed (HTTP ${resp.status}): ${String(parsed.error || rawBody.slice(0, 180) || 'Webhook error')}`
-      );
+    if (parsed.ok === false || parsed.success === false) {
+      throw new Error(`Google Drive upload rejected: ${String(parsed.error || parsed.message || 'Unknown error')}`);
     }
 
     const nestedData =
@@ -308,22 +418,17 @@ async function readStoredFile(
     const targetUrl = new URL(webhookUrl);
     targetUrl.searchParams.set('fileId', fileId);
 
-    const resp = await fetchWithTimeout(targetUrl.toString(), { method: 'GET' }, 35_000);
+    const resp = await fetchGoogleDriveWebhook(
+      targetUrl.toString(),
+      {
+        method: 'GET',
+        headers: { Accept: 'application/json, text/plain, */*' },
+      },
+      35_000
+    );
     if (resp.status === 404) return null;
 
-    const rawBody = await resp.text();
-    let parsed: Record<string, unknown> = {};
-    try {
-      parsed = JSON.parse(rawBody) as Record<string, unknown>;
-    } catch {
-      parsed = {};
-    }
-
-    if (!resp.ok) {
-      throw new Error(
-        `Google Drive fetch failed (HTTP ${resp.status}): ${String(parsed.error || rawBody.slice(0, 180) || 'Webhook error')}`
-      );
-    }
+    const parsed = await parseGoogleDriveJsonResponse(resp, 'fetch');
 
     const nestedData =
       parsed.data && typeof parsed.data === 'object' ? (parsed.data as Record<string, unknown>) : undefined;
@@ -331,6 +436,9 @@ async function readStoredFile(
       parsed.base64Data ?? parsed.dataBase64 ?? nestedData?.base64Data ?? ''
     ).trim();
     if (!rawBase64) {
+      if (parsed.error && !/not\s*found/i.test(String(parsed.error))) {
+        throw new Error(`Google Drive fetch error: ${String(parsed.error)}`);
+      }
       return null;
     }
 
@@ -377,8 +485,16 @@ async function deleteStoredFile(fileRef: string): Promise<boolean> {
     targetUrl.searchParams.set('fileId', fileId);
 
     try {
-      const resp = await fetchWithTimeout(targetUrl.toString(), { method: 'GET' }, 20_000);
-      return resp.ok;
+      const resp = await fetchGoogleDriveWebhook(
+        targetUrl.toString(),
+        {
+          method: 'GET',
+          headers: { Accept: 'application/json, text/plain, */*' },
+        },
+        20_000
+      );
+      const parsed = await parseGoogleDriveJsonResponse(resp, 'delete');
+      return parsed.ok !== false && parsed.success !== false;
     } catch (err) {
       console.warn(`[Storage] Failed to trash Google Drive file ${fileId}:`, err);
       return false;
@@ -2450,6 +2566,7 @@ async function reserveSlotTransaction(slotId: number, candidateId: number) {
 }
 
 async function startServer() {
+  validateGoogleDriveWebhookConfigOnStartup();
   await initializeDatabase();
 
   const app = express();
