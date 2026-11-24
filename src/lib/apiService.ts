@@ -785,6 +785,27 @@ export async function portalUploadDocument(
   );
 }
 
+export async function portalUpdateFormSubmissions(
+  portalToken: string,
+  payload: {
+    application_form_submitted?: boolean;
+    disc_submitted?: boolean;
+    vakad_submitted?: boolean;
+  }
+): Promise<{ candidate: CandidateRecord; availableSlots: InterviewSlot[] }> {
+  return apiFetch(
+    `/api/portal/${encodeURIComponent(portalToken)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'confirm_forms',
+        ...payload,
+      }),
+    },
+    false
+  );
+}
+
 export async function portalBookInterviewSlot(
   portalToken: string,
   slotId: number

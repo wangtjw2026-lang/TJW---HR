@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  ExternalLink,
   FileText,
   Loader2,
   MapPin,
@@ -22,6 +23,7 @@ import {
   getProtectedFileUrl,
   portalBookInterviewSlot,
   portalRespondToOffer,
+  portalUpdateFormSubmissions,
   portalUploadDocument,
 } from '../lib/apiService';
 import { formatMYR, getDoc } from '../lib/atsHelpers';
@@ -29,6 +31,7 @@ import {
   CandidateRecord,
   DocType,
   InterviewSlot,
+  ONLINE_FORM_URLS,
   STATUS_META,
 } from '../types/ats';
 
@@ -42,28 +45,6 @@ interface CandidatePortalViewProps {
   onRefreshWorkspace?: () => Promise<void> | void;
   onNotify?: (message: string) => void;
 }
-
-const FORMS_AND_ASSESSMENT_DOCS: Array<{
-  type: DocType;
-  label: string;
-  subtitle: string;
-}> = [
-  {
-    type: 'APPLICATION_FORM',
-    label: 'Employment Application Form',
-    subtitle: 'Mandatory · Upload completed Employment Application Form (PDF, PNG, JPG, WEBP, DOCX)',
-  },
-  {
-    type: 'DISC',
-    label: 'DISC Assessment Report / Sheet',
-    subtitle: 'Mandatory · Upload completed DISC Personality Assessment report or sheet (PDF, PNG, JPG, WEBP, DOCX)',
-  },
-  {
-    type: 'VAKAD',
-    label: 'VAKAD Assessment Report / Sheet',
-    subtitle: 'Mandatory · Upload completed VAKAD Assessment report or sheet (PDF, PNG, JPG, WEBP, DOCX)',
-  },
-];
 
 const ACADEMIC_DOCS: Array<{
   type: DocType;
@@ -117,6 +98,7 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploadingType, setUploadingType] = useState<DocType | null>(null);
+  const [savingFormKey, setSavingFormKey] = useState<'application_form_submitted' | 'disc_submitted' | 'vakad_submitted' | null>(null);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [copiedLink, setCopiedLink] = useState(false);
@@ -195,6 +177,32 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
       setError(err instanceof Error ? err.message : 'Upload failed.');
     } finally {
       setUploadingType(null);
+    }
+  };
+
+  const handleToggleFormSubmitted = async (
+    field: 'application_form_submitted' | 'disc_submitted' | 'vakad_submitted',
+    checked: boolean,
+    label: string
+  ) => {
+    if (!selectedToken || !canInteract) return;
+    setSavingFormKey(field);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const data = await portalUpdateFormSubmissions(selectedToken, { [field]: checked });
+      setPortalCandidate(data.candidate);
+      setAvailableSlots(data.availableSlots);
+      await onRefreshWorkspace?.();
+      notify(
+        checked
+          ? `Confirmed completion of ${label}.`
+          : `Marked ${label} as pending.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to save ${label} status.`);
+    } finally {
+      setSavingFormKey(null);
     }
   };
 
@@ -368,114 +376,208 @@ export const CandidatePortalView: React.FC<CandidatePortalViewProps> = ({
               </div>
             </div>
 
-            {/* Section 1: Application Form, DISC & VAKAD Assessments (Upload Only) */}
-            <div className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4">
-              <div>
-                <h3 className="text-sm font-bold text-[#0F172A]">
-                  Step 1 · Employment Application Form, DISC &amp; VAKAD Assessments
-                </h3>
-                <p className="text-xs text-[#64748B] mt-0.5">
-                  Upload your completed Employment Application Form, DISC Assessment, and VAKAD Assessment files (PDF, PNG, JPG, WEBP, or DOCX).
-                </p>
-              </div>
+            {/* Section 1: Online Forms & Assessments (Links + Completion Checkboxes) */}
+            {(() => {
+              const appFormUrl =
+                portalCandidate.form_links?.application_form_url || ONLINE_FORM_URLS.APPLICATION_FORM;
+              const discUrl = portalCandidate.form_links?.disc_url || ONLINE_FORM_URLS.DISC;
+              const vakadUrl = portalCandidate.form_links?.vakad_url || '';
 
-              <div className="divide-y divide-[#E2E8F0] border border-[#E2E8F0] rounded-md">
-                {FORMS_AND_ASSESSMENT_DOCS.map((item) => {
-                  const doc = getDoc(portalCandidate, item.type);
-                  return (
-                    <div
-                      key={item.type}
-                      className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
-                    >
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-bold text-[#0F172A]">{item.label}</span>
-                          {doc?.verified ? (
-                            <span className="text-[11px] font-semibold text-[#15803D]">Verified by HR</span>
-                          ) : doc?.completed ? (
-                            <span className="text-[11px] font-semibold text-[#0F766E]">Uploaded</span>
-                          ) : (
-                            <span className="text-[11px] font-semibold text-[#B45309]">Pending Upload</span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-[#64748B]">{item.subtitle}</div>
-                        {doc?.file_name && (
-                          <div className="mt-1 flex items-center gap-2 text-[11px] font-mono text-[#0F766E]">
-                            <FileText className="h-3 w-3" />
-                            <span>{doc.file_name}</span>
-                            {doc.file_path && (
-                              <a
-                                href={getProtectedFileUrl(doc.file_path, selectedToken)}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="underline"
-                              >
-                                View File
-                              </a>
-                            )}
-                          </div>
-                        )}
-                        {doc?.file_path && doc.ai_verified_status && (
-                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
-                            {doc.ai_verified_status === 'VERIFIED_MATCH' ? (
-                              <span className="inline-flex items-center gap-1 font-medium text-[#15803D]">
-                                <Sparkles className="h-3 w-3" />
-                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name matched
-                              </span>
-                            ) : doc.ai_verified_status === 'NAME_MISMATCH' ? (
-                              <span className="inline-flex items-center gap-1 font-medium text-[#DC2626]">
-                                <AlertTriangle className="h-3 w-3 shrink-0" />
-                                Detected: {doc.ai_extracted?.document_detected || item.label} · Name on document
-                                {doc.ai_extracted?.candidate_name_on_doc
-                                  ? ` ("${doc.ai_extracted.candidate_name_on_doc}")`
-                                  : ''}{' '}
-                                does not match your profile. Please verify or replace if incorrect.
-                              </span>
-                            ) : doc.ai_verified_status === 'AI_FAILED' ? (
-                              <span className="inline-flex items-center gap-1 text-[#64748B]">
-                                <AlertCircle className="h-3 w-3 shrink-0" />
-                                File received · Queued for manual HR verification.
-                              </span>
+              const appFormDoc = getDoc(portalCandidate, 'APPLICATION_FORM');
+              const discDoc = getDoc(portalCandidate, 'DISC');
+              const vakadDoc = getDoc(portalCandidate, 'VAKAD');
+
+              const appFormSubmitted = Boolean(
+                portalCandidate.application_form_submitted || appFormDoc?.completed || appFormDoc?.verified
+              );
+              const discSubmitted = Boolean(
+                portalCandidate.disc_submitted || discDoc?.completed || discDoc?.verified
+              );
+              const vakadSubmitted = Boolean(
+                portalCandidate.vakad_submitted || vakadDoc?.completed || vakadDoc?.verified
+              );
+
+              return (
+                <div className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4">
+                  <div>
+                    <h3 className="text-sm font-bold text-[#0F172A]">
+                      Step 1 · Employment Application Form, DISC &amp; VAKAD Assessments
+                    </h3>
+                    <p className="text-xs text-[#64748B] mt-0.5">
+                      Complete each required online form in a new tab, then tick the confirmation checkbox below so HR can verify your submission.
+                    </p>
+                  </div>
+
+                  <div className="divide-y divide-[#E2E8F0] border border-[#E2E8F0] rounded-md">
+                    {/* 1. Employment Application Form */}
+                    <div className="px-4 py-3.5 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-[#0F172A]">
+                              1. Employment Application Form
+                            </span>
+                            {appFormDoc?.verified ? (
+                              <span className="text-[11px] font-semibold text-[#15803D]">Verified by HR</span>
+                            ) : appFormSubmitted ? (
+                              <span className="text-[11px] font-semibold text-[#0F766E]">Submitted</span>
                             ) : (
-                              <span className="inline-flex items-center gap-1 font-medium text-[#B45309]">
-                                <Sparkles className="h-3 w-3 shrink-0" />
-                                Detected: {doc.ai_extracted?.document_detected || 'Uploaded document'} · Pending HR
-                                verification
+                              <span className="text-[11px] font-semibold text-[#B45309]">Mandatory · Pending</span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[#64748B] mt-0.5">
+                            Mandatory · Complete and submit our official online Employment Application Form.
+                          </div>
+                        </div>
+
+                        <a
+                          href={appFormUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] transition-colors whitespace-nowrap shrink-0"
+                        >
+                          Open Application Form ↗
+                        </a>
+                      </div>
+
+                      <label className="flex items-center gap-2.5 rounded-md border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 text-xs text-[#0F172A] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={appFormSubmitted}
+                          disabled={!canInteract || savingFormKey === 'application_form_submitted'}
+                          onChange={(e) =>
+                            void handleToggleFormSubmitted(
+                              'application_form_submitted',
+                              e.target.checked,
+                              'Employment Application Form'
+                            )
+                          }
+                          className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
+                        />
+                        <span className="font-medium">I have submitted the Employment Application Form</span>
+                        {savingFormKey === 'application_form_submitted' && (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E] ml-auto" />
+                        )}
+                      </label>
+                    </div>
+
+                    {/* 2. DISC Assessment */}
+                    <div className="px-4 py-3.5 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-[#0F172A]">2. DISC Assessment</span>
+                            {discDoc?.verified ? (
+                              <span className="text-[11px] font-semibold text-[#15803D]">Verified by HR</span>
+                            ) : discSubmitted ? (
+                              <span className="text-[11px] font-semibold text-[#0F766E]">Completed</span>
+                            ) : (
+                              <span className="text-[11px] font-semibold text-[#B45309]">Mandatory · Pending</span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[#64748B] mt-0.5">
+                            Mandatory · Complete the online DISC Personality Assessment.
+                          </div>
+                        </div>
+
+                        <a
+                          href={discUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] transition-colors whitespace-nowrap shrink-0"
+                        >
+                          Start DISC Assessment ↗
+                        </a>
+                      </div>
+
+                      <label className="flex items-center gap-2.5 rounded-md border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 text-xs text-[#0F172A] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={discSubmitted}
+                          disabled={!canInteract || savingFormKey === 'disc_submitted'}
+                          onChange={(e) =>
+                            void handleToggleFormSubmitted(
+                              'disc_submitted',
+                              e.target.checked,
+                              'DISC Assessment'
+                            )
+                          }
+                          className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
+                        />
+                        <span className="font-medium">I have completed the DISC Assessment</span>
+                        {savingFormKey === 'disc_submitted' && (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E] ml-auto" />
+                        )}
+                      </label>
+                    </div>
+
+                    {/* 3. VAKAD Assessment (Optional / Coming Soon until VAKAD_FORM_URL is configured) */}
+                    <div className="px-4 py-3.5 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-bold text-[#0F172A]">3. VAKAD Assessment</span>
+                            {vakadUrl ? (
+                              vakadDoc?.verified ? (
+                                <span className="text-[11px] font-semibold text-[#15803D]">Verified by HR</span>
+                              ) : vakadSubmitted ? (
+                                <span className="text-[11px] font-semibold text-[#0F766E]">Completed</span>
+                              ) : (
+                                <span className="text-[11px] font-semibold text-[#B45309]">Pending</span>
+                              )
+                            ) : (
+                              <span className="inline-flex items-center gap-1 rounded border border-[#E2E8F0] bg-[#F1F5F9] px-2 py-0.5 text-[11px] font-medium text-[#64748B]">
+                                <Clock className="h-3 w-3" />
+                                Not Yet Created — Link Coming Soon
                               </span>
                             )}
                           </div>
+                          <div className="text-[11px] text-[#64748B] mt-0.5">
+                            {vakadUrl
+                              ? 'Complete the online VAKAD Assessment and confirm below.'
+                              : 'Optional / Coming Soon — no action is required right now and this will not block your application.'}
+                          </div>
+                        </div>
+
+                        {vakadUrl && (
+                          <a
+                            href={vakadUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            Start VAKAD Assessment ↗
+                          </a>
                         )}
                       </div>
 
-                      {canInteract && (
-                        <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-semibold text-[#334155] hover:bg-[#F8FAFC] whitespace-nowrap shrink-0">
-                          {uploadingType === item.type ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E]" />
-                          ) : (
-                            <Upload className="h-3.5 w-3.5 text-[#0F766E]" />
-                          )}
-                          {uploadingType === item.type
-                            ? 'Uploading & Scanning...'
-                            : doc?.completed
-                              ? 'Replace File'
-                              : 'Upload File'}
+                      {vakadUrl && (
+                        <label className="flex items-center gap-2.5 rounded-md border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 text-xs text-[#0F172A] cursor-pointer select-none">
                           <input
-                            type="file"
-                            accept=".pdf,.jpg,.jpeg,.png,.webp,.docx"
-                            className="hidden"
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (f) void handleUploadDoc(item.type, f);
-                              e.target.value = '';
-                            }}
+                            type="checkbox"
+                            checked={vakadSubmitted}
+                            disabled={!canInteract || savingFormKey === 'vakad_submitted'}
+                            onChange={(e) =>
+                              void handleToggleFormSubmitted(
+                                'vakad_submitted',
+                                e.target.checked,
+                                'VAKAD Assessment'
+                              )
+                            }
+                            className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
                           />
+                          <span className="font-medium">I have completed the VAKAD Assessment</span>
+                          {savingFormKey === 'vakad_submitted' && (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0F766E] ml-auto" />
+                          )}
                         </label>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            </div>
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Section 2: Academic Documents Upload */}
             <div className="rounded-lg border border-[#E2E8F0] bg-white p-5 space-y-4">

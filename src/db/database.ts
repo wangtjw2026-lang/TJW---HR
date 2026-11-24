@@ -584,6 +584,53 @@ async function ensureEmailLogsDeliveryColumns(): Promise<void> {
   }
 }
 
+async function ensureCandidatesFormSubmissionColumns(): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(candidates)`).all<{ name: string }>();
+  const colNames = new Set(columns.map((c) => c.name));
+
+  let addedAny = false;
+  if (!colNames.has('application_form_submitted')) {
+    await db.exec(`ALTER TABLE candidates ADD COLUMN application_form_submitted INTEGER NOT NULL DEFAULT 0`);
+    addedAny = true;
+  }
+  if (!colNames.has('disc_submitted')) {
+    await db.exec(`ALTER TABLE candidates ADD COLUMN disc_submitted INTEGER NOT NULL DEFAULT 0`);
+    addedAny = true;
+  }
+  if (!colNames.has('vakad_submitted')) {
+    await db.exec(`ALTER TABLE candidates ADD COLUMN vakad_submitted INTEGER NOT NULL DEFAULT 0`);
+    addedAny = true;
+  }
+
+  if (addedAny) {
+    // Backfill submission flags from existing candidate_documents rows
+    await db.exec(`
+      UPDATE candidates
+      SET application_form_submitted = 1
+      WHERE id IN (
+        SELECT candidate_id FROM candidate_documents
+        WHERE doc_type = 'APPLICATION_FORM' AND (completed = 1 OR verified = 1)
+      )
+    `);
+    await db.exec(`
+      UPDATE candidates
+      SET disc_submitted = 1
+      WHERE id IN (
+        SELECT candidate_id FROM candidate_documents
+        WHERE doc_type = 'DISC' AND (completed = 1 OR verified = 1)
+      )
+    `);
+    await db.exec(`
+      UPDATE candidates
+      SET vakad_submitted = 1
+      WHERE id IN (
+        SELECT candidate_id FROM candidate_documents
+        WHERE doc_type = 'VAKAD' AND (completed = 1 OR verified = 1)
+      )
+    `);
+  }
+}
+
 let initPromise: Promise<void> | null = null;
 
 export function initializeDatabase(): Promise<void> {
@@ -637,6 +684,9 @@ export function initializeDatabase(): Promise<void> {
         screening_decision TEXT NOT NULL DEFAULT 'pending',
         screening_remarks TEXT NOT NULL DEFAULT '',
         disc_profile TEXT NOT NULL DEFAULT '',
+        application_form_submitted INTEGER NOT NULL DEFAULT 0,
+        disc_submitted INTEGER NOT NULL DEFAULT 0,
+        vakad_submitted INTEGER NOT NULL DEFAULT 0,
         last_doc_reminder_at TEXT NOT NULL DEFAULT '',
         qualification_status TEXT NOT NULL DEFAULT 'pending',
         qualification_remarks TEXT NOT NULL DEFAULT '',
@@ -739,6 +789,7 @@ export function initializeDatabase(): Promise<void> {
     `);
 
     await ensureUsersSecurityColumns();
+    await ensureCandidatesFormSubmissionColumns();
     await ensureCandidateDocumentsAiColumns();
     await ensureCandidateDocumentsSchemaAndTypes();
     await ensureEmailLogsDeliveryColumns();

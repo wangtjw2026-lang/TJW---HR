@@ -3,6 +3,7 @@ import {
   CandidateFilters,
   CandidateRecord,
   DocType,
+  ONLINE_FORM_URLS,
   StaffRole,
   WORKFLOW_STAGES,
 } from '../types/ats';
@@ -23,7 +24,16 @@ export function getDoc(candidate: CandidateRecord, type: DocType): CandidateDocu
 
 export function getMissingMandatoryDocs(candidate: CandidateRecord): string[] {
   const missing: string[] = [];
-  const check = (type: DocType, label: string) => {
+  const vakadActive = Boolean(candidate.form_links?.vakad_url);
+
+  const checkForm = (type: 'APPLICATION_FORM' | 'DISC' | 'VAKAD', submittedFlag: boolean | undefined, label: string) => {
+    const doc = getDoc(candidate, type);
+    if (doc?.not_applicable) return;
+    if (submittedFlag || doc?.completed || doc?.verified) return;
+    missing.push(label);
+  };
+
+  const checkUploadDoc = (type: DocType, label: string) => {
     const doc = getDoc(candidate, type);
     if (!doc) {
       if (type !== 'UEC') missing.push(label);
@@ -34,13 +44,16 @@ export function getMissingMandatoryDocs(candidate: CandidateRecord): string[] {
       missing.push(label);
     }
   };
-  check('APPLICATION_FORM', 'Employment Application Form');
-  check('DISC', 'DISC Assessment Report / Sheet');
-  check('VAKAD', 'VAKAD Assessment Report / Sheet');
-  check('SPM', 'SPM Examination Results');
-  check('UEC', 'UEC Examination Results');
-  check('DEGREE', 'University Degree Certificate');
-  check('TRANSCRIPT', 'University Academic Transcript');
+
+  checkForm('APPLICATION_FORM', candidate.application_form_submitted, 'Employment Application Form (Online Form)');
+  checkForm('DISC', candidate.disc_submitted, 'DISC Assessment (Online Assessment)');
+  if (vakadActive) {
+    checkForm('VAKAD', candidate.vakad_submitted, 'VAKAD Assessment (Online Assessment)');
+  }
+  checkUploadDoc('SPM', 'SPM Examination Results');
+  checkUploadDoc('UEC', 'UEC Examination Results');
+  checkUploadDoc('DEGREE', 'University Degree Certificate');
+  checkUploadDoc('TRANSCRIPT', 'University Academic Transcript');
   return missing;
 }
 
@@ -162,6 +175,18 @@ export function exportCandidatesToExcelCsv(candidates: CandidateRecord[], _role:
 
   const docStatusLabel = (c: CandidateRecord, t: DocType) => {
     const d = getDoc(c, t);
+    if (t === 'VAKAD' && !c.form_links?.vakad_url && !c.vakad_submitted && !d?.completed && !d?.verified) {
+      return 'Not Yet Created';
+    }
+    if (t === 'APPLICATION_FORM' && (d?.verified || c.application_form_submitted || d?.completed)) {
+      return d?.verified ? 'verified' : 'submitted';
+    }
+    if (t === 'DISC' && (d?.verified || c.disc_submitted || d?.completed)) {
+      return d?.verified ? 'verified' : 'submitted';
+    }
+    if (t === 'VAKAD' && (d?.verified || c.vakad_submitted || d?.completed)) {
+      return d?.verified ? 'verified' : 'submitted';
+    }
     if (!d) return 'missing';
     if (d.not_applicable) return 'N/A';
     if (d.verified) return 'verified';
@@ -348,7 +373,10 @@ export function resolveCandidatePortalUrl(
 }
 
 export function buildWhatsAppMessage(
-  candidate: Pick<CandidateRecord, 'full_name' | 'position' | 'email' | 'portal_token' | 'portal_url'>,
+  candidate: Pick<
+    CandidateRecord,
+    'full_name' | 'position' | 'email' | 'portal_token' | 'portal_url' | 'form_links'
+  >,
   templateKey: WhatsAppTemplateKey
 ): string {
   const name = candidate.full_name || 'Candidate';
@@ -356,10 +384,25 @@ export function buildWhatsAppMessage(
   const email = candidate.email || 'your email address';
   const portalUrl = resolveCandidatePortalUrl(candidate);
   const portalSuffix = portalUrl ? ` Portal link: ${portalUrl}` : '';
+  const appFormUrl = candidate.form_links?.application_form_url || ONLINE_FORM_URLS.APPLICATION_FORM;
+  const discUrl = candidate.form_links?.disc_url || ONLINE_FORM_URLS.DISC;
+  const vakadUrl = candidate.form_links?.vakad_url || '';
 
   switch (templateKey) {
-    case 'shortlisted_docs':
-      return `Hi ${name}, this is HR from TJW. Congratulations on being shortlisted for the ${position} role! We have sent an email to ${email} with your Candidate Self-Service Portal link to upload your completed Employment Application Form, DISC Assessment, VAKAD Assessment, and academic certificates (SPM, UEC if applicable, Degree, and Transcript).${portalSuffix} Please check your inbox (and Spam/Junk folder) and let us know if you have any questions.`;
+    case 'shortlisted_docs': {
+      const vakadNote = vakadUrl
+        ? `3) VAKAD Assessment: ${vakadUrl}`
+        : `3) VAKAD Assessment: Not yet created (link coming soon — not required at this time)`;
+      return [
+        `Hi ${name}, this is HR from TJW. Congratulations on being shortlisted for the ${position} role!`,
+        `We have also emailed ${email} with your next steps:`,
+        `1) Employment Application Form (Mandatory): ${appFormUrl}`,
+        `2) DISC Assessment (Mandatory): ${discUrl}`,
+        vakadNote,
+        `4) Upload your academic certificates (SPM, UEC if applicable, Degree, and Transcript) & confirm form submission via your Candidate Self-Service Portal:${portalUrl ? ` ${portalUrl}` : ' (see email)'}`,
+        `Please check your inbox (and Spam/Junk folder) and let us know if you have any questions.`,
+      ].join('\n');
+    }
     case 'interview_reminder':
       return `Hi ${name}, this is HR from TJW regarding your ${position} application. Please confirm your interview slot via our Candidate Portal or reply here if you need any assistance.${portalSuffix}`;
     case 'general_followup':

@@ -68,6 +68,7 @@ import {
   EmailLogRecord,
   InterviewSlot,
   OfferStatus,
+  ONLINE_FORM_URLS,
   PostInterviewDecision,
   QualificationStatus,
   ScreeningDecision,
@@ -93,29 +94,33 @@ const DOC_META: Array<{
   label: string;
   requiredLabel: string;
   allowUpload: boolean;
+  isOnlineForm?: boolean;
 }> = [
   {
     type: 'APPLICATION_FORM',
     label: 'Employment Application Form',
-    requiredLabel: 'Mandatory · Direct File Upload',
-    allowUpload: true,
+    requiredLabel: 'Mandatory · Online Form Link',
+    allowUpload: false,
+    isOnlineForm: true,
   },
   {
     type: 'DISC',
-    label: 'DISC Assessment Report / Sheet',
-    requiredLabel: 'Mandatory · Direct File Upload',
-    allowUpload: true,
+    label: 'DISC Assessment',
+    requiredLabel: 'Mandatory · Online Assessment Link',
+    allowUpload: false,
+    isOnlineForm: true,
   },
   {
     type: 'VAKAD',
-    label: 'VAKAD Assessment Report / Sheet',
-    requiredLabel: 'Mandatory · Direct File Upload',
-    allowUpload: true,
+    label: 'VAKAD Assessment',
+    requiredLabel: 'Optional · Coming Soon (Non-Blocking)',
+    allowUpload: false,
+    isOnlineForm: true,
   },
   {
     type: 'SPM',
     label: 'SPM Examination Results',
-    requiredLabel: 'Mandatory · Academic Document',
+    requiredLabel: 'Mandatory · Academic Document Upload',
     allowUpload: true,
   },
   {
@@ -1049,7 +1054,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                     <h3 className="text-sm font-bold text-[#0F172A]">Stage 3–4 · HR Screening Decision</h3>
                     <p className="text-xs text-[#64748B]">
                       {isAdmin
-                        ? 'Selecting "Proceed to Next Stage" automatically emails the Candidate Self-Service Portal upload link for Application Form, DISC, VAKAD, and academic certificates.'
+                        ? 'Selecting "Proceed to Next Stage" automatically emails the online Employment Application Form & DISC Assessment links along with the Candidate Self-Service Portal link for academic certificate uploads.'
                         : 'Recorded screening decision and HR reviewer notes.'}
                     </p>
                   </div>
@@ -1076,7 +1081,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                         className="inline-flex items-center gap-1.5 rounded-md bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#115E59] disabled:opacity-50"
                       >
                         <Send className="h-3.5 w-3.5" />
-                        Proceed &amp; Send Portal Upload Request
+                        Proceed &amp; Send Forms + Portal Invite
                       </button>
                       <button
                         type="button"
@@ -1351,7 +1356,7 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                       <th className="px-3.5 py-2.5 font-semibold text-center">Submitted</th>
                       <th className="px-3.5 py-2.5 font-semibold text-center">HR Verified</th>
                       <th className="px-3.5 py-2.5 font-semibold text-center">N/A</th>
-                      <th className="px-3.5 py-2.5 font-semibold text-right">Uploaded File</th>
+                      <th className="px-3.5 py-2.5 font-semibold text-right">Form Link / Uploaded File</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E2E8F0]">
@@ -1362,6 +1367,20 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                       const aiStatus = doc?.ai_verified_status || '';
                       const isScanningThis =
                         uploadingDoc === item.type || (doc?.id !== undefined && analyzingDocId === doc.id);
+
+                      const appFormUrl =
+                        candidate.form_links?.application_form_url || ONLINE_FORM_URLS.APPLICATION_FORM;
+                      const discUrl = candidate.form_links?.disc_url || ONLINE_FORM_URLS.DISC;
+                      const vakadUrl = candidate.form_links?.vakad_url || '';
+                      const isVakadComingSoon = item.type === 'VAKAD' && !vakadUrl;
+                      const candidateSelfConfirmed =
+                        item.type === 'APPLICATION_FORM'
+                          ? Boolean(candidate.application_form_submitted)
+                          : item.type === 'DISC'
+                            ? Boolean(candidate.disc_submitted)
+                            : item.type === 'VAKAD'
+                              ? Boolean(candidate.vakad_submitted)
+                              : false;
 
                       const extractedHighlights: Array<{ label: string; value: string; mono?: boolean }> = [];
                       if (ai) {
@@ -1431,45 +1450,65 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                         <React.Fragment key={item.type}>
                           <tr className="hover:bg-[#FAFBFC]">
                             <td className="px-3.5 py-3">
-                              <div className="font-semibold text-[#0F172A]">{item.label}</div>
-                              <div className="text-[11px] text-[#64748B]">{item.requiredLabel}</div>
-                              {doc?.file_name && (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-semibold text-[#0F172A]">{item.label}</span>
+                                {item.isOnlineForm && candidateSelfConfirmed && !isVakadComingSoon && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#0F766E]">
+                                    <CheckCircle2 className="h-3 w-3" />
+                                    Candidate Confirmed
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-[#64748B]">
+                                {item.type === 'VAKAD' && vakadUrl
+                                  ? 'Online Assessment Link (Active)'
+                                  : item.requiredLabel}
+                              </div>
+                              {item.allowUpload && doc?.file_name && (
                                 <div className="mt-0.5 font-mono text-[11px] text-[#0F766E] truncate max-w-[230px]">
                                   {doc.file_name}
                                 </div>
                               )}
                             </td>
                             <td className="px-3 py-3 text-center">
-                              <input
-                                type="checkbox"
-                                checked={flag.completed}
-                                disabled={!isAdmin || flag.not_applicable}
-                                onChange={(e) =>
-                                  setDocFlags((prev) => ({
-                                    ...prev,
-                                    [item.type]: { ...prev[item.type], completed: e.target.checked },
-                                  }))
-                                }
-                                className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
-                              />
+                              {isVakadComingSoon ? (
+                                <span className="text-[#CBD5E1]">—</span>
+                              ) : (
+                                <input
+                                  type="checkbox"
+                                  checked={flag.completed}
+                                  disabled={!isAdmin || flag.not_applicable}
+                                  onChange={(e) =>
+                                    setDocFlags((prev) => ({
+                                      ...prev,
+                                      [item.type]: { ...prev[item.type], completed: e.target.checked },
+                                    }))
+                                  }
+                                  className="h-4 w-4 accent-[#0F766E] disabled:opacity-60"
+                                />
+                              )}
                             </td>
                             <td className="px-3 py-3 text-center">
-                              <input
-                                type="checkbox"
-                                checked={flag.verified}
-                                disabled={!isAdmin || flag.not_applicable}
-                                onChange={(e) =>
-                                  setDocFlags((prev) => ({
-                                    ...prev,
-                                    [item.type]: {
-                                      ...prev[item.type],
-                                      verified: e.target.checked,
-                                      completed: e.target.checked ? true : prev[item.type].completed,
-                                    },
-                                  }))
-                                }
-                                className="h-4 w-4 accent-[#15803D] disabled:opacity-60"
-                              />
+                              {isVakadComingSoon ? (
+                                <span className="text-[#CBD5E1]">—</span>
+                              ) : (
+                                <input
+                                  type="checkbox"
+                                  checked={flag.verified}
+                                  disabled={!isAdmin || flag.not_applicable}
+                                  onChange={(e) =>
+                                    setDocFlags((prev) => ({
+                                      ...prev,
+                                      [item.type]: {
+                                        ...prev[item.type],
+                                        verified: e.target.checked,
+                                        completed: e.target.checked ? true : prev[item.type].completed,
+                                      },
+                                    }))
+                                  }
+                                  className="h-4 w-4 accent-[#15803D] disabled:opacity-60"
+                                />
+                              )}
                             </td>
                             <td className="px-3 py-3 text-center">
                               {item.type === 'UEC' ? (
@@ -1495,7 +1534,42 @@ export const CandidateDetailDrawer: React.FC<CandidateDetailDrawerProps> = ({
                             </td>
                             <td className="px-3.5 py-3 text-right whitespace-nowrap">
                               <div className="inline-flex items-center gap-2">
-                                {doc?.file_path && (
+                                {item.type === 'APPLICATION_FORM' && (
+                                  <a
+                                    href={appFormUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 rounded border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1 text-[11px] font-semibold text-[#0F766E] hover:bg-[#CCFBF1]"
+                                  >
+                                    Open Application Form ↗
+                                  </a>
+                                )}
+                                {item.type === 'DISC' && (
+                                  <a
+                                    href={discUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 rounded border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1 text-[11px] font-semibold text-[#0F766E] hover:bg-[#CCFBF1]"
+                                  >
+                                    Start DISC Assessment ↗
+                                  </a>
+                                )}
+                                {item.type === 'VAKAD' &&
+                                  (vakadUrl ? (
+                                    <a
+                                      href={vakadUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-flex items-center gap-1 rounded border border-[#0F766E]/30 bg-[#F0FDFA] px-2.5 py-1 text-[11px] font-semibold text-[#0F766E] hover:bg-[#CCFBF1]"
+                                    >
+                                      Start VAKAD Assessment ↗
+                                    </a>
+                                  ) : (
+                                    <span className="inline-flex items-center rounded border border-[#E2E8F0] bg-[#F1F5F9] px-2 py-0.5 text-[11px] font-medium text-[#64748B]">
+                                      Not Yet Created — Link Coming Soon
+                                    </span>
+                                  ))}
+                                {item.allowUpload && doc?.file_path && (
                                   <a
                                     href={getProtectedFileUrl(doc.file_path)}
                                     target="_blank"
@@ -2198,8 +2272,16 @@ function buildDocFlags(
   >;
   for (const t of types) {
     const found = candidate.documents.find((d) => d.doc_type === t);
+    const formSubmitted =
+      t === 'APPLICATION_FORM'
+        ? Boolean(candidate.application_form_submitted)
+        : t === 'DISC'
+          ? Boolean(candidate.disc_submitted)
+          : t === 'VAKAD'
+            ? Boolean(candidate.vakad_submitted)
+            : false;
     result[t] = {
-      completed: Boolean(found?.completed),
+      completed: Boolean(found?.completed || formSubmitted),
       verified: Boolean(found?.verified),
       not_applicable: Boolean(found?.not_applicable),
     };

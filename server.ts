@@ -236,52 +236,97 @@ function sanitizeDownloadMimeType(rawMime: string, fallbackFileName = ''): strin
   return 'application/octet-stream';
 }
 
+const GDRIVE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+interface GoogleDriveWebhookFetchResult {
+  response: globalThis.Response;
+  webhookHost: string;
+  finalHost: string;
+  initialStatus: number;
+  redirectCount: number;
+}
+
 async function fetchGoogleDriveWebhook(
-  url: string,
+  webhookUrl: string,
   init: RequestInit,
   timeoutMs = 35_000
-): Promise<globalThis.Response> {
+): Promise<GoogleDriveWebhookFetchResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const webhookHost = new URL(webhookUrl).host;
+
   try {
-    let resp = await fetch(url, {
+    let currentUrl = webhookUrl;
+    let finalHost = webhookHost;
+    let response = await fetch(webhookUrl, {
       ...init,
-      redirect: 'follow',
+      redirect: 'manual',
       signal: controller.signal,
     });
+    const initialStatus = response.status;
+    let redirectCount = 0;
 
-    // Defensive fallback: if any 302/303 redirect is returned manually, follow Location via GET
-    // so script.googleusercontent.com never receives a re-sent POST (HTTP 405).
-    let redirectHops = 0;
-    while ((resp.status === 302 || resp.status === 303) && redirectHops < 5) {
-      const location = resp.headers.get('location');
-      if (!location) break;
-      const nextUrl = new URL(location, resp.url || url);
+    // Never allow automatic redirect forwarding on Google Apps Script webhooks.
+    // On any 301/302/303/307/308 redirect, read Location and fetch it via GET
+    // so script.googleusercontent.com returns the JSON payload instead of HTTP 405.
+    while (GDRIVE_REDIRECT_STATUSES.has(response.status) && redirectCount < 5) {
+      const redirectUrl = response.headers.get('location');
+      if (!redirectUrl) {
+        console.error(
+          `[Storage] Google Drive redirect missing Location header | webhookHost=${webhookHost} | finalHost=${finalHost} | status=${response.status}`
+        );
+        break;
+      }
+
+      const nextUrl = new URL(redirectUrl, currentUrl);
       if (nextUrl.protocol !== 'https:') {
+        console.error(
+          `[Storage] Google Drive redirect blocked (non-HTTPS) | webhookHost=${webhookHost} | redirectHost=${nextUrl.host} | status=${response.status}`
+        );
         throw new Error('Google Drive webhook redirected to an insecure non-HTTPS URL.');
       }
-      resp = await fetch(nextUrl.toString(), {
+
+      currentUrl = nextUrl.toString();
+      finalHost = nextUrl.host;
+      response = await fetch(currentUrl, {
         method: 'GET',
-        headers: { Accept: 'application/json, text/plain, */*' },
-        redirect: 'follow',
+        redirect: 'manual',
         signal: controller.signal,
       });
-      redirectHops++;
+      redirectCount++;
     }
 
-    return resp;
+    return {
+      response,
+      webhookHost,
+      finalHost,
+      initialStatus,
+      redirectCount,
+    };
+  } catch (err) {
+    console.error(
+      `[Storage] Google Drive request error | webhookHost=${webhookHost} | method=${String(init.method || 'GET')} | error=${err instanceof Error ? err.message : String(err)}`
+    );
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
 async function parseGoogleDriveJsonResponse(
-  resp: globalThis.Response,
+  result: GoogleDriveWebhookFetchResult,
   operation: 'upload' | 'fetch' | 'delete'
 ): Promise<Record<string, unknown>> {
+  const { response: resp, webhookHost, finalHost, initialStatus, redirectCount } = result;
   const rawBody = await resp.text();
   const trimmedBody = rawBody.trim();
   const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
+
+  const logFailure = (reason: string) => {
+    console.error(
+      `[Storage] Google Drive ${operation} failed | webhookHost=${webhookHost} | finalHost=${finalHost} | initialStatus=${initialStatus} | finalStatus=${resp.status} | redirects=${redirectCount} | contentType=${contentType || 'none'} | reason=${reason}`
+    );
+  };
 
   const looksLikeHtml =
     contentType.includes('text/html') ||
@@ -293,6 +338,7 @@ async function parseGoogleDriveJsonResponse(
   if (looksLikeHtml) {
     const titleMatch = trimmedBody.match(/<title[^>]*>([^<]{1,120})<\/title>/i);
     const titleHint = titleMatch ? ` — "${titleMatch[1].replace(/\s+/g, ' ').trim()}"` : '';
+    logFailure(`HTML returned instead of JSON${titleHint}`);
 
     if (resp.status === 405) {
       throw new Error(
@@ -312,20 +358,22 @@ async function parseGoogleDriveJsonResponse(
     parsed = trimmedBody ? JSON.parse(trimmedBody) : {};
   } catch {
     const snippet = trimmedBody.replace(/\s+/g, ' ').slice(0, 160);
+    logFailure(`Invalid JSON body: ${snippet || 'Empty body'}`);
     throw new Error(
       `Google Drive ${operation} returned non-JSON response (HTTP ${resp.status}): ${snippet || 'Empty body'}`
     );
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    logFailure('Unexpected JSON payload type');
     throw new Error(`Google Drive ${operation} returned an unexpected JSON payload (HTTP ${resp.status}).`);
   }
 
   const record = parsed as Record<string, unknown>;
   if (!resp.ok) {
-    throw new Error(
-      `Google Drive ${operation} failed (HTTP ${resp.status}): ${String(record.error || record.message || 'Webhook error')}`
-    );
+    const errText = String(record.error || record.message || 'Webhook error');
+    logFailure(errText);
+    throw new Error(`Google Drive ${operation} failed (HTTP ${resp.status}): ${errText}`);
   }
 
   return record;
@@ -341,28 +389,30 @@ async function saveUploadedFile(file: {
   const webhookUrl = getGoogleDriveWebhookUrl();
 
   if (webhookUrl) {
-    const base64Data = file.buffer.toString('base64');
-    const resp = await fetchGoogleDriveWebhook(
+    const payload = {
+      fileName: originalName,
+      mimeType: resolvedMime,
+      base64Data: file.buffer.toString('base64'),
+    };
+    const fetchResult = await fetchGoogleDriveWebhook(
       webhookUrl,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8',
-          Accept: 'application/json, text/plain, */*',
-        },
-        body: JSON.stringify({
-          fileName: originalName,
-          mimeType: resolvedMime,
-          base64Data,
-        }),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        redirect: 'manual',
       },
       35_000
     );
 
-    const parsed = await parseGoogleDriveJsonResponse(resp, 'upload');
+    const parsed = await parseGoogleDriveJsonResponse(fetchResult, 'upload');
 
     if (parsed.ok === false || parsed.success === false) {
-      throw new Error(`Google Drive upload rejected: ${String(parsed.error || parsed.message || 'Unknown error')}`);
+      const errMsg = String(parsed.error || parsed.message || 'Unknown error');
+      console.error(
+        `[Storage] Google Drive upload rejected | webhookHost=${fetchResult.webhookHost} | finalHost=${fetchResult.finalHost} | status=${fetchResult.response.status} | error=${errMsg}`
+      );
+      throw new Error(`Google Drive upload rejected: ${errMsg}`);
     }
 
     const nestedData =
@@ -372,6 +422,9 @@ async function saveUploadedFile(file: {
     ).trim();
 
     if (!rawFileId || !VALID_GDRIVE_FILE_ID.test(rawFileId)) {
+      console.error(
+        `[Storage] Google Drive upload missing valid fileId | webhookHost=${fetchResult.webhookHost} | finalHost=${fetchResult.finalHost} | status=${fetchResult.response.status}`
+      );
       throw new Error(
         `Google Drive webhook did not return a valid fileId.${parsed.error ? ` Error: ${String(parsed.error)}` : ''}`
       );
@@ -418,17 +471,18 @@ async function readStoredFile(
     const targetUrl = new URL(webhookUrl);
     targetUrl.searchParams.set('fileId', fileId);
 
-    const resp = await fetchGoogleDriveWebhook(
+    const fetchResult = await fetchGoogleDriveWebhook(
       targetUrl.toString(),
       {
         method: 'GET',
         headers: { Accept: 'application/json, text/plain, */*' },
+        redirect: 'manual',
       },
       35_000
     );
-    if (resp.status === 404) return null;
+    if (fetchResult.response.status === 404) return null;
 
-    const parsed = await parseGoogleDriveJsonResponse(resp, 'fetch');
+    const parsed = await parseGoogleDriveJsonResponse(fetchResult, 'fetch');
 
     const nestedData =
       parsed.data && typeof parsed.data === 'object' ? (parsed.data as Record<string, unknown>) : undefined;
@@ -437,6 +491,9 @@ async function readStoredFile(
     ).trim();
     if (!rawBase64) {
       if (parsed.error && !/not\s*found/i.test(String(parsed.error))) {
+        console.error(
+          `[Storage] Google Drive fetch error | webhookHost=${fetchResult.webhookHost} | finalHost=${fetchResult.finalHost} | status=${fetchResult.response.status} | error=${String(parsed.error)}`
+        );
         throw new Error(`Google Drive fetch error: ${String(parsed.error)}`);
       }
       return null;
@@ -485,18 +542,19 @@ async function deleteStoredFile(fileRef: string): Promise<boolean> {
     targetUrl.searchParams.set('fileId', fileId);
 
     try {
-      const resp = await fetchGoogleDriveWebhook(
+      const fetchResult = await fetchGoogleDriveWebhook(
         targetUrl.toString(),
         {
           method: 'GET',
           headers: { Accept: 'application/json, text/plain, */*' },
+          redirect: 'manual',
         },
         20_000
       );
-      const parsed = await parseGoogleDriveJsonResponse(resp, 'delete');
+      const parsed = await parseGoogleDriveJsonResponse(fetchResult, 'delete');
       return parsed.ok !== false && parsed.success !== false;
     } catch (err) {
-      console.warn(`[Storage] Failed to trash Google Drive file ${fileId}:`, err);
+      console.error(`[Storage] Failed to trash Google Drive file ${fileId}:`, err);
       return false;
     }
   }
@@ -942,6 +1000,33 @@ function getPublicPortalUrlStatus(req: Request) {
     effectiveBaseUrl,
     isPrivatePreview: !publicAppUrl || containsPrivatePreview,
     warning,
+  };
+}
+
+const ONLINE_APPLICATION_FORM_URL =
+  'https://script.google.com/macros/s/AKfycbzmwDILioaOGbozPl9t13wCJLpdF_T99WHAglBDJJXvEZTmWIt2oilSNYLyyatK6cG0/exec';
+const ONLINE_DISC_ASSESSMENT_URL =
+  'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec';
+
+function getVakadFormUrl(): string {
+  const raw = cleanEnvValue(process.env.VAKAD_FORM_URL);
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
+  } catch {
+    // Ignore malformed VAKAD_FORM_URL
+  }
+  return '';
+}
+
+function getFormLinksConfig() {
+  return {
+    application_form_url: ONLINE_APPLICATION_FORM_URL,
+    disc_url: ONLINE_DISC_ASSESSMENT_URL,
+    vakad_url: getVakadFormUrl(),
   };
 }
 
@@ -2361,10 +2446,20 @@ async function hydrateCandidate(
 
   const portalToken = String(row.portal_token || '');
   const portalUrl = req && portalToken ? `${getAppBaseUrl(req)}/?portal=${portalToken}` : undefined;
+  const appFormDoc = docs.find((d) => String(d.doc_type) === 'APPLICATION_FORM');
+  const discDoc = docs.find((d) => String(d.doc_type) === 'DISC');
+  const vakadDoc = docs.find((d) => String(d.doc_type) === 'VAKAD');
+  const applicationFormSubmitted = Boolean(Number(row.application_form_submitted) || Number(appFormDoc?.completed));
+  const discSubmitted = Boolean(Number(row.disc_submitted) || Number(discDoc?.completed));
+  const vakadSubmitted = Boolean(Number(row.vakad_submitted) || Number(vakadDoc?.completed));
 
   return {
     ...row,
+    application_form_submitted: applicationFormSubmitted,
+    disc_submitted: discSubmitted,
+    vakad_submitted: vakadSubmitted,
     portal_url: portalUrl,
+    form_links: getFormLinksConfig(),
     skills,
     documents: docs.map((d) => {
       const rawAiJson = String(d.ai_extracted_json || '');
@@ -2469,23 +2564,49 @@ async function hydrateSlot(slot: Record<string, unknown>) {
 
 async function getMissingDocsForCandidate(candidateId: number): Promise<string[]> {
   const labels: Record<string, string> = {
-    APPLICATION_FORM: 'Employment Application Form (Upload)',
-    DISC: 'DISC Assessment Report / Sheet (Upload)',
-    VAKAD: 'VAKAD Assessment Report / Sheet (Upload)',
+    APPLICATION_FORM: 'Employment Application Form (Online Form)',
+    DISC: 'DISC Assessment (Online Assessment)',
+    VAKAD: 'VAKAD Assessment (Online Assessment)',
     SPM: 'SPM Examination Results',
     UEC: 'UEC Examination Results',
     DEGREE: 'University Degree Certificate',
     TRANSCRIPT: 'University Academic Transcript',
   };
-  const rows = await db
-    .prepare(`SELECT doc_type, completed, verified, not_applicable FROM candidate_documents WHERE candidate_id = ? AND doc_type != 'RESUME'`)
-    .all<{ doc_type: string; completed: number; verified: number; not_applicable: number }>(candidateId);
+  const vakadActive = Boolean(getVakadFormUrl());
+  const [candRow, rows] = await Promise.all([
+    db
+      .prepare('SELECT application_form_submitted, disc_submitted, vakad_submitted FROM candidates WHERE id = ?')
+      .get<{ application_form_submitted?: number; disc_submitted?: number; vakad_submitted?: number }>(candidateId),
+    db
+      .prepare(`SELECT doc_type, completed, verified, not_applicable FROM candidate_documents WHERE candidate_id = ? AND doc_type != 'RESUME'`)
+      .all<{ doc_type: string; completed: number; verified: number; not_applicable: number }>(candidateId),
+  ]);
 
+  const byType = new Map(rows.map((r) => [r.doc_type, r]));
   const missing: string[] = [];
-  for (const r of rows) {
+
+  const checkOnlineForm = (docType: 'APPLICATION_FORM' | 'DISC' | 'VAKAD', submittedCol: boolean) => {
+    const r = byType.get(docType);
+    if (r?.not_applicable) return;
+    if (submittedCol || r?.completed || r?.verified) return;
+    missing.push(labels[docType] || docType);
+  };
+
+  checkOnlineForm('APPLICATION_FORM', Boolean(candRow?.application_form_submitted));
+  checkOnlineForm('DISC', Boolean(candRow?.disc_submitted));
+  if (vakadActive) {
+    checkOnlineForm('VAKAD', Boolean(candRow?.vakad_submitted));
+  }
+
+  for (const dt of ['SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'] as const) {
+    const r = byType.get(dt);
+    if (!r) {
+      if (dt !== 'UEC') missing.push(labels[dt]);
+      continue;
+    }
     if (r.not_applicable) continue;
     if (!r.completed && !r.verified) {
-      missing.push(labels[r.doc_type] || r.doc_type);
+      missing.push(labels[dt] || dt);
     }
   }
   return missing;
@@ -4198,27 +4319,34 @@ async function startServer() {
           .run(nextStage, nextStatus, decision, remarks, id);
 
         if (decision === 'proceed') {
+          const formLinks = getFormLinksConfig();
+          const vakadLine = formLinks.vakad_url
+            ? `3. VAKAD Assessment (Online): ${formLinks.vakad_url}`
+            : '3. VAKAD Assessment: Not yet created (link coming soon — not required at this time)';
+
           await dispatchEmail({
             candidateId: id,
             candidateName: String(existing.full_name),
             recipientEmail: String(existing.email),
             templateType: 'shortlist_forms_disc',
-            subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Upload Application Form, Assessments & Academic Docs`,
+            subject: `[TalentFlow MY] Shortlisted for ${existing.position} — Complete Online Forms & Upload Academic Docs`,
             bodyText: [
               `Dear ${existing.full_name},`,
               '',
               `Congratulations! Your application for ${existing.position} (${existing.department}) has progressed to the next stage.`,
               '',
-              'Please upload the following completed documents directly via your Candidate Self-Service Portal (accepted formats: PDF, PNG, JPG, WEBP, DOCX):',
-              '- Employment Application Form (Mandatory)',
-              '- DISC Assessment Report / Sheet (Mandatory)',
-              '- VAKAD Assessment Report / Sheet (Mandatory)',
+              'STEP 1 — Complete Online Forms & Assessments:',
+              `1. Employment Application Form (Mandatory): ${formLinks.application_form_url}`,
+              `2. DISC Assessment (Mandatory): ${formLinks.disc_url}`,
+              vakadLine,
+              '',
+              'STEP 2 — Confirm Form Submission & Upload Academic Certificates via Candidate Self-Service Portal:',
+              `Candidate Self-Service Portal Link: ${portalUrl}`,
+              'Please tick the completion checkboxes after submitting the online forms above, and upload clear copies (PDF, PNG, JPG, WEBP, or DOCX) of:',
               '- SPM Examination Results (Mandatory)',
               '- UEC Examination Results (If applicable)',
               '- University Degree Certificate (Mandatory)',
               '- University Academic Transcript (Mandatory)',
-              '',
-              `Candidate Self-Service Portal Link: ${portalUrl}`,
               '',
               'Best regards,',
               'TalentFlow MY HR Recruitment Team',
@@ -4253,7 +4381,7 @@ async function startServer() {
           targetEntity: `${existing.full_name} (${existing.candidate_code})`,
           details:
             decision === 'proceed'
-              ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched Candidate Portal upload request (Application Form, DISC, VAKAD & Academic Docs).`
+              ? `Shortlisted ${existing.full_name} (Stage 5) & dispatched online Application Form, DISC Assessment, and Candidate Portal academic upload links.`
               : `Updated screening decision for ${existing.full_name} to "${decision}". Remarks: ${remarks || 'None'}`,
         });
       }
@@ -4268,15 +4396,32 @@ async function startServer() {
           WHERE candidate_id = ? AND doc_type = ?
         `);
 
+        let nextAppFormSubmitted = Number(existing.application_form_submitted || 0);
+        let nextDiscSubmitted = Number(existing.disc_submitted || 0);
+        let nextVakadSubmitted = Number(existing.vakad_submitted || 0);
+
         for (const item of docsUpdates) {
+          const dt = String(item.doc_type);
+          const completedVal = item.completed || item.verified ? 1 : 0;
           await updateDocStmt.run(
-            item.completed ? 1 : 0,
+            completedVal,
             item.verified ? 1 : 0,
             item.not_applicable ? 1 : 0,
             id,
-            String(item.doc_type)
+            dt
           );
+          if (dt === 'APPLICATION_FORM') nextAppFormSubmitted = completedVal;
+          if (dt === 'DISC') nextDiscSubmitted = completedVal;
+          if (dt === 'VAKAD') nextVakadSubmitted = completedVal;
         }
+
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET application_form_submitted = ?, disc_submitted = ?, vakad_submitted = ?
+            WHERE id = ?
+          `)
+          .run(nextAppFormSubmitted, nextDiscSubmitted, nextVakadSubmitted, id);
 
         const missing = await getMissingDocsForCandidate(id);
         const currentStage = Number(existing.stage);
@@ -4298,7 +4443,7 @@ async function startServer() {
           pageVisited: 'Candidate Detail Drawer',
           actionTaken: 'VERIFY_DOCUMENT',
           targetEntity: `${existing.full_name} (${existing.candidate_code})`,
-          details: `Verified forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}${discProfile ? `, DISC: ${discProfile}` : ''}).`,
+          details: `Verified online forms & academic documents for ${existing.full_name} (Remaining missing: ${missing.length}${discProfile ? `, DISC: ${discProfile}` : ''}).`,
         });
       }
       // 3. Stage 8 -> 9 Qualification Decision + Auto Interview Invite
@@ -4450,9 +4595,13 @@ async function startServer() {
     asyncHandler(async (req: AuthedRequest, res: Response) => {
       const candidateId = Number(req.params.id);
       const docType = String(req.body?.doc_type || '').toUpperCase();
+      const allowedUploadDocTypes = ['RESUME', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
 
-      if (!isExtractableDocType(docType)) {
-        res.status(400).json({ error: 'Invalid document type.' });
+      if (!allowedUploadDocTypes.includes(docType) || !isExtractableDocType(docType)) {
+        res.status(400).json({
+          error:
+            'Only Resume and Academic Certificates (SPM, UEC, Degree, Transcript) accept file uploads. Application Form, DISC, and VAKAD use online form links.',
+        });
         return;
       }
       if (!req.file) {
@@ -4628,21 +4777,31 @@ async function startServer() {
         `)
         .run(nowIso, id);
 
+      const formLinks = getFormLinksConfig();
+      const vakadReminderLine = formLinks.vakad_url
+        ? `- VAKAD Assessment (Online): ${formLinks.vakad_url}`
+        : '- VAKAD Assessment: Not yet created (link coming soon — not required at this time)';
+
       const emailDelivery = await dispatchEmail({
         candidateId: id,
         candidateName: String(candidate.full_name),
         recipientEmail: String(candidate.email),
         templateType: 'docs_reminder_48h',
-        subject: `[Reminder] Pending Forms & Academic Documents — ${candidate.position}`,
+        subject: `[Reminder] Pending Online Forms & Academic Documents — ${candidate.position}`,
         bodyText: [
           `Dear ${candidate.full_name},`,
           '',
-          `This is a reminder for your ${candidate.position} application. We are still awaiting your direct portal upload for the following items:`,
+          `This is a reminder for your ${candidate.position} application. We are still awaiting completion of the following items:`,
           ...(missing.length > 0
             ? missing.map((m) => `- ${m}`)
-            : ['- Outstanding application form, assessments, or academic documents']),
+            : ['- Outstanding online forms or academic certificates']),
           '',
-          `Please upload your completed Application Form, DISC, VAKAD, and academic certificates (SPM, UEC if applicable, Degree, Transcript) directly via your Candidate Self-Service Portal:`,
+          'Online Form & Assessment Links:',
+          `- Employment Application Form (Mandatory): ${formLinks.application_form_url}`,
+          `- DISC Assessment (Mandatory): ${formLinks.disc_url}`,
+          vakadReminderLine,
+          '',
+          'Candidate Self-Service Portal (Confirm form submission & upload SPM, UEC if applicable, Degree, and Transcript):',
           `${portalUrl}`,
           '',
           'Thank you,',
@@ -4738,19 +4897,29 @@ async function startServer() {
           `)
           .run(new Date().toISOString().slice(0, 19), id);
 
+        const formLinks = getFormLinksConfig();
+        const vakadBatchLine = formLinks.vakad_url
+          ? `- VAKAD Assessment (Online): ${formLinks.vakad_url}`
+          : '- VAKAD Assessment: Not yet created (link coming soon — not required at this time)';
+
         const delivery = await dispatchEmail({
           candidateId: id,
           candidateName: String(candidate.full_name),
           recipientEmail: String(candidate.email),
           templateType: 'docs_reminder_48h',
-          subject: `[Reminder] Pending Forms & Academic Documents — ${candidate.position}`,
+          subject: `[Reminder] Pending Online Forms & Academic Documents — ${candidate.position}`,
           bodyText: [
             `Dear ${candidate.full_name},`,
             '',
-            `This is a 48-hour follow-up reminder for your ${candidate.position} application. Please upload the outstanding items via your Candidate Self-Service Portal:`,
+            `This is a 48-hour follow-up reminder for your ${candidate.position} application. Please complete the outstanding items below:`,
             ...missing.map((m) => `- ${m}`),
             '',
-            `Candidate Self-Service Portal Link: ${portalUrl}`,
+            'Online Form & Assessment Links:',
+            `- Employment Application Form (Mandatory): ${formLinks.application_form_url}`,
+            `- DISC Assessment (Mandatory): ${formLinks.disc_url}`,
+            vakadBatchLine,
+            '',
+            `Confirm submission & upload academic certificates (SPM, UEC if applicable, Degree, Transcript) via your Candidate Self-Service Portal: ${portalUrl}`,
             '',
             'Regards,\nTalentFlow MY HR Team',
           ].join('\n'),
@@ -5359,9 +5528,13 @@ async function startServer() {
   ): Promise<{ errorStatus?: number; errorMessage?: string }> {
     const candidateId = Number(row.id);
     const docType = String(req.body?.doc_type || '').toUpperCase();
-    const allowedPortalDocs = ['APPLICATION_FORM', 'DISC', 'VAKAD', 'SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
+    const allowedPortalDocs = ['SPM', 'UEC', 'DEGREE', 'TRANSCRIPT'];
     if (!allowedPortalDocs.includes(docType)) {
-      return { errorStatus: 400, errorMessage: 'Invalid document type for portal upload.' };
+      return {
+        errorStatus: 400,
+        errorMessage:
+          'Only academic certificates (SPM, UEC, Degree, Transcript) are uploaded here. Please use the online links and checkboxes for Application Form and DISC Assessment.',
+      };
     }
     if (!req.file) {
       return { errorStatus: 400, errorMessage: 'Please attach a document file (PDF, PNG, JPG, WEBP, or DOCX).' };
@@ -5475,13 +5648,95 @@ async function startServer() {
       const candidateId = Number(row.id);
       const action = String(req.body?.action || '');
 
-      // Action A: Upload candidate form, assessment, or academic document
+      // Action A: Upload academic document (SPM, UEC, Degree, Transcript)
       if (action === 'upload_document') {
         const result = await processPortalAcademicUpload(req, row);
         if (result.errorStatus) {
           res.status(result.errorStatus).json({ error: result.errorMessage });
           return;
         }
+      }
+      // Action A2: Candidate self-confirmation checkboxes for online forms & assessments
+      else if (action === 'confirm_forms') {
+        const hasAppForm = typeof req.body?.application_form_submitted === 'boolean';
+        const hasDisc = typeof req.body?.disc_submitted === 'boolean';
+        const hasVakad = typeof req.body?.vakad_submitted === 'boolean' && Boolean(getVakadFormUrl());
+
+        if (!hasAppForm && !hasDisc && !hasVakad) {
+          res.status(400).json({ error: 'No valid online form submission flag provided.' });
+          return;
+        }
+
+        await ensureCandidateDocumentRows(candidateId);
+
+        const nextAppForm = hasAppForm
+          ? req.body.application_form_submitted
+            ? 1
+            : 0
+          : Number(row.application_form_submitted || 0);
+        const nextDisc = hasDisc ? (req.body.disc_submitted ? 1 : 0) : Number(row.disc_submitted || 0);
+        const nextVakad = hasVakad ? (req.body.vakad_submitted ? 1 : 0) : Number(row.vakad_submitted || 0);
+
+        await db
+          .prepare(`
+            UPDATE candidates
+            SET application_form_submitted = ?, disc_submitted = ?, vakad_submitted = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .run(nextAppForm, nextDisc, nextVakad, candidateId);
+
+        if (hasAppForm) {
+          await db
+            .prepare(`
+              UPDATE candidate_documents
+              SET completed = ?, not_applicable = 0, uploaded_at = CASE WHEN ? = 1 THEN datetime('now') ELSE uploaded_at END
+              WHERE candidate_id = ? AND doc_type = 'APPLICATION_FORM'
+            `)
+            .run(nextAppForm, nextAppForm, candidateId);
+        }
+        if (hasDisc) {
+          await db
+            .prepare(`
+              UPDATE candidate_documents
+              SET completed = ?, not_applicable = 0, uploaded_at = CASE WHEN ? = 1 THEN datetime('now') ELSE uploaded_at END
+              WHERE candidate_id = ? AND doc_type = 'DISC'
+            `)
+            .run(nextDisc, nextDisc, candidateId);
+        }
+        if (hasVakad) {
+          await db
+            .prepare(`
+              UPDATE candidate_documents
+              SET completed = ?, not_applicable = 0, uploaded_at = CASE WHEN ? = 1 THEN datetime('now') ELSE uploaded_at END
+              WHERE candidate_id = ? AND doc_type = 'VAKAD'
+            `)
+            .run(nextVakad, nextVakad, candidateId);
+        }
+
+        const missing = await getMissingDocsForCandidate(candidateId);
+        const currentStage = Number(row.stage);
+        const nextStage = currentStage < 7 ? (missing.length === 0 ? 7 : Math.max(currentStage, 6)) : currentStage;
+        const nextStatus =
+          currentStage <= 7 ? (missing.length === 0 ? 'docs_under_review' : 'shortlisted_docs') : String(row.status);
+
+        await db
+          .prepare(`UPDATE candidates SET stage = ?, status = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(nextStage, nextStatus, candidateId);
+
+        const changedParts: string[] = [];
+        if (hasAppForm) changedParts.push(`Application Form: ${nextAppForm ? 'Submitted' : 'Pending'}`);
+        if (hasDisc) changedParts.push(`DISC Assessment: ${nextDisc ? 'Completed' : 'Pending'}`);
+        if (hasVakad) changedParts.push(`VAKAD Assessment: ${nextVakad ? 'Completed' : 'Pending'}`);
+
+        await logAudit({
+          req,
+          actorName: `${row.full_name} (${row.email})`,
+          actorRole: 'candidate_portal',
+          pageVisited: 'Candidate Self-Service Portal',
+          actionTaken: 'CONFIRM_ONLINE_FORMS',
+          targetEntity: `${row.full_name} (${row.candidate_code})`,
+          details: `Candidate ${row.full_name} updated online form completion via self-service portal (${changedParts.join(', ')}).`,
+        });
       }
       // Action B: Atomic Self-Service Interview Slot Booking
       else if (action === 'book_slot') {

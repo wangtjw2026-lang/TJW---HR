@@ -120,7 +120,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div>
             <p className="font-semibold text-slate-900">Stages 5–8 · Forms, Assessments &amp; Docs</p>
-            <p className="mt-1">Direct portal uploads for Application Form, DISC, VAKAD, and SPM/UEC/Degree/Transcript with Gemini AI verification.</p>
+            <p className="mt-1">Online Employment Application Form &amp; DISC links plus direct portal uploads for SPM/UEC/Degree/Transcript with Gemini AI verification.</p>
           </div>
           <div>
             <p className="font-semibold text-slate-900">Stages 9–15 · Interview & MYR Offer</p>
@@ -243,7 +243,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
             {pendingDocsQueue.length === 0 ? (
               <div className="px-5 py-6 text-xs text-slate-500">
-                No shortlisted candidates currently have outstanding Application Form, DISC, VAKAD, or academic document uploads.
+                No shortlisted candidates currently have outstanding online forms (Application Form, DISC) or academic document uploads.
               </div>
             ) : (
               <div className="divide-y divide-slate-100">

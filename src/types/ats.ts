@@ -30,6 +30,19 @@ export type DocType =
   | 'DEGREE'
   | 'TRANSCRIPT';
 
+export const ONLINE_FORM_URLS = {
+  APPLICATION_FORM:
+    'https://script.google.com/macros/s/AKfycbzmwDILioaOGbozPl9t13wCJLpdF_T99WHAglBDJJXvEZTmWIt2oilSNYLyyatK6cG0/exec',
+  DISC:
+    'https://script.google.com/macros/s/AKfycby-lUFDHSd2NmbiS3Gbg8Y22Ql8smy3XjatCdIs3s5AZ2yeqTBUB6dBQbhgt5EpDt1W/exec',
+} as const;
+
+export interface FormLinksConfig {
+  application_form_url: string;
+  disc_url: string;
+  vakad_url: string;
+}
+
 export type ScreeningDecision = 'pending' | 'proceed' | 'reject';
 export type QualificationStatus = 'pending' | 'qualified' | 'not_qualified';
 export type PostInterviewDecision = 'pending' | 'offer' | 'reject';
@@ -239,6 +252,9 @@ export interface CandidateRecord {
   screening_decision: ScreeningDecision;
   screening_remarks: string;
   disc_profile: string;
+  application_form_submitted: boolean;
+  disc_submitted: boolean;
+  vakad_submitted: boolean;
   last_doc_reminder_at: string;
   qualification_status: QualificationStatus;
   qualification_remarks: string;
@@ -248,6 +264,7 @@ export interface CandidateRecord {
   final_decision_notes: string;
   portal_token: string;
   portal_url?: string;
+  form_links?: FormLinksConfig;
   created_at: string;
   updated_at: string;
   documents: CandidateDocument[];
